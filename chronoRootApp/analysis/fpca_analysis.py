@@ -28,19 +28,28 @@ import logging
 logging.getLogger('matplotlib.category').setLevel(logging.ERROR)
 
 
-def performFPCA(conf_path):
-    COLUMNS = [
-        'MainRootLength (mm)',
-        'LateralRootsLength (mm)',
-        'TotalLength (mm)',
-        'NumberOfLateralRoots',
-        'MainOverTotal (%)',
-        'DiscreteLateralDensity (LR/cm)',
-        'HypocotylLength (mm)',
-    ]
+DEFAULT_FPCA_COLUMNS = [
+    'MainRootLength (mm)',
+    'LateralRootsLength (mm)',
+    'TotalLength (mm)',
+    'NumberOfLateralRoots',
+    'MainOverTotal (%)',
+    'DiscreteLateralDensity (LR/cm)',
+    'HypocotylLength (mm)',
+]
 
-    with open(conf_path, 'r') as file:
-        conf = json.load(file)
+
+def performFPCA(conf_path):
+    if isinstance(conf_path, dict):
+        conf = conf_path
+    else:
+        with open(conf_path, 'r') as file:
+            conf = json.load(file)
+
+    COLUMNS = list(conf.get('fpcaMetrics') or DEFAULT_FPCA_COLUMNS)
+    if not COLUMNS:
+        print('FPCA skipped: no metrics selected')
+        return
 
     basis = MonomialBasis
     inverse_rank_normalize = conf['normFPCA']
@@ -53,6 +62,10 @@ def performFPCA(conf_path):
     temporal_data_df['Plant_id'] = (
         temporal_data_df['Plant_id'].astype('str') + ' (' + temporal_data_df['Experiment'] + ')'
     )
+    COLUMNS = [col for col in COLUMNS if col in temporal_data_df.columns]
+    if not COLUMNS:
+        print('FPCA skipped: selected metrics are not in Temporal_Data.csv')
+        return
 
     magnitudes_dict = {
         magnitude: temporal_data_df.pivot(

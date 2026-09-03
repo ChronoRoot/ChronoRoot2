@@ -97,12 +97,14 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
             'seed_count': seed_count if seed_count is not None else '',
         })
 
-    return {
+    payload = {
         'config_kind': CONFIG_KIND,
         'config_version': CONFIG_VERSION,
         'user_video_path': analysis_tab.video_path_edit.text(),
         'project_dir': analysis_tab.proj_dir_edit.text(),
         'analysis_id': analysis_tab.identifier_edit.text().strip(),
+        'PlateCondition': analysis_tab.plateConditionName.text(),
+        'ExtraVariable': analysis_tab.extraField.text(),
         'time_delta': analysis_tab.time_delta_edit.text(),
         'add_time': analysis_tab.add_time_edit.text(),
         'germination_time_cut': analysis_tab.germination_time_edit.text(),
@@ -113,16 +115,30 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         'plant_growth_analysis': analysis_tab.plant_growth_checkbox.isChecked(),
         'show_tracking': analysis_tab.show_tracking_checkbox.isChecked(),
         'germination_each_video': analysis_tab.store_each_video_checkbox.isChecked(),
-        'metric_hypocotyl': analysis_tab.check_hypocotyl.isChecked(),
-        'metric_main_root': analysis_tab.check_main_root.isChecked(),
-        'metric_total_root': analysis_tab.check_total_root.isChecked(),
-        'metric_plant_area': analysis_tab.check_plant_area.isChecked(),
-        'metric_root_area': analysis_tab.check_root_area.isChecked(),
         'do_fpca': analysis_tab.fpca_checkbox.isChecked(),
         'fpca_components': analysis_tab.fpca_components_edit.text(),
         'normalize_fpca': analysis_tab.fpca_normalize_checkbox.isChecked(),
         'groups': groups,
     }
+    if hasattr(analysis_tab, 'averagePerPlantStats'):
+        payload['averagePerPlantStats'] = analysis_tab.averagePerPlantStats.isChecked()
+        payload['everyXhourField'] = analysis_tab.everyXhourField.text()
+        payload['everyXhourFieldFourier'] = analysis_tab.everyXhourFieldFourier.text()
+        payload['doFourier'] = analysis_tab.doFourier.isChecked()
+        payload['genotypeAxisLabel'] = analysis_tab.genotypeAxisLabelField.text()
+        payload['plateConditionAxisLabel'] = analysis_tab.plateConditionAxisLabelField.text()
+        payload['extraVariableLabel'] = analysis_tab.extraVariableLabelField.text()
+        for name in (
+            'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
+            'statsByPlateCondition', 'statsByExtraVariable',
+            'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
+            'measureHypocotyl', 'measureMainRoot', 'measureTotalRoot',
+            'measureArea', 'measureDenseRoot', 'measureGermination',
+        ):
+            widget = getattr(analysis_tab, name, None)
+            if widget is not None:
+                payload[name] = widget.isChecked()
+    return payload
 
 
 def _rebuild_groups(analysis_tab, groups: List[Dict[str, Any]]) -> None:
@@ -183,6 +199,12 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
         if analysis_id is not None:
             analysis_tab.identifier_edit.setText(str(analysis_id))
 
+        if hasattr(analysis_tab, 'plateConditionName'):
+            plate = data.get('PlateCondition', data.get('plateConditionName', ''))
+            extra = data.get('ExtraVariable', data.get('extraField', ''))
+            analysis_tab.plateConditionName.setText(str(plate or ''))
+            analysis_tab.extraField.setText(str(extra or ''))
+
         for widget, key, default in (
             (analysis_tab.time_delta_edit, 'time_delta', ''),
             (analysis_tab.add_time_edit, 'add_time', ''),
@@ -209,13 +231,31 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
             data,
             ('germination_each_video', 'germination-each-video'),
         )
-        _set_checkbox_from_keys(analysis_tab.check_hypocotyl, data, ('metric_hypocotyl',))
-        _set_checkbox_from_keys(analysis_tab.check_main_root, data, ('metric_main_root',))
-        _set_checkbox_from_keys(analysis_tab.check_total_root, data, ('metric_total_root',))
-        _set_checkbox_from_keys(analysis_tab.check_plant_area, data, ('metric_plant_area',))
-        _set_checkbox_from_keys(analysis_tab.check_root_area, data, ('metric_root_area',))
         _set_checkbox_from_keys(analysis_tab.fpca_checkbox, data, ('do_fpca',))
         _set_checkbox_from_keys(analysis_tab.fpca_normalize_checkbox, data, ('normalize_fpca',))
+
+        if hasattr(analysis_tab, 'averagePerPlantStats'):
+            _set_checkbox_from_keys(analysis_tab.averagePerPlantStats, data, ('averagePerPlantStats',))
+            _set_checkbox_from_keys(analysis_tab.doFourier, data, ('doFourier',))
+            for widget, key in (
+                (analysis_tab.everyXhourField, 'everyXhourField'),
+                (analysis_tab.everyXhourFieldFourier, 'everyXhourFieldFourier'),
+                (analysis_tab.genotypeAxisLabelField, 'genotypeAxisLabel'),
+                (analysis_tab.plateConditionAxisLabelField, 'plateConditionAxisLabel'),
+                (analysis_tab.extraVariableLabelField, 'extraVariableLabel'),
+            ):
+                if key in data and data[key] is not None:
+                    widget.setText(str(data[key]))
+            for name in (
+                'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
+                'statsByPlateCondition', 'statsByExtraVariable',
+                'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
+                'measureHypocotyl', 'measureMainRoot', 'measureTotalRoot',
+                'measureArea', 'measureDenseRoot', 'measureGermination',
+            ):
+                widget = getattr(analysis_tab, name, None)
+                if widget is not None:
+                    _set_checkbox_from_keys(widget, data, (name,))
 
         groups = data.get('groups')
         if groups is None and 'group_names' in data:

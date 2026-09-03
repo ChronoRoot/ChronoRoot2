@@ -14,11 +14,14 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox,
                            QFileDialog, QGroupBox, QMessageBox, QScrollArea,
-                           QTabWidget, QTableWidget, QTableWidgetItem, QMenu, QComboBox, QDialog)
+                           QTabWidget, QTableWidget, QTableWidgetItem, QMenu, QComboBox, QDialog,
+                           QTreeWidget, QTreeWidgetItem)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QPixmap, QIntValidator, QDoubleValidator
 import ui_errors
 import interface_config
+import chrono_root_backend  # noqa: F401
+from stats_config_dialog import ScreeningStatsConfigDialog
 
 # --- CONFIGURATION CONSTANTS ---
 APP_NAME = "chronoRootScreening"
@@ -136,6 +139,28 @@ class AnalysisTab(QWidget):
         identifier_layout.addWidget(self.identifier_edit)
         proj_layout.addLayout(identifier_layout)
 
+        factor_layout = QHBoxLayout()
+        self.plateConditionName = QLineEdit()
+        self.plateConditionName.setObjectName("plateConditionName")
+        self.plateConditionName.setPlaceholderText('Control')
+        factor_layout.addWidget(QLabel('Plate Growth Condition:'))
+        factor_layout.addWidget(self.plateConditionName)
+        plate_hint = QLabel('(Optional, e.g. "Control", "Treatment")')
+        plate_hint.setStyleSheet('color: #666; font-size: 9pt;')
+        factor_layout.addWidget(plate_hint)
+        proj_layout.addLayout(factor_layout)
+
+        extra_layout = QHBoxLayout()
+        self.extraField = QLineEdit()
+        self.extraField.setObjectName("extraField")
+        self.extraField.setPlaceholderText('Run 1')
+        extra_layout.addWidget(QLabel('Extra Variable:'))
+        extra_layout.addWidget(self.extraField)
+        extra_hint = QLabel('(Optional value, e.g. Run 1, Run 2.)')
+        extra_hint.setStyleSheet('color: #666; font-size: 9pt;')
+        extra_layout.addWidget(extra_hint)
+        proj_layout.addLayout(extra_layout)
+
         # Time delta field
         time_settings = QHBoxLayout()
         self.time_delta_edit = QLineEdit()
@@ -238,21 +263,8 @@ class AnalysisTab(QWidget):
         process_vertical_layout.addLayout(process_layout)
         
         self.plant_growth_widget = QWidget()
-        plant_process_layout = QHBoxLayout() # Use VBox to stack the rows
-        
-        # Metric selection row
-        self.check_hypocotyl = QCheckBox('Hypocotyl Length')
-        self.check_main_root = QCheckBox('Main Root Length')
-        self.check_total_root = QCheckBox('Total Root Length')
-        self.check_plant_area = QCheckBox('Plant Area')
-        self.check_root_area = QCheckBox('Dense Root Area')
-        
-        for cb in [self.check_hypocotyl, self.check_main_root, self.check_total_root, 
-                   self.check_plant_area, self.check_root_area]:
-            cb.setChecked(True)
-            plant_process_layout.addWidget(cb)
-        
-        # FPCA row
+        plant_process_layout = QHBoxLayout()
+
         self.fpca_checkbox = QCheckBox('Perform FPCA analysis')
         plant_process_layout.addWidget(self.fpca_checkbox)
         plant_process_layout.addWidget(QLabel('Components:'))
@@ -263,13 +275,13 @@ class AnalysisTab(QWidget):
         self.fpca_normalize_checkbox = QCheckBox('Normalize FPCA data')
         self.fpca_normalize_checkbox.setChecked(False)
         plant_process_layout.addWidget(self.fpca_normalize_checkbox)
-        
+        plant_process_layout.addStretch()
+
         self.plant_growth_widget.setLayout(plant_process_layout)
         
         process_vertical_layout.addWidget(self.plant_growth_widget)
         
-        process_group.setLayout(process_vertical_layout)     
-        self.plant_growth_widget.setLayout(plant_process_layout)
+        process_group.setLayout(process_vertical_layout)
         layout.addWidget(process_group)
         
         # Group Names
@@ -310,6 +322,10 @@ class AnalysisTab(QWidget):
         self.generate_report_btn = QPushButton('Generate Report')
         self.generate_report_btn.clicked.connect(self.generate_report)
         buttons_layout.addWidget(self.generate_report_btn)
+
+        self.configure_stats_btn = QPushButton('Configure Statistical Analysis')
+        self.configure_stats_btn.clicked.connect(self.open_stats_config_dialog)
+        buttons_layout.addWidget(self.configure_stats_btn)
         
         # Add name mapping button to the buttons_layout
         self.name_mapping_btn = QPushButton('Edit Name Mapping')
@@ -327,6 +343,9 @@ class AnalysisTab(QWidget):
         # Initialize calibration mode
         self.toggle_calibration_mode()
         self.toggle_plant_growth_options()
+        self.stats_config_dialog = ScreeningStatsConfigDialog(self)
+        self.stats_config_dialog.register_on_host(self)
+        self.stats_config_dialog.set_defaults()
         self._ui_ready = True
 
     def _autosave_config(self):
@@ -700,6 +719,8 @@ class AnalysisTab(QWidget):
             'group_names': group_names,
             'seed_counts': [count if count is not None else 0 for count in seed_counts],
             'group_rois': {name: list(coords) for name, coords in group_rois.items()},
+            'PlateCondition': self.plateConditionName.text().strip(),
+            'ExtraVariable': self.extraField.text().strip(),
         })
 
         if not config['has_qr']:
@@ -757,10 +778,64 @@ class AnalysisTab(QWidget):
         except Exception as e:
             ui_errors.show_critical(self, "Error", f"Failed to launch preview:\n{e}")
 
+    def open_stats_config_dialog(self):
+        self.stats_config_dialog.exec_()
+        self._autosave_config()
+
+    def _int_field(self, widget, default):
+        text = widget.text().strip() if hasattr(widget, 'text') else str(default)
+        try:
+            return int(float(text)) if text else default
+        except ValueError:
+            return default
+
+    def _build_report_config(self):
+        selected = self.stats_config_dialog.selected_metric_columns()
+        if not self.germination_checkbox.isChecked():
+            selected = [col for col in selected if col != 'GerminationTime']
+        if not self.plant_growth_checkbox.isChecked():
+            selected = [col for col in selected if col == 'GerminationTime']
+
+        conf = {
+            'MainFolder': self.proj_dir_edit.text(),
+            'timeStep': self._get_time_delta(),
+            'everyXhourField': self._int_field(self.everyXhourField, 6),
+            'everyXhourFieldFourier': self._int_field(self.everyXhourFieldFourier, 6),
+            'everyXhourFieldAngles': self._int_field(self.everyXhourFieldAngles, 6),
+            'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
+            'doFPCA': self.fpca_checkbox.isChecked(),
+            'normFPCA': self.fpca_normalize_checkbox.isChecked(),
+            'numComponentsFPCAField': self._int_field(self.fpca_components_edit, 2),
+            'doFourier': self.doFourier.isChecked(),
+            'doPlantGrowth': self.plant_growth_checkbox.isChecked(),
+            'doGermination': self.germination_checkbox.isChecked(),
+            'selectedMetrics': selected,
+            'includeLateralRootPlots': False,
+            'temporalOverviewMetrics': [col for col in selected if col != 'GerminationTime'],
+            'fpcaMetrics': [
+                col for col in selected
+                if col in ('MainRootLength (mm)', 'TotalLength (mm)', 'HypocotylLength (mm)')
+            ],
+            'genotypeAxisLabel': self.genotypeAxisLabelField.text().strip() or 'Group',
+            'plateConditionAxisLabel': self.plateConditionAxisLabelField.text().strip() or 'Plate condition',
+            'extraVariableLabel': self.extraVariableLabelField.text().strip() or 'Run',
+            'addTimeBeforePhoto': self._int_field(self.add_time_edit, 0),
+            'germinationTimeCut': self._int_field(self.germination_time_edit, 0),
+            'germinationEachVideo': self.store_each_video_checkbox.isChecked(),
+        }
+        for name in (
+            'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
+            'statsByPlateCondition', 'statsByExtraVariable',
+            'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
+        ):
+            conf[name] = getattr(self, name).isChecked()
+        mapping_file = os.path.join(self.proj_dir_edit.text(), 'name_mapping.json')
+        if os.path.exists(mapping_file):
+            conf['nameMapping'] = mapping_file
+        return conf
+
     def generate_report(self):
-        """
-        Generate report on all completed experiments.
-        """
+        """Generate report on all completed experiments."""
         if not self.proj_dir_edit.text():
             ui_errors.show_warning(self, 'Error', 'Please select a project directory first!')
             return
@@ -772,62 +847,28 @@ class AnalysisTab(QWidget):
             return
 
         project_dir = self.proj_dir_edit.text()
-        time_delta = self._get_time_delta()
-
-        try:
-            add_time = int(self.add_time_edit.text() or '0')
-        except ValueError:
-            add_time = 0
-
         analysis_dir = os.path.join(project_dir, 'analysis')
         if not os.path.exists(analysis_dir):
             ui_errors.show_warning(self, 'Error', 'No analysis directory found!')
             return
 
         analyses = [d for d in os.listdir(analysis_dir)
-                      if os.path.isdir(os.path.join(analysis_dir, d))]
-
+                    if os.path.isdir(os.path.join(analysis_dir, d))]
         if not analyses:
             ui_errors.show_warning(self, 'Error', 'No analyses found to process!')
             return
 
-        mapping_file = os.path.join(project_dir, 'name_mapping.json')
+        conf = self._build_report_config()
+        config_path = os.path.join(project_dir, 'report_config.json')
+        try:
+            with open(config_path, 'w') as handle:
+                json.dump(conf, handle, indent=4)
+        except OSError as exc:
+            ui_errors.show_critical(self, 'Error', f'Failed to write report config:\n{exc}')
+            return
 
-        active_parts = []
-        mapping = [
-            ("HypocotylLength", self.check_hypocotyl),
-            ("MainRootLength", self.check_main_root),
-            ("TotalRootLength", self.check_total_root),
-            ("Area", self.check_plant_area),
-            ("DenseRootArea", self.check_root_area)
-        ]
-        for name, cb in mapping:
-            if cb.isChecked():
-                active_parts.append(name)
-
-        do_fpca = self.fpca_checkbox.isChecked()
-        fpca_comps = self.fpca_components_edit.text() or "2"
-        germ_cut = self.germination_time_edit.text() or "0"
-
-        args = [
-            "python", "generate_report.py",
-            "--project-dir", project_dir,
-            "--dt", str(time_delta),
-            "--add-time-before-photo", str(add_time),
-            "--germination-time-cut", str(germ_cut),
-            "--do-germination", str(self.germination_checkbox.isChecked()),
-            "--germination-each-video", str(self.store_each_video_checkbox.isChecked()),
-            "--do-plant-growth", str(self.plant_growth_checkbox.isChecked()),
-            "--selected-metrics", ",".join(active_parts),
-            "--do-fpca", str(do_fpca),
-            "--fpca-components", fpca_comps,
-            "--normalize-fpca", str(self.fpca_normalize_checkbox.isChecked())
-        ]
-
-        if os.path.exists(mapping_file):
-            args.extend(["--name-mapping", mapping_file])
-
-        mapping_msg = " with name mapping" if os.path.exists(mapping_file) else ""
+        args = ["python", "generate_report.py", "--config", config_path]
+        mapping_msg = " with name mapping" if conf.get('nameMapping') else ""
         app_dir = os.path.dirname(os.path.abspath(__file__))
         self.report_launcher = ui_errors.launch_worker(
             args,
@@ -836,7 +877,7 @@ class AnalysisTab(QWidget):
             started_title="Report Generation Started",
             started_message=(
                 f"Report generation has been started{mapping_msg}.\n"
-                f"Results will be saved in: {os.path.join(project_dir, 'results')}"
+                f"Results will be saved in: {os.path.join(project_dir, 'Report')}"
             ),
             error_title="Report Generation Error",
         )
@@ -1076,225 +1117,110 @@ class ResultsTab(QWidget):
         self.table.resizeColumnsToContents()
 
 class ReportsTab(QWidget):
-    PARAMETERS = [
-        "Germination",
-        "Area",
-        "DenseRootArea",
-        "HypocotylLength", 
-        "MainRootLength", 
-        "TotalRootLength"
-    ]
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.project_dir = None
-        self.current_image_index = 0
-        self.image_paths = []
+        self.report_root = None
+        self.current_plot = ''
+        self.current_stats = ''
         self.initUI()
-        
+
     def initUI(self):
-        layout = QVBoxLayout()
-        
-        # Controls layout
-        controls_layout = QHBoxLayout()
-        
-        # Parameter selector
-        self.parameter_selector = QComboBox()
-        self.parameter_selector.addItems(self.PARAMETERS)
-        controls_layout.addWidget(QLabel('Parameter:'))
-        controls_layout.addWidget(self.parameter_selector)
+        layout = QHBoxLayout()
 
-        # Connect parameter selector
-        self.parameter_selector.currentTextChanged.connect(self.update_plot_types)
-
-        # Plot type selector (will be populated dynamically)
-        self.plot_type = QComboBox()
-        self.plot_type.currentTextChanged.connect(self.update_image_list)
-        controls_layout.addWidget(QLabel('Plot Type:'))
-        controls_layout.addWidget(self.plot_type)
-
-        # Image selector
-        self.image_selector = QComboBox()
-        self.image_selector.currentIndexChanged.connect(self.display_selected_image)
-        controls_layout.addWidget(QLabel('Select Image:'))
-        controls_layout.addWidget(self.image_selector)
-        
-        # Navigation buttons
-        self.prev_btn = QPushButton('←')
-        self.next_btn = QPushButton('→')
-        self.prev_btn.clicked.connect(self.show_previous)
-        self.next_btn.clicked.connect(self.show_next)
-        self.prev_btn.setFixedWidth(40)
-        self.next_btn.setFixedWidth(40)
-        controls_layout.addWidget(self.prev_btn)
-        controls_layout.addWidget(self.next_btn)
-        
-        # Refresh button
+        side = QVBoxLayout()
         self.refresh_btn = QPushButton('Refresh')
         self.refresh_btn.clicked.connect(self.refresh_images)
-        controls_layout.addWidget(self.refresh_btn)
-        
-        # Current path label for debugging
+        side.addWidget(self.refresh_btn)
+        self.open_stats_btn = QPushButton('Open stats')
+        self.open_stats_btn.clicked.connect(self.open_stats)
+        self.open_stats_btn.setEnabled(False)
+        side.addWidget(self.open_stats_btn)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabel('Report figures')
+        self.tree.itemClicked.connect(self.on_item_clicked)
+        side.addWidget(self.tree)
+
+        right = QVBoxLayout()
         self.path_label = QLabel()
         self.path_label.setWordWrap(True)
-        controls_layout.addWidget(self.path_label)
-        
-        controls_layout.addStretch()
-        layout.addLayout(controls_layout)
-        
-        # Image display area
+        right.addWidget(self.path_label)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
-        self.image_label = QLabel()
+        self.image_label = QLabel('Select a figure in the report tree')
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll_area.setWidget(self.image_label)
-        
-        layout.addWidget(self.scroll_area)
-        
+        right.addWidget(self.scroll_area)
+
+        layout.addLayout(side, 1)
+        layout.addLayout(right, 3)
         self.setLayout(layout)
-        self.update_button_states()
-        
+
     def set_project_dir(self, dir_path):
         self.project_dir = dir_path
         self.refresh_images()
-        
-    def get_image_folder(self):
-        if not self.project_dir:
-            print("No project directory set")
-            return None
-            
-        results_dir = os.path.join(self.project_dir, 'results')
-        if not os.path.exists(results_dir):
-            return None
-            
-        current_parameter = self.parameter_selector.currentText()
-        current_plot_type = self.plot_type.currentText()
-        
-        if not current_parameter or not current_plot_type:
-            return None
-            
-        image_folder = os.path.join(
-            results_dir,
-            current_parameter,
-            current_plot_type
-        )
-        
-        return image_folder if os.path.exists(image_folder) else None
 
-    def update_plot_types(self):
-        if not self.project_dir:
-            return
-                
-        current_parameter = self.parameter_selector.currentText()
-        if not current_parameter:
-            return
-                
-        parameter_dir = os.path.join(self.project_dir, 'results', current_parameter)
-        
-        plot_types = []
-        if os.path.exists(parameter_dir):
-            for folder in os.listdir(parameter_dir):
-                folder_path = os.path.join(parameter_dir, folder)
-                if os.path.isdir(folder_path) and not folder.endswith('ProcessedData'):
-                    plot_types.append(folder)
-        
-        # Block signals to prevent multiple redundant image updates
-        self.plot_type.blockSignals(True)
-        self.plot_type.clear()
-        self.plot_type.addItems(plot_types)
-        self.plot_type.blockSignals(False)
-        
-        if plot_types:
-            # Default to the first one if current selection is gone
-            self.plot_type.setCurrentIndex(0)
-        
-        # Manually trigger image list update
-        self.update_image_list()
+    def _populate_tree(self, parent, nodes):
+        from gui.report_browser import ReportBranch, ReportLeaf
+        for node in nodes:
+            item = QTreeWidgetItem(parent, [node.label])
+            if isinstance(node, ReportLeaf):
+                item.setData(0, Qt.UserRole, {
+                    'plot': node.plot_file,
+                    'stats': node.stats_file,
+                })
+            elif isinstance(node, ReportBranch):
+                self._populate_tree(item, node.children)
 
-    def update_image_list(self):
-        self.image_paths = []
-        image_folder = self.get_image_folder()
-        
-        if image_folder and os.path.exists(image_folder):
-            for f in os.listdir(image_folder):
-                if f.lower().endswith('.png'):
-                    full_path = os.path.join(image_folder, f)
-                    self.image_paths.append(full_path)
-            
-            self.image_paths.sort()
-        
-        # Update image selector
-        self.image_selector.blockSignals(True)
-        self.image_selector.clear()
-        if self.image_paths:
-            self.image_selector.addItems([os.path.basename(p) for p in self.image_paths])
-            self.image_selector.blockSignals(False)
-            self.image_selector.setCurrentIndex(0) # Force selection of first image
-        else:
-            self.image_selector.blockSignals(False)
-            self.image_label.setText("No images found in the selected directory")
-            self.image_label.setPixmap(QPixmap()) # Clear old image
-        
-        self.current_image_index = 0
-        self.display_current_image()
-        self.update_button_states()
-        
-    def display_selected_image(self):
-        self.current_image_index = self.image_selector.currentIndex()
-        self.display_current_image()
-        self.update_button_states()
-        
-    def display_current_image(self):
-        if not self.image_paths or self.current_image_index < 0:
-            self.image_label.setText("No images available")
-            self.path_label.setText("No image selected")
-            return
-            
-        if self.current_image_index >= len(self.image_paths):
-            self.current_image_index = len(self.image_paths) - 1
-            
-        image_path = self.image_paths[self.current_image_index]
-        self.path_label.setText(f"Current image: {image_path}")
-                    
-        # Load and display image
-        pixmap = QPixmap(image_path)
-        if not pixmap.isNull():
-            # Scale image to fit the window while maintaining aspect ratio
-            scaled_pixmap = pixmap.scaled(
-                self.scroll_area.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled_pixmap)
-        else:
-            error_msg = f"Error loading image: {image_path}"
-            self.image_label.setText(error_msg)
-            
-    def show_previous(self):
-        if self.current_image_index > 0:
-            self.current_image_index -= 1
-            self.image_selector.setCurrentIndex(self.current_image_index)
-            
-    def show_next(self):
-        if self.current_image_index < len(self.image_paths) - 1:
-            self.current_image_index += 1
-            self.image_selector.setCurrentIndex(self.current_image_index)
-            
-    def update_button_states(self):
-        self.prev_btn.setEnabled(self.current_image_index > 0)
-        self.next_btn.setEnabled(self.current_image_index < len(self.image_paths) - 1)
-        
     def refresh_images(self):
+        self.tree.clear()
+        self.current_plot = ''
+        self.current_stats = ''
+        self.open_stats_btn.setEnabled(False)
         if not self.project_dir:
             return
-        self.update_plot_types() 
-        
+        self.report_root = os.path.join(self.project_dir, 'Report')
+        if not os.path.isdir(self.report_root):
+            self.image_label.setText('No Report folder yet. Generate a report first.')
+            self.image_label.setPixmap(QPixmap())
+            return
+        from gui.report_browser import load_report_catalog
+        catalog = load_report_catalog(self.report_root)
+        self._populate_tree(self.tree.invisibleRootItem(), catalog)
+        self.tree.expandToDepth(1)
+
+    def on_item_clicked(self, item, _column):
+        payload = item.data(0, Qt.UserRole)
+        if not payload:
+            return
+        self.current_plot = os.path.join(self.report_root, payload['plot'])
+        self.current_stats = os.path.join(self.report_root, payload['stats']) if payload.get('stats') else ''
+        self.open_stats_btn.setEnabled(bool(self.current_stats and os.path.isfile(self.current_stats)))
+        self.display_current_image()
+
+    def open_stats(self):
+        if self.current_stats and os.path.isfile(self.current_stats):
+            subprocess.Popen(['xdg-open', self.current_stats])
+
+    def display_current_image(self):
+        if not self.current_plot or not os.path.isfile(self.current_plot):
+            self.image_label.setText('No image selected')
+            self.path_label.setText('')
+            return
+        self.path_label.setText(self.current_plot)
+        pixmap = QPixmap(self.current_plot)
+        if pixmap.isNull():
+            self.image_label.setText(f'Error loading image: {self.current_plot}')
+            return
+        scaled = pixmap.scaled(
+            self.scroll_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.display_current_image()
+        if self.current_plot:
+            self.display_current_image()
 
 
 class NameMappingDialog(QDialog):

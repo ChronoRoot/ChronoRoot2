@@ -44,7 +44,68 @@ from .report_plots import emit_temporal_comparison_plots
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 
 
-def plot_individual_plant(savepath, dataframe, name):
+DEFAULT_TEMPORAL_METRICS = [
+    'MainRootLength (mm)', 'LateralRootsLength (mm)', 'TotalLength (mm)',
+    'NumberOfLateralRoots', 'DiscreteLateralDensity (LR/cm)', 'MainOverTotal (%)',
+    'HypocotylLength (mm)',
+]
+
+DEFAULT_OVERVIEW_METRICS = [
+    ('MainRootLength (mm)', 'Main root length'),
+    ('LateralRootsLength (mm)', 'Lateral root length'),
+    ('TotalLength (mm)', 'Total root length'),
+    ('NumberOfLateralRoots', 'Number of lateral roots'),
+    ('DiscreteLateralDensity (LR/cm)', 'Discrete lateral root density'),
+    ('MainOverTotal (%)', 'Main root / total length (%)'),
+]
+
+LATERAL_SUMMARY_COLUMNS = (
+    'LateralRootsLength (mm)',
+    'NumberOfLateralRoots',
+    'DiscreteLateralDensity (LR/cm)',
+    'MainOverTotal (%)',
+)
+
+METRIC_TITLES = {
+    'MainRootLength (mm)': 'Main root length',
+    'LateralRootsLength (mm)': 'Lateral root length',
+    'TotalLength (mm)': 'Total root length',
+    'NumberOfLateralRoots': 'Number of lateral roots',
+    'DiscreteLateralDensity (LR/cm)': 'Discrete lateral root density',
+    'MainOverTotal (%)': 'Main root / total length (%)',
+    'HypocotylLength (mm)': 'Hypocotyl length',
+    'Area (mm2)': 'Plant area',
+    'DenseRootArea (mm2)': 'Dense root area',
+}
+
+
+def _include_lateral_root_plots(conf):
+    if conf is None:
+        return True
+    return conf.get('includeLateralRootPlots', True)
+
+
+def _add_day_axis(ax, dataframe, day_tick_size=12):
+    ax_days = ax.twiny()
+    ax_days.set_xlim(ax.get_xlim())
+    max_hours = dataframe['ElapsedTime (h)'].max()
+    if pd.notna(max_hours) and max_hours > 0:
+        total_days = np.ceil(max_hours / 24).astype(int)
+        if total_days > 0:
+            day_ticks = np.arange(24, total_days * 24 + 1, 24)
+            day_labels = [f'Day {i}' for i in range(1, total_days + 1)]
+            ax_days.set_xticks(day_ticks)
+            ax_days.set_xticklabels(day_labels, rotation=45, ha='left', fontsize=day_tick_size)
+        else:
+            ax_days.set_xticks([])
+    else:
+        ax_days.set_xticks([])
+    ax_days.tick_params(axis='x', which='major', length=8, width=2, color='black')
+    ax_days.tick_params(axis='x', which='minor', length=4, width=1, color='black')
+    return ax_days
+
+
+def plot_individual_plant(savepath, dataframe, name, conf=None):
     plt.ioff()
     
     # Define font sizes for consistency across subplots
@@ -54,72 +115,35 @@ def plot_individual_plant(savepath, dataframe, name):
     LEGEND_SIZE = 16
     DAY_TICK_SIZE = 12
 
-    # Create subplots: 2 rows, 1 column.
-    # Increase figure height (e.g., (9, 10)) to accommodate two plots.
-    # sharex=True ensures they align and only the bottom plot shows hour labels.
-    fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(9, 10), dpi=150, sharex=True)
+    include_laterals = _include_lateral_root_plots(conf)
 
-    # ===========================
-    # TOP SUBPLOT (Lengths)
-    # ===========================
-    # Plot MainRootLength and LateralRootsLength on the top axis (ax1)
-    # Adding distinct labels for the legend
+    if include_laterals:
+        fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(9, 10), dpi=150, sharex=True)
+    else:
+        fig, ax1 = plt.subplots(nrows=1, ncols=1, figsize=(9, 6), dpi=150)
+        ax2 = None
+
     dataframe.plot(x='ElapsedTime (h)', y='MainRootLength (mm)', ax=ax1, color='g', label='Main Root Length')
-    dataframe.plot(x='ElapsedTime (h)', y='LateralRootsLength (mm)', ax=ax1, color='b', label='Lateral Roots Length')
+    if include_laterals and 'LateralRootsLength (mm)' in dataframe.columns:
+        dataframe.plot(x='ElapsedTime (h)', y='LateralRootsLength (mm)', ax=ax1, color='b', label='Lateral Roots Length')
     dataframe.plot(x='ElapsedTime (h)', y='HypocotylLength (mm)', ax=ax1, color='r', label='Hypocotyl Length')
     
-    # Increase title padding to make room for the top "Days" axis ticks
     ax1.set_title('%s' % convertFromPathSafe(name), pad=40, fontsize=TITLE_SIZE)
     ax1.set_ylabel('Length (mm)', fontsize=LABEL_SIZE)
     ax1.tick_params(axis='y', which='major', labelsize=TICK_SIZE)
     ax1.legend(fontsize=LEGEND_SIZE, loc='upper left')
-    # Remove x-label from top plot since it's shared
-    ax1.set_xlabel('')
 
-    # ===========================
-    # BOTTOM SUBPLOT (Number of LRs)
-    # ===========================
-    # Plot NumberOfLateralRoots on the bottom axis (ax2)
-    # Using magenta ('m') for contrast
-    dataframe.plot(x='ElapsedTime (h)', y='NumberOfLateralRoots', ax=ax2, color='m', legend=False)
-    
-    ax2.set_ylabel('Number of Lateral Roots', fontsize=LABEL_SIZE)
-    ax2.set_xlabel('Elapsed Time (h)', fontsize=LABEL_SIZE)
-    ax2.tick_params(axis='both', which='major', labelsize=TICK_SIZE)
-
-    # ===========================
-    # SECOND X-AXIS (DAYS) ON TOP
-    # ===========================
-    # Create the twin axis attached to the TOP subplot (ax1)
-    ax1_days = ax1.twiny()
-    
-    # Ensure the limits match the shared x-axis
-    ax1_days.set_xlim(ax1.get_xlim())
-
-    # Calculate the total number of days
-    max_hours = dataframe['ElapsedTime (h)'].max()
-    # Handle potential empty plots or very short times
-    if pd.notna(max_hours) and max_hours > 0:
-        total_days = np.ceil(max_hours / 24).astype(int)
-
-        # Create day ticks if the experiment is longer than 24h
-        if total_days > 0:
-            day_ticks = np.arange(24, total_days * 24 + 1, 24)
-            day_labels = [f'Day {i}' for i in range(1, total_days + 1)]
-
-            # Set day ticks and labels
-            ax1_days.set_xticks(day_ticks)
-            ax1_days.set_xticklabels(day_labels, rotation=45, ha='left', fontsize=DAY_TICK_SIZE)
-        else:
-             ax1_days.set_xticks([])
+    if ax2 is not None:
+        ax1.set_xlabel('')
+        dataframe.plot(x='ElapsedTime (h)', y='NumberOfLateralRoots', ax=ax2, color='m', legend=False)
+        ax2.set_ylabel('Number of Lateral Roots', fontsize=LABEL_SIZE)
+        ax2.set_xlabel('Elapsed Time (h)', fontsize=LABEL_SIZE)
+        ax2.tick_params(axis='both', which='major', labelsize=TICK_SIZE)
     else:
-        ax1_days.set_xticks([])
+        ax1.set_xlabel('Elapsed Time (h)', fontsize=LABEL_SIZE)
 
-    # Customize the appearance of the top ticks
-    ax1_days.tick_params(axis='x', which='major', length=8, width=2, color='black')
-    ax1_days.tick_params(axis='x', which='minor', length=4, width=1, color='black')
-    
-    # Adjust layout to prevent overlapping labels
+    _add_day_axis(ax1, dataframe, DAY_TICK_SIZE)
+
     plt.tight_layout()
 
     fig.savefig(os.path.join(savepath, name), dpi=150, bbox_inches='tight')
@@ -178,7 +202,7 @@ def _write_metric_summary_table(conf, data, metric, slug):
     result = result.round(3)
     result.to_csv(table_file(conf, MODULE_TEMPORAL, slug, 'summary_table.csv'), index=False)
 
-def _build_temporal_summary_table(data, group_cols, dt, max_hour):
+def _build_temporal_summary_table(data, group_cols, dt, max_hour, include_laterals=True):
     n_steps = int(round((max_hour + 1) / dt, 0))
     summary_df = []
 
@@ -191,6 +215,12 @@ def _build_temporal_summary_table(data, group_cols, dt, max_hour):
         'MainOverTotal (%)': ['mean', 'std'],
         'HypocotylLength (mm)': ['mean', 'std'],
     }
+    if not include_laterals:
+        for col in LATERAL_SUMMARY_COLUMNS:
+            agg_cols.pop(col, None)
+    agg_cols = {col: spec for col, spec in agg_cols.items() if col in data.columns}
+    if not agg_cols:
+        return pd.DataFrame()
 
     for step in range(n_steps):
         end = int(min(dt * (step + 1), max_hour))
@@ -218,12 +248,16 @@ def generateTableTemporal(conf, data):
     data = ensure_factor_columns(data)
     dt = int(conf['everyXhourField'])
     max_hour = data['ElapsedTime (h)'].max()
+    include_laterals = _include_lateral_root_plots(conf)
 
     tables = [
-        (_build_temporal_summary_table(data, ['Experiment'], dt, max_hour), 'summary_by_genotype.csv'),
-        (_build_temporal_summary_table(data, ['PlateCondition', 'Experiment'], dt, max_hour),
+        (_build_temporal_summary_table(
+            data, ['Experiment'], dt, max_hour, include_laterals), 'summary_by_genotype.csv'),
+        (_build_temporal_summary_table(
+            data, ['PlateCondition', 'Experiment'], dt, max_hour, include_laterals),
          'summary_by_plate.csv'),
-        (_build_temporal_summary_table(data, ['ExtraVariable', 'Experiment'], dt, max_hour),
+        (_build_temporal_summary_table(
+            data, ['ExtraVariable', 'Experiment'], dt, max_hour, include_laterals),
          'summary_by_extra_variable.csv'),
     ]
 
@@ -231,11 +265,42 @@ def generateTableTemporal(conf, data):
         if not table.empty:
             table.to_csv(os.path.join(overview_dir(conf, MODULE_TEMPORAL), filename), index=False)
     
+def _overview_metric_pairs(conf, dataframe):
+    requested = conf.get('temporalOverviewMetrics')
+    if requested:
+        pairs = []
+        for item in requested:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                col, title = item[0], item[1]
+            else:
+                col, title = item, METRIC_TITLES.get(item, str(item))
+            if col in dataframe.columns:
+                pairs.append((col, title))
+        if pairs:
+            return pairs
+    return [(col, title) for col, title in DEFAULT_OVERVIEW_METRICS if col in dataframe.columns]
+
+
+def _overview_ylabel(col):
+    if col == 'NumberOfLateralRoots':
+        return 'Number of LR'
+    if col == 'DiscreteLateralDensity (LR/cm)':
+        return 'Discrete LR density (LRs/cm)'
+    if col == 'MainOverTotal (%)':
+        return 'Percentage (%)'
+    if 'mm2' in col.lower():
+        return 'Area (mm²)'
+    return 'Length (mm)'
+
+
 def plot_info_all(conf, dataframe):
     plt.ioff()
     dataframe = ensure_factor_columns(dataframe)
     geno_palette = genotype_palette_for_data(dataframe)
     geno_label = get_genotype_axis_label(conf)
+    metrics = _overview_metric_pairs(conf, dataframe)
+    if not metrics:
+        return
 
     def _plot_metric(ax, y_col, title):
         sns.lineplot(
@@ -245,29 +310,17 @@ def plot_info_all(conf, dataframe):
         ax.set_title(title, fontsize=16)
         ax.legend(loc='best', title=geno_label)
 
-    fig3 = plt.figure(figsize=(12, 8), constrained_layout=True)
-    gs = fig3.add_gridspec(2, 3)
-    axes = [fig3.add_subplot(gs[r, c]) for r in range(2) for c in range(3)]
+    n = len(metrics)
+    ncols = 3 if n > 2 else max(n, 1)
+    nrows = int(np.ceil(n / ncols))
+    fig3 = plt.figure(figsize=(4 * ncols, 4 * nrows), constrained_layout=True)
+    gs = fig3.add_gridspec(nrows, ncols)
+    axes = [fig3.add_subplot(gs[i // ncols, i % ncols]) for i in range(n)]
 
-    metrics = [
-        ('MainRootLength (mm)', 'Main root length'),
-        ('LateralRootsLength (mm)', 'Lateral root length'),
-        ('TotalLength (mm)', 'Total root length'),
-        ('NumberOfLateralRoots', 'Number of lateral roots'),
-        ('DiscreteLateralDensity (LR/cm)', 'Discrete lateral root density'),
-        ('MainOverTotal (%)', 'Main root / total length (%)'),
-    ]
     for ax, (col, title) in zip(axes, metrics):
         _plot_metric(ax, col, title)
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
-        if col == 'NumberOfLateralRoots':
-            ax.set_ylabel('Number of LR', fontsize=12)
-        elif col == 'DiscreteLateralDensity (LR/cm)':
-            ax.set_ylabel('Discrete LR density (LRs/cm)', fontsize=12)
-        elif col == 'MainOverTotal (%)':
-            ax.set_ylabel('Percentage (%)', fontsize=12)
-        else:
-            ax.set_ylabel('Length (mm)', fontsize=12)
+        ax.set_ylabel(_overview_ylabel(col), fontsize=12)
 
     plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_subplots.png'), dpi=300, bbox_inches='tight')
 

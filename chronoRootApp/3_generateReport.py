@@ -79,7 +79,7 @@ if __name__ == "__main__":
 
     print("Report generation began. This may take a while.")
 
-    temporal_parameters = [
+    temporal_parameters = conf.get('temporalMetrics') or [
         'MainRootLength (mm)', 'LateralRootsLength (mm)', 'TotalLength (mm)',
         'NumberOfLateralRoots', 'DiscreteLateralDensity (LR/cm)', 'MainOverTotal (%)',
         'HypocotylLength (mm)',

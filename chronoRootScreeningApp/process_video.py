@@ -140,6 +140,8 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
             'analysis_id': params['analysis_id'],
             'group_names': params['group_names'],
             'num_groups': len(params['group_names']),
+            'PlateCondition': params.get('PlateCondition', '') or '',
+            'ExtraVariable': params.get('ExtraVariable', '') or '',
             'video_directory': params['video_dir'],
             'segmentation_directory': params['segmentation_dir'],
             'start_time': start_time,
@@ -273,7 +275,10 @@ def process_video(params: Dict[str, Any]):
 
     group_info = {
         'group_names': params['group_names'],
-        'seed_counts': params['seed_counts']
+        'seed_counts': params['seed_counts'],
+        'PlateCondition': params.get('PlateCondition', '') or '',
+        'ExtraVariable': params.get('ExtraVariable', '') or '',
+        'time_delta': params.get('time_delta'),
     }
 
     with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
@@ -311,12 +316,15 @@ def process_video(params: Dict[str, Any]):
     
     # Use list instead of DataFrame for accumulation 
     all_data_rows = []
-    column_names = ["UID", "Group", "ElapsedHours", "Area",
-                    "Perim.", "Slice", "SeedPos", "Date",
-                    "HypocotylLength", "MainRootLength", "TotalRootLength", 
-                    "DenseRootArea", 
-                    "BoundingBox_X", "BoundingBox_Y", "BoundingBox_Width", "BoundingBox_Height",
-                    "ImageFile"]
+    column_names = [
+        "Plant_id", "Experiment", "ElapsedHours", "Area",
+        "Perim.", "Frame", "SeedPos", "FileName",
+        "HypocotylLength", "MainRootLength", "TotalLength",
+        "LateralRootsLength", "NumberOfLateralRoots",
+        "DenseRootArea",
+        "PlateCondition", "ExtraVariable", "pixel_size",
+        "BoundingBox_X", "BoundingBox_Y", "BoundingBox_Width", "BoundingBox_Height",
+    ]
 
 
     # Calculate pixel size from calibration method
@@ -347,6 +355,10 @@ def process_video(params: Dict[str, Any]):
     except Exception as e:
         print(f"Error in pixel size calculation: {str(e)}, using default value {pixel_size:.6f} mm/pixel")
 
+    group_info['pixel_size'] = pixel_size
+    with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
+        json.dump(group_info, f, indent=4)
+
     # Process frames
     for img_file in image_files:
         seg_file = os.path.join(params['segmentation_dir'], "Ensemble", img_file)
@@ -362,11 +374,6 @@ def process_video(params: Dict[str, Any]):
             if vis_image is None:
                 print(f"Warning: Could not load image for visualization: {img_file}")
                 continue
-
-        # Extract date and time
-        date = img_file.split('_')[0]
-        hour = img_file.split('_')[1]
-        date_hour = date + ' ' + hour
 
         # Process binary segmentation
         binary_seg = original_seg > 0
@@ -465,11 +472,10 @@ def process_video(params: Dict[str, Any]):
             # Apply mask to ROI
             crop = original_seg[y_min:y_max, x_min:x_max] * roi_mask
 
-            # Calculate measurements
-            dense_area_covered = np.sum(crop > 0) * pixel_size * pixel_size
+            # Calculate measurements in pixels (dataWork converts lengths to mm)
+            dense_area_covered = float(np.sum(crop > 0))
             perimeter = cv2.arcLength(best_contour, True) * pixel_size
 
-            # Calculate hypocotyl properties
             hypocotyl_length = 0
             hypocotyl = crop == 4
             if np.sum(hypocotyl) > 10:
@@ -477,9 +483,8 @@ def process_video(params: Dict[str, Any]):
                 hypocotyl = cv2.morphologyEx(hypocotyl.astype(np.uint8), cv2.MORPH_OPEN, kernel)
                 hypocotyl = cv2.morphologyEx(hypocotyl, cv2.MORPH_CLOSE, kernel)
                 hypocotyl_skeleton = skeletonize(hypocotyl)
-                hypocotyl_length = np.sum(hypocotyl_skeleton) * pixel_size
+                hypocotyl_length = float(np.sum(hypocotyl_skeleton))
             
-            # Calculate simplified root properties
             mainroot_length = 0
             mainroot = crop == 1
             if np.sum(mainroot) > 10:
@@ -487,7 +492,7 @@ def process_video(params: Dict[str, Any]):
                 mainroot = cv2.morphologyEx(mainroot.astype(np.uint8), cv2.MORPH_OPEN, kernel)
                 mainroot = cv2.morphologyEx(mainroot, cv2.MORPH_CLOSE, kernel)
                 mainroot_skeleton = skeletonize(mainroot)
-                mainroot_length = np.sum(mainroot_skeleton) * pixel_size
+                mainroot_length = float(np.sum(mainroot_skeleton))
             
             totalroot_length = 0
             totalroot = np.bitwise_or(crop == 1, crop == 2)
@@ -496,32 +501,35 @@ def process_video(params: Dict[str, Any]):
                 totalroot = cv2.morphologyEx(totalroot.astype(np.uint8), cv2.MORPH_OPEN, kernel)
                 totalroot = cv2.morphologyEx(totalroot, cv2.MORPH_CLOSE, kernel)
                 totalroot_skeleton = skeletonize(totalroot)
-                totalroot_length = np.sum(totalroot_skeleton) * pixel_size
+                totalroot_length = float(np.sum(totalroot_skeleton))
 
-            # get convex hull of total root
-            dense_root_area = np.sum(totalroot) * pixel_size * pixel_size
+            dense_root_area = float(np.sum(totalroot))
+            lateral_length = max(0.0, totalroot_length - mainroot_length)
 
-            # Get group and create visualization
-            group = get_group_for_position(x_center, y_center, groups)
+            experiment = get_group_for_position(x_center, y_center, groups)
+            plate_condition = params.get('PlateCondition', '') or ''
+            extra_variable = params.get('ExtraVariable', '') or ''
             if params['show_tracking']:
                 vis_image = draw_tracking(
                     vis_image,
                     [x, y, x_w, y_h],
-                    group,
+                    experiment,
                     int(ID),
                     crop,
                     (x_min, y_min)
                 )
             
-            # Store results
-            UID = f"{params['analysis_id']}_{group}_{int(ID)}"
-            rows.append([UID, group, t * params['time_delta'] / 60, 
-                        dense_area_covered, 
-                        perimeter, t + 1, ID, date_hour, 
-                        hypocotyl_length, mainroot_length, totalroot_length, 
-                        dense_root_area,
-                        x, y, w, h,  
-                        img_file])   
+            plant_id = f"{params['analysis_id']}_{experiment}_{int(ID)}"
+            rows.append([
+                plant_id, experiment, t * params['time_delta'] / 60,
+                dense_area_covered,
+                perimeter, t + 1, ID, img_file,
+                hypocotyl_length, mainroot_length, totalroot_length,
+                lateral_length, 0,
+                dense_root_area,
+                plate_condition, extra_variable, pixel_size,
+                x, y, w, h,
+            ])   
         
         # Save visualization
         if params['show_tracking']:
@@ -537,7 +545,7 @@ def process_video(params: Dict[str, Any]):
 
     # Post-processing
     if not dataframe.empty:
-        dataframe = dataframe.sort_values(by=['SeedPos', 'Slice']).reset_index(drop=True)
+        dataframe = dataframe.sort_values(by=['SeedPos', 'Frame']).reset_index(drop=True)
         # Ensure SeedPos can be converted to int safely
         try:
              dataframe['SeedPos'] = dataframe['SeedPos'].astype(int) - np.min(dataframe['SeedPos'].astype(int))
@@ -545,7 +553,7 @@ def process_video(params: Dict[str, Any]):
              pass # Handle cases where SeedPos might be empty
 
     # Remove unknown group seeds after all processing
-    dataframe = dataframe[dataframe['Group'] != 'Unknown']
+    dataframe = dataframe[dataframe['Experiment'] != 'Unknown']
 
     # Save results
     results_path = os.path.join(analysis_dir, 'seeds.tsv')
@@ -613,6 +621,8 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
         'show_tracking': bool(config['show_tracking']),
         'group_names': config['group_names'],
         'seed_counts': config['seed_counts'],
+        'PlateCondition': config.get('PlateCondition', '') or '',
+        'ExtraVariable': config.get('ExtraVariable', '') or '',
     }
 
     if params['has_qr']:
@@ -646,6 +656,8 @@ def build_params_from_args(args) -> Dict[str, Any]:
         'show_tracking': args.show_tracking,
         'group_names': group_names,
         'seed_counts': seed_counts,
+        'PlateCondition': getattr(args, 'plate_condition', '') or '',
+        'ExtraVariable': getattr(args, 'extra_variable', '') or '',
     }
 
     if not args.has_qr:
@@ -678,6 +690,8 @@ def main():
     parser.add_argument('--group-info', nargs='+',
                         help='Alternating group names and seed counts (e.g., "GroupA" "10" "GroupB" "15")')
     parser.add_argument('--group-rois', help='JSON file with precomputed group ROIs')
+    parser.add_argument('--plate-condition', default='', help='Plate growth condition for this video')
+    parser.add_argument('--extra-variable', default='', help='Extra variable for this video')
 
     args = parser.parse_args()
 
