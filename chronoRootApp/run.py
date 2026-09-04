@@ -1989,7 +1989,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportGenerateButton.setText("Generate report")
         self.reportGenerateButton.setToolTip(
             "<b>Compile Results:</b><br>"
-            "Generate visual charts, CSV data, and perform statistical comparisons between varieties.")
+            "Generate visual charts, CSV data, and perform statistical comparisons between varieties.<br>"
+            "Re-applies the current analysis period from hourly files (Postprocess is not required "
+            "when the period is already covered)."
+        )
         self.reportGenerateButton.clicked.connect(self.report)
 
         self.reportSaveConfigButton = QtWidgets.QPushButton(self.tab4)

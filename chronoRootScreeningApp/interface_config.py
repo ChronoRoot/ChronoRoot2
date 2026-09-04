@@ -126,8 +126,10 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         payload['cam'] = cam
     if hasattr(analysis_tab, 'averagePerPlantStats'):
         payload['averagePerPlantStats'] = analysis_tab.averagePerPlantStats.isChecked()
+        payload['measureRelativeToInitial'] = analysis_tab.measureRelativeToInitial.isChecked()
         payload['everyXhourField'] = analysis_tab.everyXhourField.text()
         payload['everyXhourFieldFourier'] = analysis_tab.everyXhourFieldFourier.text()
+        payload['everyXhourFieldAngles'] = analysis_tab.everyXhourFieldAngles.text()
         payload['doFourier'] = analysis_tab.doFourier.isChecked()
         payload['genotypeAxisLabel'] = analysis_tab.genotypeAxisLabelField.text()
         payload['plateConditionAxisLabel'] = analysis_tab.plateConditionAxisLabelField.text()
@@ -247,10 +249,15 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
 
         if hasattr(analysis_tab, 'averagePerPlantStats'):
             _set_checkbox_from_keys(analysis_tab.averagePerPlantStats, data, ('averagePerPlantStats',))
+            if getattr(analysis_tab, 'measureRelativeToInitial', None) is not None:
+                _set_checkbox_from_keys(
+                    analysis_tab.measureRelativeToInitial, data, ('measureRelativeToInitial',),
+                )
             _set_checkbox_from_keys(analysis_tab.doFourier, data, ('doFourier',))
             for widget, key in (
                 (analysis_tab.everyXhourField, 'everyXhourField'),
                 (analysis_tab.everyXhourFieldFourier, 'everyXhourFieldFourier'),
+                (analysis_tab.everyXhourFieldAngles, 'everyXhourFieldAngles'),
                 (analysis_tab.genotypeAxisLabelField, 'genotypeAxisLabel'),
                 (analysis_tab.plateConditionAxisLabelField, 'plateConditionAxisLabel'),
                 (analysis_tab.extraVariableLabelField, 'extraVariableLabel'),

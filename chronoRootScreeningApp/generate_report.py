@@ -29,8 +29,16 @@ from chrono_root_backend import (
     report_root,
     temporal_metric_slug,
 )
-from analysis.utils.report_paths import analysis_dir
+from analysis.time_windows import (
+    analysis_period_is_current,
+    apply_time_windows,
+    hourly_covers_analysis_period,
+    load_hourly_tables,
+    subtract_initial_stage,
+)
+from analysis.utils.report_paths import analysis_dir, temporal_data_file
 from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
+from analysis.report_plots import relative_title
 from skfda import FDataGrid
 from skfda.preprocessing.dim_reduction import FPCA
 from skfda.representation.basis import MonomialBasis
@@ -181,7 +189,7 @@ def _run_fpca_for_metrics(conf, columns):
     """FPCA + comparison stats for screening-only columns (Area, dense root area)."""
     from analysis.utils.report_paths import plot_file
 
-    temporal_data_df = pd.read_csv(data_file(conf, 'Temporal_Data.csv'))
+    temporal_data_df = pd.read_csv(temporal_data_file(conf))
     temporal_data_df = ensure_factor_columns(temporal_data_df)
     temporal_data_df['Experiment'] = temporal_data_df['Experiment'].astype(str)
     temporal_data_df = temporal_data_df.sort_values(by='Experiment')
@@ -231,14 +239,14 @@ def _run_fpca_for_metrics(conf, columns):
             x='ElapsedTime (h)', y=magnitude, hue='Experiment',
             data=temporal_data_df, errorbar='se', palette=genotype_palette, ax=ax,
         )
-        ax.set_title(magnitude)
+        ax.set_title(relative_title(magnitude, conf))
         ax.legend(title=genotype_legend)
         ax = plt.subplot(1, 2, 2)
         sns.scatterplot(
             data=fpc_df, x='PC1' + suffix, y='PC2' + suffix,
             hue='Experiment', palette=genotype_palette, s=100, ax=ax,
         )
-        ax.set_title('PC1 vs PC2')
+        ax.set_title(relative_title('PC1 vs PC2', conf))
         ax.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
         for ext in ('png', 'svg'):
@@ -250,7 +258,7 @@ def _run_fpca_for_metrics(conf, columns):
 
         for fpc1 in range(1, number_of_components + 1):
             pc_col = f'PC{fpc1}{suffix}'
-            pc_label = f'{magnitude} — PC{fpc1}'
+            pc_label = relative_title(f'{magnitude} — PC{fpc1}', conf)
             pc_dir = analysis_dir(conf, MODULE_TEMPORAL, mag_slug, 'fpca', f'pc{fpc1}')
             perform_scalar_pairwise_stats(
                 conf, fpc_df, pc_col, output_dir=None, plant_id_col='Plant_id',
@@ -305,9 +313,43 @@ def run_postprocess(conf):
     return combined, all_data
 
 
+def rebuild_temporal_from_hours(conf):
+    """Rebuild Temporal_Data.csv from Hour CSVs and the current analysis period."""
+    hourly = load_hourly_tables(conf)
+    if hourly is None or hourly.empty:
+        raise FileNotFoundError(
+            'No PostProcess_Hour.csv files found. Run Postprocess before generating a report.'
+        )
+    main_folder = conf.get('MainFolder') or ''
+    if not analysis_period_is_current(conf, main_folder):
+        print(
+            'Warning: the saved analysis period was set for a different set of videos. '
+            'Run Postprocess to include new analyses.',
+            flush=True,
+        )
+    if not hourly_covers_analysis_period(hourly, conf):
+        print(
+            'Warning: the current analysis period is not fully covered by existing hourly files. '
+            'Hours outside the stored Date range will be empty. '
+            'Run Postprocess if you need those extra hours.',
+            flush=True,
+        )
+    print('Rebuilding Temporal_Data.csv from hourly files...', flush=True)
+    all_data = apply_time_windows(hourly, conf)
+    all_data = ensure_factor_columns(all_data)
+    temporal_path = data_file(conf, 'Temporal_Data.csv')
+    all_data.to_csv(temporal_path, index=False)
+    print(f'Wrote {temporal_path}', flush=True)
+    plot_data = subtract_initial_stage(all_data, conf)
+    if conf.get('measureRelativeToInitial') and not plot_data.empty:
+        rel_path = temporal_data_file(conf)
+        plot_data.to_csv(rel_path, index=False)
+        print(f'Wrote {rel_path}', flush=True)
+    return plot_data
+
+
 def _load_postprocessed_tables(conf):
     raw_path = data_file(conf, 'Raw_Data.tsv')
-    temporal_path = data_file(conf, 'Temporal_Data.csv')
     if not os.path.isfile(raw_path):
         raise FileNotFoundError(
             f'No Raw_Data.tsv at {raw_path}. Run Postprocess before generating a report.'
@@ -315,12 +357,7 @@ def _load_postprocessed_tables(conf):
     combined = pd.read_csv(raw_path, sep='\t')
     all_data = pd.DataFrame()
     if conf.get('doPlantGrowth', True):
-        if not os.path.isfile(temporal_path):
-            raise FileNotFoundError(
-                f'No Temporal_Data.csv at {temporal_path}. Run Postprocess before generating a report.'
-            )
-        all_data = pd.read_csv(temporal_path)
-        all_data = ensure_factor_columns(all_data)
+        all_data = rebuild_temporal_from_hours(conf)
     return combined, all_data
 
 
@@ -328,9 +365,9 @@ def run_report(conf, combined, all_data):
     selected = conf.get('selectedMetrics') or SCREENING_TEMPORAL_METRICS
     temporal_selected = apply_screening_plot_defaults(conf, selected)
     do_growth = conf.get('doPlantGrowth', True)
-    do_germination = conf.get('doGermination', True)
+    do_germination = conf.get('doGermination', True) and not conf.get('measureRelativeToInitial')
     do_fpca = conf.get('doFPCA', False)
-    do_fourier = conf.get('doFourier', False)
+    do_fourier = conf.get('doFourier', False) and not conf.get('measureRelativeToInitial')
 
     if do_growth:
         if all_data.empty:

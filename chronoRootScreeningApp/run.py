@@ -24,6 +24,7 @@ import chrono_root_backend  # noqa: F401
 from analysis.time_windows import (
     PERIOD_GATE_MESSAGE,
     analysis_period_is_current,
+    hourly_files_exist,
     report_folder_name,
 )
 from robot_ids import identifier_from_rpi_cam, parse_robot_video_path, resolve_rpi_cam
@@ -319,6 +320,11 @@ class AnalysisTab(QWidget):
         buttons_layout.addWidget(self.configure_stats_btn)
 
         self.generate_report_btn = QPushButton('Generate Report')
+        self.generate_report_btn.setToolTip(
+            'Generate charts and statistics from existing hourly files. '
+            'Re-applies the current analysis period; Postprocess is not required '
+            'when that period is already covered.'
+        )
         self.generate_report_btn.clicked.connect(self.generate_report)
         buttons_layout.addWidget(self.generate_report_btn)
         
@@ -827,7 +833,10 @@ class AnalysisTab(QWidget):
             ui_errors.show_critical(self, "Error", f"Failed to launch preview:\n{e}")
 
     def open_stats_config_dialog(self):
-        self.stats_config_dialog.exec_()
+        snapshot = self.stats_config_dialog.snapshot_values()
+        if self.stats_config_dialog.exec_() != QDialog.Accepted:
+            self.stats_config_dialog.restore_values(snapshot)
+            return
         self._autosave_config()
 
     def open_time_window_dialog(self):
@@ -874,6 +883,7 @@ class AnalysisTab(QWidget):
             'everyXhourFieldFourier': self._int_field(self.everyXhourFieldFourier, 6),
             'everyXhourFieldAngles': self._int_field(self.everyXhourFieldAngles, 6),
             'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
+            'measureRelativeToInitial': self.measureRelativeToInitial.isChecked(),
             'doFPCA': self.fpca_checkbox.isChecked() and self.plant_growth_checkbox.isChecked(),
             'normFPCA': self.fpca_normalize_checkbox.isChecked(),
             'numComponentsFPCAField': self._int_field(self.fpca_components_edit, 2),
@@ -1034,12 +1044,11 @@ class AnalysisTab(QWidget):
         conf = self._build_report_config()
         report_dir = os.path.join(project_dir, report_folder_name(conf))
         raw_path = os.path.join(report_dir, 'data', 'Raw_Data.tsv')
-        temporal_path = os.path.join(report_dir, 'data', 'Temporal_Data.csv')
         missing = []
         if not os.path.isfile(raw_path):
             missing.append('Raw_Data.tsv')
-        if conf.get('doPlantGrowth', True) and not os.path.isfile(temporal_path):
-            missing.append('Temporal_Data.csv')
+        if conf.get('doPlantGrowth', True) and not hourly_files_exist(project_dir):
+            missing.append('PostProcess_Hour.csv')
         if missing:
             ui_errors.show_warning(
                 self,

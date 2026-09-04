@@ -29,6 +29,17 @@ class StatsConfigDialog(QtWidgets.QDialog):
     self.averagePerPlantStats = QtWidgets.QCheckBox("Average intervals before testing")
     self.averagePerPlantStats.setObjectName("averagePerPlantStats")
 
+    self.measureRelativeToInitial = QtWidgets.QCheckBox(
+        "Measure each plant relative to initial stage"
+    )
+    self.measureRelativeToInitial.setObjectName("measureRelativeToInitial")
+    self.measureRelativeToInitial.setChecked(False)
+    self.measureRelativeToInitial.setToolTip(
+        "Subtract the first non-NaN value in the analysis window from each "
+        "length, area, and lateral-root-count series, per plant. "
+        "Speeds, percentages, densities, and angles are unchanged."
+    )
+
     self.everyXhourField = self._labeled_field(
         "Time series stats interval (dt, in hours):", "everyXhourField"
     )
@@ -63,6 +74,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
 
     layout = QtWidgets.QVBoxLayout(self)
     layout.addWidget(self.averagePerPlantStats)
+    layout.addWidget(self.measureRelativeToInitial)
     layout.addLayout(self._field_row(self.everyXhourField[0], self.everyXhourField[1]))
     layout.addLayout(self._field_row(self.everyXhourFieldFourier[0], self.everyXhourFieldFourier[1]))
     layout.addLayout(self._field_row(self.everyXhourFieldAngles[0], self.everyXhourFieldAngles[1]))
@@ -88,6 +100,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
   def register_on_host(self, host):
     """Expose dialog widgets on the main window for config save/load."""
     host.averagePerPlantStats = self.averagePerPlantStats
+    host.measureRelativeToInitial = self.measureRelativeToInitial
     host.everyXhourField = self.everyXhourField[1]
     host.everyXhourFieldFourier = self.everyXhourFieldFourier[1]
     host.everyXhourFieldAngles = self.everyXhourFieldAngles[1]
@@ -96,6 +109,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
 
   def set_defaults(self):
     self.averagePerPlantStats.setChecked(False)
+    self.measureRelativeToInitial.setChecked(False)
     self.everyXhourField[1].setText("6")
     self.everyXhourFieldFourier[1].setText("6")
     self.everyXhourFieldAngles[1].setText("6")
@@ -104,3 +118,33 @@ class StatsConfigDialog(QtWidgets.QDialog):
 
   def stats_checkbox_fields(self):
     return list(self._mode_checkboxes.values())
+
+  def snapshot_values(self):
+    values = {
+        'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
+        'measureRelativeToInitial': self.measureRelativeToInitial.isChecked(),
+        'everyXhourField': self.everyXhourField[1].text(),
+        'everyXhourFieldFourier': self.everyXhourFieldFourier[1].text(),
+        'everyXhourFieldAngles': self.everyXhourFieldAngles[1].text(),
+        'modes': {
+            name: checkbox.isChecked()
+            for name, checkbox in self._mode_checkboxes.items()
+        },
+    }
+    return values
+
+  def restore_values(self, values):
+    if not values:
+      return
+    self.averagePerPlantStats.setChecked(bool(values.get('averagePerPlantStats')))
+    self.measureRelativeToInitial.setChecked(bool(values.get('measureRelativeToInitial')))
+    if values.get('everyXhourField') is not None:
+      self.everyXhourField[1].setText(str(values['everyXhourField']))
+    if values.get('everyXhourFieldFourier') is not None:
+      self.everyXhourFieldFourier[1].setText(str(values['everyXhourFieldFourier']))
+    if values.get('everyXhourFieldAngles') is not None:
+      self.everyXhourFieldAngles[1].setText(str(values['everyXhourFieldAngles']))
+    for name, checked in (values.get('modes') or {}).items():
+      checkbox = self._mode_checkboxes.get(name)
+      if checkbox is not None:
+        checkbox.setChecked(bool(checked))

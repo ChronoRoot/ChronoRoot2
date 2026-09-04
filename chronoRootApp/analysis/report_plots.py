@@ -1,5 +1,6 @@
 """Comparison-mode plots paired with statistical report outputs."""
 
+import math
 import os
 
 import matplotlib.pyplot as plt
@@ -22,9 +23,42 @@ from .utils.report_style import (
 
 plt.switch_backend('agg')
 
+RELATIVE_TITLE_SUFFIX = 'relative to initial stage'
 
-def _plot_title(metric_label, spec):
-    return f'{metric_label} — {spec["header"]}'
+
+def subplot_grid(n):
+    """Rows = floor(sqrt(n)), columns = ceil(n / rows)."""
+    n = max(int(n), 1)
+    nrows = max(1, int(math.floor(math.sqrt(n))))
+    ncols = int(math.ceil(n / nrows))
+    return nrows, ncols
+
+
+def relative_title(title, conf=None):
+    if not (conf or {}).get('measureRelativeToInitial'):
+        return title
+    text = str(title)
+    if RELATIVE_TITLE_SUFFIX.lower() in text.lower():
+        return text
+    return f'{text} — {RELATIVE_TITLE_SUFFIX}'
+
+
+def _plot_title(metric_label, spec, conf=None):
+    return relative_title(f'{metric_label} — {spec["header"]}', conf)
+
+
+def _facet_levels(data, column, drop_unspecified=False):
+    values = list(data[column].unique()) if column in data.columns else []
+    if drop_unspecified:
+        values = [v for v in values if normalize_factor_value(v) != UNSPECIFIED_FACTOR]
+    return sorted(values, key=str)
+
+
+def _facet_wrap_kwargs(col_order):
+    kwargs = {'col_order': col_order}
+    if col_order:
+        kwargs['col_wrap'] = subplot_grid(len(col_order))[1]
+    return kwargs
 
 
 def _palette_kwargs(data, hue_col, conf):
@@ -97,6 +131,10 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
         'kind': kind, 'height': 4, 'aspect': 1.2,
     }
     kwargs.update(_palette_kwargs(data, hue, conf))
+    if col in data.columns:
+        n = int(data[col].nunique(dropna=True))
+        if n:
+            kwargs['col_wrap'] = subplot_grid(n)[1]
     return kwargs
 
 
@@ -118,7 +156,7 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
         return
     count_data = data.copy()
     count_data['_n'] = count_data[metric].notna().astype(int)
-    title = f'{metric_label} — number of plants'
+    title = relative_title(f'{metric_label} — number of plants', conf)
     count_path = _count_plot_path(output_path)
     try:
         if mode == 'by_genotype':
@@ -130,21 +168,13 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
             g = sns.relplot(
                 data=count_data,
                 **_count_lineplot_kwargs(x_col, 'Experiment', 'PlateCondition', data=count_data, conf=conf),
-                col_order=sorted(
-                    [v for v in count_data['PlateCondition'].unique()
-                     if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
-                    key=str,
-                ),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'PlateCondition', drop_unspecified=True)),
             )
         elif mode == 'genotype_by_extra':
             g = sns.relplot(
                 data=count_data,
                 **_count_lineplot_kwargs(x_col, 'Experiment', 'ExtraVariable', data=count_data, conf=conf),
-                col_order=sorted(
-                    [v for v in count_data['ExtraVariable'].unique()
-                     if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
-                    key=str,
-                ),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'ExtraVariable', drop_unspecified=True)),
             )
         elif mode == 'by_plate_condition':
             g = sns.relplot(
@@ -160,13 +190,13 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
             g = sns.relplot(
                 data=count_data,
                 **_count_lineplot_kwargs(x_col, 'PlateCondition', 'Experiment', data=count_data, conf=conf),
-                col_order=sorted(count_data['Experiment'].unique(), key=str),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'Experiment')),
             )
         elif mode == 'extra_within_genotype':
             g = sns.relplot(
                 data=count_data,
                 **_count_lineplot_kwargs(x_col, 'ExtraVariable', 'Experiment', data=count_data, conf=conf),
-                col_order=sorted(count_data['Experiment'].unique(), key=str),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'Experiment')),
             )
         else:
             return
@@ -193,7 +223,7 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
-    title = title or _plot_title(metric_label, spec)
+    title = title or _plot_title(metric_label, spec, conf)
 
     plt.ioff()
     try:
@@ -202,18 +232,12 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
         elif mode == 'genotype_by_plate':
             g = sns.relplot(
                 data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'PlateCondition', data=plot_data, conf=conf),
-                col_order=sorted(
-                    [v for v in plot_data['PlateCondition'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
-                    key=str,
-                ),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'PlateCondition', drop_unspecified=True)),
             )
         elif mode == 'genotype_by_extra':
             g = sns.relplot(
                 data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'ExtraVariable', data=plot_data, conf=conf),
-                col_order=sorted(
-                    [v for v in plot_data['ExtraVariable'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
-                    key=str,
-                ),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'ExtraVariable', drop_unspecified=True)),
             )
         elif mode == 'by_plate_condition':
             g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', data=plot_data, conf=conf))
@@ -222,12 +246,12 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
         elif mode == 'plate_within_genotype':
             g = sns.relplot(
                 data=plot_data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', 'Experiment', data=plot_data, conf=conf),
-                col_order=sorted(plot_data['Experiment'].unique(), key=str),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'Experiment')),
             )
         elif mode == 'extra_within_genotype':
             g = sns.relplot(
                 data=plot_data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', 'Experiment', data=plot_data, conf=conf),
-                col_order=sorted(plot_data['Experiment'].unique(), key=str),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'Experiment')),
             )
         else:
             return False
@@ -255,7 +279,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
-    title = _plot_title(metric_label, spec)
+    title = _plot_title(metric_label, spec, conf)
     output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name or '')
     plt.ioff()
 
@@ -326,7 +350,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
-    title = _plot_title(metric_label, spec)
+    title = _plot_title(metric_label, spec, conf)
     output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name or '')
     plt.ioff()
 

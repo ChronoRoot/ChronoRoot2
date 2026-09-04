@@ -9,12 +9,12 @@ from skfda.representation.basis import MonomialBasis
 import seaborn as sns
 from scipy.stats import norm
 from .stats_utils import perform_scalar_pairwise_stats, ensure_factor_columns
-from .report_plots import emit_scalar_comparison_plots
+from .report_plots import emit_scalar_comparison_plots, relative_title
 from .utils.report_paths import (
     MODULE_TEMPORAL,
     analysis_dir,
-    data_file,
     plot_file,
+    temporal_data_file,
     temporal_metric_slug,
 )
 from .utils.report_style import (
@@ -55,7 +55,7 @@ def performFPCA(conf_path):
     inverse_rank_normalize = conf['normFPCA']
     number_of_components = int(conf['numComponentsFPCAField'])
 
-    temporal_data_df = pd.read_csv(data_file(conf, 'Temporal_Data.csv'))
+    temporal_data_df = pd.read_csv(temporal_data_file(conf))
     temporal_data_df = ensure_factor_columns(temporal_data_df)
     temporal_data_df['Experiment'] = temporal_data_df['Experiment'].astype('str')
     temporal_data_df = temporal_data_df.sort_values(by='Experiment')
@@ -90,7 +90,7 @@ def performFPCA(conf_path):
             x='ElapsedTime (h)', y=magnitude, hue='Experiment',
             data=temporal_data_df, errorbar='se', palette=genotype_palette,
         )
-        plt.title(magnitude, fontsize=16)
+        plt.title(relative_title(magnitude, conf), fontsize=16)
         leg = plt.gca().get_legend()
         if leg is not None:
             leg.set_title(genotype_legend)
@@ -122,7 +122,7 @@ def performFPCA(conf_path):
             s=100,
             ax=ax,
         )
-        ax.set_title('PC1 vs PC2')
+        ax.set_title(relative_title('PC1 vs PC2', conf))
         ax.set_xlabel('PC1' + (' (IRN)' if inverse_rank_normalize else ''))
         ax.set_ylabel('PC2' + (' (IRN)' if inverse_rank_normalize else ''))
         ax.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -138,7 +138,10 @@ def performFPCA(conf_path):
                 palette=genotype_palette,
             )
             ax.set_title(
-                f'PC{fpc1}. Variance Explained: {fpca.explained_variance_ratio_[fpc1 - 1]:.2f}',
+                relative_title(
+                    f'PC{fpc1}. Variance Explained: {fpca.explained_variance_ratio_[fpc1 - 1]:.2f}',
+                    conf,
+                ),
                 fontsize=16,
             )
 
@@ -158,7 +161,7 @@ def performFPCA(conf_path):
                 color = palette[i]
                 ax.plot(curve, color=color, label=f'Q {quantiles[i]:.2f}')
 
-            ax.set_title(f'Interpretation of PC{fpc1}', fontsize=16)
+            ax.set_title(relative_title(f'Interpretation of PC{fpc1}', conf), fontsize=16)
             ax.set_ylabel(magnitude)
             ax.set_xlabel('Time (h)')
 
@@ -186,7 +189,7 @@ def performFPCA(conf_path):
                         data=fpc_df, x=fpc_i, y=fpc_j, hue='Experiment',
                         palette=genotype_palette, s=100,
                     )
-                    plt.title(f'{magnitude} - PC{i} vs PC{j}', fontsize=14)
+                    plt.title(relative_title(f'{magnitude} - PC{i} vs PC{j}', conf), fontsize=14)
                     plt.xlabel(f'PC{i}', fontsize=12)
                     plt.ylabel(f'PC{j}', fontsize=12)
                     plt.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -206,7 +209,7 @@ def performFPCA(conf_path):
         # Phase B: paired comparison stats/plots per PC (after overview is saved)
         for fpc1 in range(1, number_of_components + 1):
             pc_col = f"PC{fpc1}{'_IRN' if inverse_rank_normalize else ''}"
-            pc_label = f'{magnitude} — PC{fpc1}'
+            pc_label = relative_title(f'{magnitude} — PC{fpc1}', conf)
             pc_dir = analysis_dir(conf, MODULE_TEMPORAL, mag_slug, 'fpca', f'pc{fpc1}')
             perform_scalar_pairwise_stats(
                 conf, fpc_df, pc_col, output_dir=None, plant_id_col='Plant_id',

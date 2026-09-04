@@ -33,7 +33,7 @@ from analysis.utils.fileUtilities import (
     build_plant_id,
     normalize_factor_value,
 )
-from analysis.time_windows import apply_time_windows, snapshot_hours
+from analysis.time_windows import apply_time_windows, snapshot_hours, subtract_initial_stage
 from analysis.utils.report_paths import (
     data_file,
     individual_plots_dir,
@@ -41,6 +41,7 @@ from analysis.utils.report_paths import (
     MODULE_CONVEX,
     purge_disabled_comparison_outputs,
     report_root,
+    temporal_data_file,
 )
 
 
@@ -90,6 +91,8 @@ if __name__ == "__main__":
     temporal_data_path = data_file(conf, 'Temporal_Data.csv')
     convex_data_path = data_file(conf, 'Convex_Hull_Data.csv')
 
+    relative = bool(conf.get('measureRelativeToInitial'))
+
     # --- Phase 1: temporal aggregate + individual plots ---
     print('Phase 1/3: aggregating temporal data...')
     plant_frames = []
@@ -99,7 +102,9 @@ if __name__ == "__main__":
         exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
         print(f'Phase 1/3: experiment {exp_index}/{n_experiments}: {real_exp_name}')
 
-        iplots_exp_folder = individual_plots_dir(conf, exp_dir_name)
+        iplots_exp_folder = None
+        if not relative:
+            iplots_exp_folder = individual_plots_dir(conf, exp_dir_name)
 
         rpi_paths = utils.load_paths(exp_dir, '*')
         for rpi in rpi_paths:
@@ -132,6 +137,9 @@ if __name__ == "__main__":
                     )
                     plant_frames.append(data)
 
+                    if relative:
+                        continue
+
                     plot_filename = f"{exp_dir_name}_{plant_id}.png"
                     iplot_cache = os.path.join(res_folder, plot_filename)
                     report_dest = os.path.join(iplots_exp_folder, plot_filename)
@@ -149,16 +157,22 @@ if __name__ == "__main__":
     all_data.to_csv(temporal_data_path, index=False)
     print(f'Phase 1/3: wrote {temporal_data_path}')
 
-    all_data = _normalize_temporal_dataframe(all_data)
+    plot_data = subtract_initial_stage(all_data, conf) if not all_data.empty else all_data
+    if not plot_data.empty:
+        plot_data = _normalize_temporal_dataframe(plot_data)
+    if relative and not plot_data.empty:
+        rel_path = temporal_data_file(conf)
+        plot_data.to_csv(rel_path, index=False)
+        print(f'Phase 1/3: wrote {rel_path}')
 
     config_modes = get_enabled_comparison_modes(conf)
-    effective_modes = get_enabled_comparison_modes(conf, all_data)
+    effective_modes = get_enabled_comparison_modes(conf, plot_data)
     conf['effectiveComparisonModes'] = effective_modes
     log_auto_disabled_modes(conf, config_modes, effective_modes)
 
     # --- Phase 2: convex hull ---
     convex_hull_df = pd.DataFrame()
-    if conf.get('doConvex'):
+    if conf.get('doConvex') and not relative:
         print('Phase 2/3: convex hull analysis...')
         global_shape, global_center = convex_hull.calculate_atlas_geometry(experiments)
         snapshot_h = snapshot_hours(conf, kind='convex')
@@ -210,16 +224,16 @@ if __name__ == "__main__":
     # --- Phase 3: figures and statistics ---
     print('Phase 3/3: generating report figures and statistics...')
 
-    performStatisticalAnalysisForMetrics(conf, all_data, temporal_parameters)
+    performStatisticalAnalysisForMetrics(conf, plot_data, temporal_parameters)
 
-    plot_info_all(conf, all_data)
-    generateTableTemporal(conf, all_data)
+    plot_info_all(conf, plot_data)
+    generateTableTemporal(conf, plot_data)
 
     if conf.get('doFPCA'):
         print('Phase 3/3: FPCA analysis')
-        performFPCA(args.config)
+        performFPCA(conf)
 
-    if conf.get('doConvex') and not convex_hull_df.empty:
+    if not relative and conf.get('doConvex') and not convex_hull_df.empty:
         print('Phase 3/3: convex hull summary and statistics')
         convex_hull.plot_hull_metrics_summary(conf, convex_hull_df)
         convex_hull.visualize_combined_atlases(conf)
@@ -237,11 +251,11 @@ if __name__ == "__main__":
 
         conf['effectiveComparisonModes'] = saved_modes
 
-    if conf.get('doFourier'):
+    if not relative and conf.get('doFourier'):
         print('Phase 3/3: Fourier analysis')
         makeFourierPlots(conf)
 
-    if conf.get('doLateralAngles'):
+    if not relative and conf.get('doLateralAngles'):
         print('Phase 3/3: lateral angles analysis')
         makeLateralAnglesPlots(conf)
         plotLateralAnglesOnTop(conf)

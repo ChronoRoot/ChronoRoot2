@@ -12,6 +12,7 @@ MODULE_ANGLES = 'angles'
 
 OVERVIEW_SLUG = 'overview'
 INDIVIDUAL_PLOTS_DIR = 'individual_plots'
+RELATIVE_MEASUREMENTS_DIR = 'relative measurements'
 
 TEMPORAL_METRICS = [
     'MainRootLength (mm)',
@@ -68,10 +69,25 @@ def module_dir(conf, module: str) -> str:
     return path
 
 
+def measure_relative_to_initial(conf) -> bool:
+    return bool((conf or {}).get('measureRelativeToInitial'))
+
+
 def metric_dir(conf, module: str, slug: str) -> str:
     path = os.path.join(module_dir(conf, module), slug)
+    if measure_relative_to_initial(conf) and module == MODULE_TEMPORAL:
+        path = os.path.join(path, RELATIVE_MEASUREMENTS_DIR)
     ensure_directory(path)
     return path
+
+
+def temporal_data_file(conf) -> str:
+    """Temporal_Data.csv; relative runs write a copy under data/relative measurements/."""
+    if measure_relative_to_initial(conf):
+        path = os.path.join(report_root(conf), 'data', RELATIVE_MEASUREMENTS_DIR)
+        ensure_directory(path)
+        return os.path.join(path, 'Temporal_Data.csv')
+    return data_file(conf, 'Temporal_Data.csv')
 
 
 def analysis_dir(conf, module: str, metric_slug_name: str, *subpath: str) -> str:
@@ -164,14 +180,20 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
             continue
         for slug in slugs:
             base = os.path.join(module_path, slug)
-            if not os.path.isdir(base):
-                continue
-            for mode in disabled:
-                stem = f'{slug}_{mode}'
-                for filename in (f'{stem}.png', f'{stem}_stats.txt', f'{stem}_count.png'):
-                    path = os.path.join(base, filename)
-                    if os.path.isfile(path):
-                        os.remove(path)
+            bases = [base]
+            if module == MODULE_TEMPORAL:
+                rel_base = os.path.join(base, RELATIVE_MEASUREMENTS_DIR)
+                if os.path.isdir(rel_base):
+                    bases.append(rel_base)
+            for out_dir in bases:
+                if not os.path.isdir(out_dir):
+                    continue
+                for mode in disabled:
+                    stem = f'{slug}_{mode}'
+                    for filename in (f'{stem}.png', f'{stem}_stats.txt', f'{stem}_count.png'):
+                        path = os.path.join(out_dir, filename)
+                        if os.path.isfile(path):
+                            os.remove(path)
 
     for parent_slug in FOURIER_PARENT_METRICS.values():
         growth_dir = os.path.join(root, MODULE_TEMPORAL, parent_slug, 'growth_speed')

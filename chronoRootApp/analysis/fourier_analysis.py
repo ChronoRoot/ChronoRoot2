@@ -28,6 +28,17 @@ from .utils.report_paths import (
 from .time_windows import draw_clock_ticks, elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 
+
+def _odd_kernel(n, requested):
+    n = int(n)
+    if n < 3:
+        return 0
+    limit = n if n % 2 else n - 1
+    k = min(int(requested), limit)
+    if k % 2 == 0:
+        k -= 1
+    return k if k >= 3 else 0
+
 def _interp_interior_nans(values):
     """Fill NaNs between the first and last finite samples; keep end pads as NaN."""
     y = np.asarray(values, dtype=float).copy()
@@ -123,8 +134,13 @@ class DataProcessor:
             std = np.std(m_speed[valid])
             work = (work - mean) / std if std != 0 else work - mean
         if medfilt:
-            work = signal.medfilt(work, 5)
-            work = work - signal.medfilt(work, 25)
+            n = len(work)
+            k5 = _odd_kernel(n, 5)
+            k25 = _odd_kernel(n, 25)
+            if k5:
+                work = signal.medfilt(work, k5)
+            if k25:
+                work = work - signal.medfilt(work, k25)
         if detrend:
             work = signal.detrend(work)
         out = np.full(m_speed.shape, np.nan, dtype=float)

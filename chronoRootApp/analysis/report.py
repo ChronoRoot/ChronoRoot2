@@ -42,7 +42,7 @@ from .utils.report_paths import (
     temporal_metric_slug,
 )
 from .stats_utils import perform_temporal_pairwise_stats, ensure_factor_columns
-from .report_plots import emit_temporal_comparison_plots
+from .report_plots import emit_temporal_comparison_plots, relative_title, subplot_grid
 from .time_windows import draw_clock_ticks, elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 
@@ -335,14 +335,13 @@ def plot_info_all(conf, dataframe):
         ax.legend(loc='best', title=geno_label)
 
     n = len(metrics)
-    ncols = 3 if n > 2 else max(n, 1)
-    nrows = int(np.ceil(n / ncols))
+    nrows, ncols = subplot_grid(n)
     fig3 = plt.figure(figsize=(4 * ncols, 4 * nrows), constrained_layout=True)
     gs = fig3.add_gridspec(nrows, ncols)
     axes = [fig3.add_subplot(gs[i // ncols, i % ncols]) for i in range(n)]
 
     for ax, (col, title) in zip(axes, metrics):
-        _plot_metric(ax, col, title)
+        _plot_metric(ax, col, relative_title(title, conf))
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
         ax.set_ylabel(_overview_ylabel(col), fontsize=12)
 
@@ -363,7 +362,7 @@ def plot_info_all(conf, dataframe):
             errorbar=None, estimator='sum', ax=ax, palette=geno_palette,
         )
         draw_clock_ticks(ax, n_df, conf, twin_axis=False)
-        ax.set_title(title, fontsize=16)
+        ax.set_title(relative_title(title, conf), fontsize=16)
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
         ax.set_ylabel('Number of plants', fontsize=12)
         ax.legend(loc='best', title=geno_label)

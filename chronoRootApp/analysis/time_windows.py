@@ -532,6 +532,100 @@ def apply_time_windows(data, conf):
     return result
 
 
+INITIAL_STAGE_COLUMNS = (
+    'MainRootLength (mm)',
+    'LateralRootsLength (mm)',
+    'TotalLength (mm)',
+    'HypocotylLength (mm)',
+    'NumberOfLateralRoots',
+    'Area (mm2)',
+    'DenseRootArea (mm2)',
+    'Area',
+    'DenseRootArea',
+)
+
+
+def subtract_initial_stage(data, conf):
+    """Subtract each plant's first in-window non-NaN from length/area/LR series."""
+    if data is None or data.empty:
+        return data
+    if not (conf or {}).get('measureRelativeToInitial'):
+        return data
+    work = data.copy()
+    cols = [c for c in INITIAL_STAGE_COLUMNS if c in work.columns]
+    if not cols:
+        return work
+    for col in cols:
+        work[col] = pd.to_numeric(work[col], errors='coerce')
+    key_cols = _plant_key_columns(work)
+    for _key, part in work.groupby(key_cols, sort=False):
+        idx = part.index
+        for col in cols:
+            series = work.loc[idx, col]
+            first = series.first_valid_index()
+            if first is None:
+                continue
+            baseline = series.loc[first]
+            if pd.isna(baseline):
+                continue
+            work.loc[idx, col] = series - baseline
+    return work
+
+
+def hourly_covers_analysis_period(hourly_df, conf):
+    """True if each group's [start, start+duration] lies inside Hour Date spans."""
+    if hourly_df is None or hourly_df.empty or 'Date' not in hourly_df.columns:
+        return False
+    groups = list((conf or {}).get('timeGroups') or [])
+    if not groups:
+        return False
+    duration = (conf or {}).get('timeDurationHours')
+    if duration in (None, ''):
+        duration_hours = default_duration_hours(groups, hourly_df)
+    else:
+        duration_hours = float(duration)
+
+    work = hourly_df.copy()
+    work['Date'] = _ensure_dates(work['Date'])
+    if 'Plant_id' not in work.columns:
+        return False
+    key_cols = _plant_key_columns(work)
+    group_bounds = {}
+    for _key, part in work.groupby(key_cols, sort=False):
+        dates = part['Date'].dropna()
+        if dates.empty:
+            continue
+        group = match_time_group(groups, dates.min(), dates.max())
+        if group is None:
+            continue
+        gid = group.get('id')
+        dmin, dmax = dates.min(), dates.max()
+        if gid not in group_bounds:
+            group_bounds[gid] = [dmin, dmax]
+        else:
+            group_bounds[gid][0] = min(group_bounds[gid][0], dmin)
+            group_bounds[gid][1] = max(group_bounds[gid][1], dmax)
+
+    if not group_bounds:
+        return False
+    for i, group in enumerate(groups):
+        window = _window_for_group(group, duration_hours)
+        if window is None:
+            return False
+        start, _t0, end = window
+        gid = group.get('id')
+        if gid is None:
+            gid = i + 1
+        bounds = group_bounds.get(gid)
+        if bounds is None:
+            bounds = group_bounds.get(i + 1)
+        if bounds is None:
+            return False
+        if bounds[0] > start or bounds[1] < end:
+            return False
+    return True
+
+
 def elapsed_clock_ticks(data, conf=None, clock_times=None):
     """Elapsed hours whose Date matches configured clock times of day."""
     if data is None or data.empty:
@@ -608,6 +702,17 @@ def draw_clock_ticks_on_axes(axes, data, conf):
         draw_clock_ticks(ax, data, conf, twin_axis=True)
 
 
+def hourly_files_exist(main_folder):
+    """True if any PostProcess_Hour.csv exists under Analysis/ (does not read files)."""
+    analysis = os.path.join(main_folder, 'Analysis') if main_folder else ''
+    if not analysis or not os.path.isdir(analysis):
+        return False
+    for _dirpath, _dirnames, filenames in os.walk(analysis):
+        if 'PostProcess_Hour.csv' in filenames:
+            return True
+    return False
+
+
 def collect_hourly_frames(analysis_folder):
     """Load PostProcess_Hour.csv frames (Date fallback from Results_raw names)."""
     frames = []
@@ -653,6 +758,11 @@ def collect_hourly_data(main_folder):
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def load_hourly_tables(conf):
+    """Load PostProcess_Hour.csv tables from the project's Analysis tree."""
+    return collect_hourly_data((conf or {}).get('MainFolder') or '')
 
 
 def _span_record(plant_id, date_min, date_max, experiment='', video='', n_plants=1):

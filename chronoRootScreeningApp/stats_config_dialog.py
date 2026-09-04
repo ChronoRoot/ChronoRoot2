@@ -119,6 +119,46 @@ class ScreeningStatsConfigDialog(StatsConfigDialog):
         for checkbox in self._measure_checkboxes.values():
             checkbox.setChecked(True)
 
+    def snapshot_values(self):
+        values = super().snapshot_values()
+        values.update({
+            'doFourier': self.doFourier.isChecked(),
+            'fpca_checkbox': self.fpca_checkbox.isChecked(),
+            'fpca_components': self.fpca_components_edit.text(),
+            'fpca_normalize': self.fpca_normalize_checkbox.isChecked(),
+            'genotypeAxisLabel': self.genotypeAxisLabelField.text(),
+            'plateConditionAxisLabel': self.plateConditionAxisLabelField.text(),
+            'extraVariableLabel': self.extraVariableLabelField.text(),
+            'measures': {
+                name: checkbox.isChecked()
+                for name, checkbox in self._measure_checkboxes.items()
+            },
+        })
+        return values
+
+    def restore_values(self, values):
+        super().restore_values(values)
+        if not values:
+            return
+        if 'doFourier' in values:
+            self.doFourier.setChecked(bool(values['doFourier']))
+        if 'fpca_checkbox' in values:
+            self.fpca_checkbox.setChecked(bool(values['fpca_checkbox']))
+        if values.get('fpca_components') is not None:
+            self.fpca_components_edit.setText(str(values['fpca_components']))
+        if 'fpca_normalize' in values:
+            self.fpca_normalize_checkbox.setChecked(bool(values['fpca_normalize']))
+        if values.get('genotypeAxisLabel') is not None:
+            self.genotypeAxisLabelField.setText(str(values['genotypeAxisLabel']))
+        if values.get('plateConditionAxisLabel') is not None:
+            self.plateConditionAxisLabelField.setText(str(values['plateConditionAxisLabel']))
+        if values.get('extraVariableLabel') is not None:
+            self.extraVariableLabelField.setText(str(values['extraVariableLabel']))
+        for name, checked in (values.get('measures') or {}).items():
+            checkbox = self._measure_checkboxes.get(name)
+            if checkbox is not None:
+                checkbox.setChecked(bool(checked))
+
     def set_plant_growth_enabled(self, enabled):
         self.fpca_widget.setEnabled(bool(enabled))
 
