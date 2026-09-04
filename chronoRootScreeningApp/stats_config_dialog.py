@@ -1,6 +1,6 @@
-"""Screening statistical analysis dialog: chronoRootApp modes plus measure list."""
+"""Screening report-parameter dialog: chronoRootApp modes plus FPCA, Fourier, measures."""
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtGui, QtWidgets
 
 from chrono_root_backend import CHRONOROOT_APP_DIR  # noqa: F401  # puts chronoRootApp on sys.path
 from gui.stats_config_dialog import StatsConfigDialog
@@ -29,7 +29,8 @@ MEASURE_WIDGETS = [
 class ScreeningStatsConfigDialog(StatsConfigDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.resize(540, 720)
+        self.setWindowTitle("Configure Report Parameters")
+        self.resize(540, 760)
 
         self.everyXhourFieldAngles[0].hide()
         self.everyXhourFieldAngles[1].hide()
@@ -42,6 +43,25 @@ class ScreeningStatsConfigDialog(StatsConfigDialog):
         self.doFourier = QtWidgets.QCheckBox("Perform Fourier analysis of growth speed")
         self.doFourier.setObjectName("doFourier")
         self.doFourier.setChecked(True)
+
+        self.fpca_checkbox = QtWidgets.QCheckBox("Perform FPCA analysis")
+        self.fpca_checkbox.setObjectName("fpca_checkbox")
+        self.fpca_components_edit = QtWidgets.QLineEdit("2")
+        self.fpca_components_edit.setObjectName("fpca_components_edit")
+        self.fpca_components_edit.setFixedWidth(40)
+        self.fpca_components_edit.setValidator(QtGui.QIntValidator(2, 10))
+        self.fpca_normalize_checkbox = QtWidgets.QCheckBox("Normalize FPCA data")
+        self.fpca_normalize_checkbox.setObjectName("fpca_normalize_checkbox")
+        self.fpca_normalize_checkbox.setChecked(False)
+
+        self.fpca_widget = QtWidgets.QWidget()
+        fpca_layout = QtWidgets.QHBoxLayout(self.fpca_widget)
+        fpca_layout.setContentsMargins(0, 0, 0, 0)
+        fpca_layout.addWidget(self.fpca_checkbox)
+        fpca_layout.addWidget(QtWidgets.QLabel("Components:"))
+        fpca_layout.addWidget(self.fpca_components_edit)
+        fpca_layout.addWidget(self.fpca_normalize_checkbox)
+        fpca_layout.addStretch()
 
         self.measures_group = QtWidgets.QGroupBox("Measures")
         measures_layout = QtWidgets.QVBoxLayout()
@@ -71,12 +91,16 @@ class ScreeningStatsConfigDialog(StatsConfigDialog):
         layout = self.layout()
         help_index = layout.indexOf(self.help_label)
         layout.insertWidget(help_index, self.doFourier)
-        layout.insertWidget(help_index + 1, self.measures_group)
-        layout.insertWidget(help_index + 2, labels_group)
+        layout.insertWidget(help_index + 1, self.fpca_widget)
+        layout.insertWidget(help_index + 2, self.measures_group)
+        layout.insertWidget(help_index + 3, labels_group)
 
     def register_on_host(self, host):
         super().register_on_host(host)
         host.doFourier = self.doFourier
+        host.fpca_checkbox = self.fpca_checkbox
+        host.fpca_components_edit = self.fpca_components_edit
+        host.fpca_normalize_checkbox = self.fpca_normalize_checkbox
         host.genotypeAxisLabelField = self.genotypeAxisLabelField
         host.plateConditionAxisLabelField = self.plateConditionAxisLabelField
         host.extraVariableLabelField = self.extraVariableLabelField
@@ -86,11 +110,17 @@ class ScreeningStatsConfigDialog(StatsConfigDialog):
     def set_defaults(self):
         super().set_defaults()
         self.doFourier.setChecked(True)
+        self.fpca_checkbox.setChecked(False)
+        self.fpca_components_edit.setText("2")
+        self.fpca_normalize_checkbox.setChecked(False)
         self.genotypeAxisLabelField.setText("Group")
         self.plateConditionAxisLabelField.setText("Plate condition")
         self.extraVariableLabelField.setText("Run")
         for checkbox in self._measure_checkboxes.values():
             checkbox.setChecked(True)
+
+    def set_plant_growth_enabled(self, enabled):
+        self.fpca_widget.setEnabled(bool(enabled))
 
     def selected_metric_columns(self):
         columns = []

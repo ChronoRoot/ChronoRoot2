@@ -138,7 +138,11 @@ def temporal_metric_slug(metric_column: str) -> str:
 
 
 def purge_disabled_comparison_outputs(conf, effective_modes):
-    """Remove comparison PNG/stats for modes not in the effective list."""
+    """Remove comparison PNG/stats for modes not in the effective list.
+
+    Only touches directories that already exist so unused modules
+    (angles, convex hull, unselected temporal slugs) are not created.
+    """
     from ..stats_utils import ALL_COMPARISON_MODES
 
     effective = set(effective_modes or [])
@@ -146,24 +150,34 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
     if not disabled:
         return
 
+    root = report_root(conf)
     metric_targets = [
         (MODULE_TEMPORAL, [temporal_metric_slug(m) for m in TEMPORAL_METRICS]),
         (MODULE_CONVEX, [metric_slug(m) for m in CONVEX_METRICS]),
         (MODULE_ANGLES, list(ANGLE_METRICS.keys())),
     ]
     for module, slugs in metric_targets:
+        module_path = os.path.join(root, module)
+        if not os.path.isdir(module_path):
+            continue
         for slug in slugs:
-            base = metric_dir(conf, module, slug)
+            base = os.path.join(module_path, slug)
+            if not os.path.isdir(base):
+                continue
             for mode in disabled:
-                for path_fn in (comparison_plot_path, comparison_stats_path):
-                    path = path_fn(base, mode, metric_slug=slug)
+                stem = f'{slug}_{mode}'
+                for filename in (f'{stem}.png', f'{stem}_stats.txt', f'{stem}_count.png'):
+                    path = os.path.join(base, filename)
                     if os.path.isfile(path):
                         os.remove(path)
 
     for parent_slug in FOURIER_PARENT_METRICS.values():
-        growth_dir = analysis_dir(conf, MODULE_TEMPORAL, parent_slug, 'growth_speed')
+        growth_dir = os.path.join(root, MODULE_TEMPORAL, parent_slug, 'growth_speed')
+        if not os.path.isdir(growth_dir):
+            continue
         for mode in disabled:
-            for path_fn in (comparison_plot_path, comparison_stats_path):
-                path = path_fn(growth_dir, mode, metric_slug=parent_slug)
+            stem = f'{parent_slug}_{mode}'
+            for filename in (f'{stem}.png', f'{stem}_stats.txt', f'{stem}_count.png'):
+                path = os.path.join(growth_dir, filename)
                 if os.path.isfile(path):
                     os.remove(path)

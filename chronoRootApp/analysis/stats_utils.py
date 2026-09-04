@@ -213,8 +213,8 @@ def _write_pairwise_block(f, subdata, metric, group_col, group_names, label_pref
     for i in range(len(group_names) - 1):
         for j in range(i + 1, len(group_names)):
             g1, g2 = group_names[i], group_names[j]
-            v1 = subdata[subdata[group_col].astype(str) == str(g1)][metric]
-            v2 = subdata[subdata[group_col].astype(str) == str(g2)][metric]
+            v1 = subdata[subdata[group_col].astype(str) == str(g1)][metric].dropna()
+            v2 = subdata[subdata[group_col].astype(str) == str(g2)][metric].dropna()
             prefix = f'{label_prefix}' if label_prefix else ''
             try:
                 if len(v1) == 0 or len(v2) == 0:
@@ -373,6 +373,8 @@ def write_fourier_comparison_stats(f, subdata, group_col, metric, group_names, l
             g1, g2 = group_names[i], group_names[j]
             v1 = subdata[subdata[group_col].astype(str) == str(g1)][metric]
             v2 = subdata[subdata[group_col].astype(str) == str(g2)][metric]
+            v1 = v1.dropna()
+            v2 = v2.dropna()
             prefix = label_prefix
             try:
                 if len(v1) == 0 or len(v2) == 0:

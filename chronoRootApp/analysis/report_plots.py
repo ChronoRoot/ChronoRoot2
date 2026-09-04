@@ -1,5 +1,7 @@
 """Comparison-mode plots paired with statistical report outputs."""
 
+import os
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -97,11 +99,93 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
     return kwargs
 
 
+def _count_lineplot_kwargs(x_col, hue_col, facet_col=None, data=None, conf=None):
+    kwargs = _lineplot_kwargs(x_col, '_n', hue_col, facet_col=facet_col, data=data, conf=conf)
+    kwargs['errorbar'] = None
+    kwargs['estimator'] = 'sum'
+    return kwargs
+
+
+def _count_plot_path(output_path):
+    root, ext = os.path.splitext(output_path)
+    return f'{root}_count{ext or ".png"}'
+
+
+def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label):
+    """Companion N-over-time figure in the same folder as the mean plot."""
+    if metric not in data.columns:
+        return
+    count_data = data.copy()
+    count_data['_n'] = count_data[metric].notna().astype(int)
+    title = f'{metric_label} — number of plants'
+    count_path = _count_plot_path(output_path)
+    try:
+        if mode == 'by_genotype':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'Experiment', data=count_data, conf=conf),
+            )
+        elif mode == 'genotype_by_plate':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'Experiment', 'PlateCondition', data=count_data, conf=conf),
+                col_order=sorted(
+                    [v for v in count_data['PlateCondition'].unique()
+                     if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
+                    key=str,
+                ),
+            )
+        elif mode == 'genotype_by_extra':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'Experiment', 'ExtraVariable', data=count_data, conf=conf),
+                col_order=sorted(
+                    [v for v in count_data['ExtraVariable'].unique()
+                     if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
+                    key=str,
+                ),
+            )
+        elif mode == 'by_plate_condition':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'PlateCondition', data=count_data, conf=conf),
+            )
+        elif mode == 'by_extra_variable':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'ExtraVariable', data=count_data, conf=conf),
+            )
+        elif mode == 'plate_within_genotype':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'PlateCondition', 'Experiment', data=count_data, conf=conf),
+                col_order=sorted(count_data['Experiment'].unique(), key=str),
+            )
+        elif mode == 'extra_within_genotype':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'ExtraVariable', 'Experiment', data=count_data, conf=conf),
+                col_order=sorted(count_data['Experiment'].unique(), key=str),
+            )
+        else:
+            return
+        axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
+        finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
+        g.set_ylabels('Number of plants')
+        g.fig.suptitle(title, y=1.02)
+        g.savefig(count_path, dpi=300, bbox_inches='tight')
+    except Exception:
+        pass
+    finally:
+        plt.close('all')
+
+
 def plot_comparison_mode(conf, data, metric, mode, output_path, *,
                          x_col='ElapsedTime (h)', metric_label=None, title=None,
                          module=None, metric_slug_name=None, analysis_type='temporal'):
     """Save a line plot matching the grouping used for a comparison mode."""
     data = ensure_factor_columns(data)
+    plot_data = data.dropna(subset=[metric]) if metric in data.columns else data
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
@@ -110,36 +194,36 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
     plt.ioff()
     try:
         if mode == 'by_genotype':
-            g = sns.relplot(data=data, **_lineplot_kwargs(x_col, metric, 'Experiment', data=data, conf=conf))
+            g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', data=plot_data, conf=conf))
         elif mode == 'genotype_by_plate':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'PlateCondition', data=data, conf=conf),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'PlateCondition', data=plot_data, conf=conf),
                 col_order=sorted(
-                    [v for v in data['PlateCondition'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
+                    [v for v in plot_data['PlateCondition'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
                     key=str,
                 ),
             )
         elif mode == 'genotype_by_extra':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'ExtraVariable', data=data, conf=conf),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'ExtraVariable', data=plot_data, conf=conf),
                 col_order=sorted(
-                    [v for v in data['ExtraVariable'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
+                    [v for v in plot_data['ExtraVariable'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
                     key=str,
                 ),
             )
         elif mode == 'by_plate_condition':
-            g = sns.relplot(data=data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', data=data, conf=conf))
+            g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', data=plot_data, conf=conf))
         elif mode == 'by_extra_variable':
-            g = sns.relplot(data=data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', data=data, conf=conf))
+            g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', data=plot_data, conf=conf))
         elif mode == 'plate_within_genotype':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', 'Experiment', data=data, conf=conf),
-                col_order=sorted(data['Experiment'].unique(), key=str),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', 'Experiment', data=plot_data, conf=conf),
+                col_order=sorted(plot_data['Experiment'].unique(), key=str),
             )
         elif mode == 'extra_within_genotype':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', 'Experiment', data=data, conf=conf),
-                col_order=sorted(data['Experiment'].unique(), key=str),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', 'Experiment', data=plot_data, conf=conf),
+                col_order=sorted(plot_data['Experiment'].unique(), key=str),
             )
         else:
             return False
@@ -149,6 +233,7 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
         g.fig.suptitle(title, y=1.02)
         g.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close('all')
+        _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
     except Exception:
         plt.close('all')

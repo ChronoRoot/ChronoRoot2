@@ -21,6 +21,7 @@ from PyQt5.QtGui import QColor, QPixmap, QIntValidator, QDoubleValidator
 import ui_errors
 import interface_config
 import chrono_root_backend  # noqa: F401
+from robot_ids import identifier_from_rpi_cam, parse_robot_video_path, resolve_rpi_cam
 from stats_config_dialog import ScreeningStatsConfigDialog
 
 # --- CONFIGURATION CONSTANTS ---
@@ -70,8 +71,9 @@ class AnalysisTab(QWidget):
         self.group_entries = []
         self.preview_window = None
         self.calibration_window = None
-        self.process_launcher = None
+        self.process_launchers = []
         self.report_launcher = None
+        self._auto_identifier = ''
         self._loading_config = False
         self._ui_ready = False
         self.initUI()
@@ -124,6 +126,7 @@ class AnalysisTab(QWidget):
         # Video path
         video_layout = QHBoxLayout()
         self.video_path_edit = QLineEdit()
+        self.video_path_edit.textChanged.connect(self.on_video_path_changed)
         video_path_btn = QPushButton('Browse')
         video_path_btn.clicked.connect(self.browse_video_path)
         video_layout.addWidget(QLabel('Video Directory:'))
@@ -134,7 +137,7 @@ class AnalysisTab(QWidget):
         # Analysis identifier
         identifier_layout = QHBoxLayout()
         self.identifier_edit = QLineEdit()
-        self.identifier_edit.setPlaceholderText('analysis_name')
+        self.identifier_edit.setPlaceholderText('rpi3_cam_0')
         identifier_layout.addWidget(QLabel('Analysis Identifier:'))
         identifier_layout.addWidget(self.identifier_edit)
         proj_layout.addLayout(identifier_layout)
@@ -235,8 +238,6 @@ class AnalysisTab(QWidget):
         
         # Process customization options
         process_group = QGroupBox('Processing Options')
-        process_vertical_layout = QVBoxLayout()
-        
         process_layout = QHBoxLayout()
         
         # 1 Do germination analysis
@@ -260,28 +261,7 @@ class AnalysisTab(QWidget):
         self.store_each_video_checkbox.setChecked(False)
         process_layout.addWidget(self.store_each_video_checkbox)
         
-        process_vertical_layout.addLayout(process_layout)
-        
-        self.plant_growth_widget = QWidget()
-        plant_process_layout = QHBoxLayout()
-
-        self.fpca_checkbox = QCheckBox('Perform FPCA analysis')
-        plant_process_layout.addWidget(self.fpca_checkbox)
-        plant_process_layout.addWidget(QLabel('Components:'))
-        self.fpca_components_edit = QLineEdit("2")
-        self.fpca_components_edit.setFixedWidth(40)
-        self.fpca_components_edit.setValidator(QIntValidator(2, 10))
-        plant_process_layout.addWidget(self.fpca_components_edit)
-        self.fpca_normalize_checkbox = QCheckBox('Normalize FPCA data')
-        self.fpca_normalize_checkbox.setChecked(False)
-        plant_process_layout.addWidget(self.fpca_normalize_checkbox)
-        plant_process_layout.addStretch()
-
-        self.plant_growth_widget.setLayout(plant_process_layout)
-        
-        process_vertical_layout.addWidget(self.plant_growth_widget)
-        
-        process_group.setLayout(process_vertical_layout)
+        process_group.setLayout(process_layout)
         layout.addWidget(process_group)
         
         # Group Names
@@ -323,7 +303,7 @@ class AnalysisTab(QWidget):
         self.generate_report_btn.clicked.connect(self.generate_report)
         buttons_layout.addWidget(self.generate_report_btn)
 
-        self.configure_stats_btn = QPushButton('Configure Statistical Analysis')
+        self.configure_stats_btn = QPushButton('Configure Report Parameters')
         self.configure_stats_btn.clicked.connect(self.open_stats_config_dialog)
         buttons_layout.addWidget(self.configure_stats_btn)
         
@@ -341,11 +321,11 @@ class AnalysisTab(QWidget):
             self._append_group_entry()
 
         # Initialize calibration mode
-        self.toggle_calibration_mode()
-        self.toggle_plant_growth_options()
         self.stats_config_dialog = ScreeningStatsConfigDialog(self)
         self.stats_config_dialog.register_on_host(self)
         self.stats_config_dialog.set_defaults()
+        self.toggle_calibration_mode()
+        self.toggle_plant_growth_options()
         self._ui_ready = True
 
     def _autosave_config(self):
@@ -471,9 +451,41 @@ class AnalysisTab(QWidget):
         self.manual_calib_widget.setVisible(not has_qr)
     
     def toggle_plant_growth_options(self):
-        """Enable or disable plant growth analysis options"""
+        """Enable or disable plant growth analysis options in the report dialog."""
         enabled = self.plant_growth_checkbox.isChecked()
-        self.plant_growth_widget.setVisible(enabled)
+        if hasattr(self, 'stats_config_dialog'):
+            self.stats_config_dialog.set_plant_growth_enabled(enabled)
+
+    def on_video_path_changed(self):
+        self._maybe_autofill_identifier()
+
+    def current_rpi_cam(self):
+        return resolve_rpi_cam(
+            video_dir=self.video_path_edit.text().strip(),
+            analysis_id=self.identifier_edit.text().strip(),
+        )
+
+    def _maybe_autofill_identifier(self):
+        if self._loading_config:
+            return
+        rpi, cam = parse_robot_video_path(self.video_path_edit.text().strip())
+        if not rpi or not cam:
+            return
+        suggested = identifier_from_rpi_cam(rpi, cam)
+        current = self.identifier_edit.text().strip()
+        if current and current != self._auto_identifier:
+            return
+        self._auto_identifier = suggested
+        if current != suggested:
+            self.identifier_edit.setText(suggested)
+
+    def _remember_auto_identifier(self):
+        rpi, cam = parse_robot_video_path(self.video_path_edit.text().strip())
+        if not rpi or not cam:
+            return
+        suggested = identifier_from_rpi_cam(rpi, cam)
+        if self.identifier_edit.text().strip() == suggested:
+            self._auto_identifier = suggested
 
     def open_calibration_helper(self):
         """Opens a helper window to assist with manual calibration"""
@@ -668,10 +680,6 @@ class AnalysisTab(QWidget):
 
         self._autosave_config()
 
-        if self.process_launcher and self.process_launcher.is_running():
-            ui_errors.show_warning(self, "Busy", "Video processing is already running.")
-            return
-
         dataset = self._validate_video_dataset()
         if not dataset:
             return
@@ -709,6 +717,7 @@ class AnalysisTab(QWidget):
             return
 
         seed_counts = [entry.get_seed_count() for entry in self.group_entries]
+        rpi, cam = self.current_rpi_cam()
         config = interface_config.build_interface_config(self)
         config.update({
             'video_dir': video_folder,
@@ -721,6 +730,8 @@ class AnalysisTab(QWidget):
             'group_rois': {name: list(coords) for name, coords in group_rois.items()},
             'PlateCondition': self.plateConditionName.text().strip(),
             'ExtraVariable': self.extraField.text().strip(),
+            'rpi': rpi,
+            'cam': cam,
         })
 
         if not config['has_qr']:
@@ -739,7 +750,8 @@ class AnalysisTab(QWidget):
 
         app_dir = os.path.dirname(os.path.abspath(__file__))
         args = ["python", "process_video.py", "--config", config_path]
-        self.process_launcher = ui_errors.launch_worker(
+        self._drop_finished_process_launchers()
+        launcher = ui_errors.launch_worker(
             args,
             parent=self,
             working_directory=app_dir,
@@ -750,6 +762,17 @@ class AnalysisTab(QWidget):
             ),
             error_title="Video Processing Error",
         )
+        launcher.process.finished.connect(lambda *_args: self._drop_finished_process_launchers())
+        self.process_launchers.append(launcher)
+
+    def _drop_finished_process_launchers(self):
+        still_running = []
+        for launcher in self.process_launchers:
+            if launcher.is_running():
+                still_running.append(launcher)
+            else:
+                launcher.deleteLater()
+        self.process_launchers = still_running
 
     def preview_video(self):
         dataset = self._validate_video_dataset()
@@ -803,7 +826,7 @@ class AnalysisTab(QWidget):
             'everyXhourFieldFourier': self._int_field(self.everyXhourFieldFourier, 6),
             'everyXhourFieldAngles': self._int_field(self.everyXhourFieldAngles, 6),
             'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
-            'doFPCA': self.fpca_checkbox.isChecked(),
+            'doFPCA': self.fpca_checkbox.isChecked() and self.plant_growth_checkbox.isChecked(),
             'normFPCA': self.fpca_normalize_checkbox.isChecked(),
             'numComponentsFPCAField': self._int_field(self.fpca_components_edit, 2),
             'doFourier': self.doFourier.isChecked(),
@@ -845,6 +868,9 @@ class AnalysisTab(QWidget):
         if self.report_launcher and self.report_launcher.is_running():
             ui_errors.show_warning(self, "Busy", "Report generation is already running.")
             return
+        if self.report_launcher is not None:
+            self.report_launcher.deleteLater()
+            self.report_launcher = None
 
         project_dir = self.proj_dir_edit.text()
         analysis_dir = os.path.join(project_dir, 'analysis')
@@ -870,17 +896,19 @@ class AnalysisTab(QWidget):
         args = ["python", "generate_report.py", "--config", config_path]
         mapping_msg = " with name mapping" if conf.get('nameMapping') else ""
         app_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dialog = ui_errors.WorkerLogDialog("Generating report…", parent=self)
         self.report_launcher = ui_errors.launch_worker(
             args,
             parent=self,
             working_directory=app_dir,
-            started_title="Report Generation Started",
-            started_message=(
-                f"Report generation has been started{mapping_msg}.\n"
-                f"Results will be saved in: {os.path.join(project_dir, 'Report')}"
-            ),
             error_title="Report Generation Error",
+            log_dialog=log_dialog,
         )
+        if self.report_launcher.is_running():
+            log_dialog.append_text(
+                f"Report generation started{mapping_msg}.\n"
+                f"Results will be saved in: {os.path.join(project_dir, 'Report')}\n\n"
+            )
 
 class ResultsTab(QWidget):
     def __init__(self, parent=None):

@@ -3,11 +3,14 @@
 import os
 import json
 import re
+from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
+from robot_ids import cam_folder_name, resolve_rpi_cam
 from chrono_root_backend import (
     convertToPathSafe,
     dataWork,
@@ -16,6 +19,8 @@ from chrono_root_backend import (
     normalize_factor_value,
     plot_individual_plant,
 )
+
+MAX_PLANT_WORKERS = 4
 
 RSA_RAW_COLUMNS = [
     'FileName',
@@ -33,15 +38,16 @@ NEAR_ZERO_MM = 0.1
 SPIKE_SIGMA = 10
 
 
-def plant_result_dir(project_dir, experiment, analysis_id, plant_index):
+def plant_result_dir(project_dir, experiment, rpi, cam, plant_index):
     safe_exp = convertToPathSafe(str(experiment))
-    safe_video = convertToPathSafe(str(analysis_id))
+    rpi_name = convertToPathSafe(str(rpi) if rpi not in (None, '') else 'unspecified')
+    cam_name = convertToPathSafe(cam_folder_name(cam))
     return os.path.join(
         project_dir,
         'Analysis',
         safe_exp,
-        safe_video,
-        'cam_0',
+        rpi_name,
+        cam_name,
         f'plant_{plant_index}',
         'Results_0',
     )
@@ -77,6 +83,8 @@ def _write_metadata(plant_rows, result_dir, pixel_size, time_step):
         'pixel_size': float(pixel_size),
         'timeStep': int(time_step) if float(time_step) == int(float(time_step)) else float(time_step),
         'Video': str(first.get('Video', '')),
+        'rpi': str(first.get('rpi', '')),
+        'cam': str(first.get('cam', '')),
     }
     path = os.path.join(result_dir, 'metadata.json')
     with open(path, 'w') as handle:
@@ -98,7 +106,7 @@ def _attach_area_mm(hourly, pixel_size):
 def _validate_plant_series(plant_rows, max_len):
     """QC from the old plant_analysis growth filter. Returns (ok, reason)."""
     n_frames = len(plant_rows)
-    if n_frames < max_len:
+    if n_frames < 0.95 * max_len:
         return False, 'incomplete_series'
 
     pixel_size = float(plant_rows['pixel_size'].iloc[0]) if 'pixel_size' in plant_rows.columns else 1.0
@@ -145,7 +153,12 @@ def _filter_valid_series(merged_seeds):
                     'max_len': max_len,
                     'reason': reason,
                 })
-                print(f'QC dropped {plant_id} ({video}): {reason} ({len(plant_rows)}/{max_len} frames)')
+
+    if dropped:
+        reason_counts = Counter(d['reason'] for d in dropped)
+        parts = ', '.join(f'{r}={c}' for r, c in sorted(reason_counts.items()))
+        print(f'QC dropped {len(dropped)} plants', flush=True)
+        print(f'  reason breakdown: {parts}', flush=True)
 
     if not keep_keys:
         return work.iloc[0:0], dropped
@@ -153,6 +166,68 @@ def _filter_valid_series(merged_seeds):
     key = work['Video'].astype(str) + '\t' + work['Plant_id'].astype(str)
     keep = {f'{video}\t{plant_id}' for video, plant_id in keep_keys}
     return work.loc[key.isin(keep)].copy(), dropped
+
+
+def process_one_screening_plant(job):
+    import os, sys
+    # Re-setup sys.path for subprocess
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    _root_dir = os.path.abspath(os.path.join(_app_dir, '..'))
+    _chron_dir = os.path.join(_root_dir, 'chronoRootApp')
+    for _p in (_app_dir, _chron_dir):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    import numpy as np
+    import pandas as pd
+    from analysis.dataWork import dataWork
+    from analysis.report import plot_individual_plant
+    from analysis.utils.fileUtilities import convertToPathSafe
+
+    result_dir = job['result_dir']
+    raw_path = job['raw_path']
+    metadata = job['metadata']
+    pixel_size = job['pixel_size']
+    conf = job['conf']
+    plant_id = job['plant_id']
+    rpi = job['rpi']
+    cam = job['cam']
+    experiment = job['experiment']
+
+    try:
+        dataWork(conf, raw_path, result_dir, N_exp=None)
+    except Exception as exc:
+        return plant_id, None, str(exc)
+
+    hourly_path = os.path.join(result_dir, 'PostProcess_Hour.csv')
+    if not os.path.isfile(hourly_path):
+        return plant_id, None, 'missing PostProcess_Hour.csv'
+
+    hourly = pd.read_csv(hourly_path)
+    # attach area in mm^2
+    scale = float(pixel_size) ** 2
+    if 'Area' in hourly.columns:
+        hourly['Area (mm2)'] = hourly['Area'] * scale
+        hourly = hourly.drop(columns=['Area'])
+    if 'DenseRootArea' in hourly.columns:
+        hourly['DenseRootArea (mm2)'] = hourly['DenseRootArea'] * scale
+        hourly = hourly.drop(columns=['DenseRootArea'])
+
+    hourly['Experiment'] = metadata['Experiment']
+    hourly['Plant_id'] = metadata['Plant_id']
+    hourly['PlateCondition'] = metadata['PlateCondition']
+    hourly['ExtraVariable'] = metadata['ExtraVariable']
+    hourly['Video'] = metadata['Video']
+    hourly['rpi'] = rpi
+    hourly['cam'] = cam
+    hourly.to_csv(hourly_path, index=False)
+
+    plot_name = f"{convertToPathSafe(experiment)}_{metadata['Plant_id']}.png"
+    try:
+        plot_individual_plant(result_dir, hourly, plot_name, conf)
+    except Exception as exc:
+        pass  # plot failure is non-fatal
+
+    return plant_id, hourly, None
 
 
 def postprocess_tracking(merged_seeds, conf):
@@ -175,9 +250,57 @@ def postprocess_tracking(merged_seeds, conf):
     if valid_seeds.empty:
         raise ValueError('Postprocess produced no hourly tables: all plants failed series QC')
 
+    # Count plants before and after QC per combination
+    def _count_plants(df, key_cols):
+        if df.empty:
+            return {}
+        for col in key_cols:
+            if col not in df.columns:
+                df = df.copy()
+                df[col] = 'Unspecified'
+        return df.groupby(key_cols)['Plant_id'].nunique().to_dict()
+
+    combo_cols = ['Experiment', 'PlateCondition', 'ExtraVariable']
+    before_counts = _count_plants(merged_seeds, combo_cols)
+    after_counts = _count_plants(valid_seeds, combo_cols)
+
+    # Per-reason drops per combo
+    drops_by_combo = defaultdict(Counter)
+    for d in dropped:
+        plant_rows_ms = merged_seeds[merged_seeds['Plant_id'] == d['Plant_id']]
+        key = (
+            str(d.get('Experiment', 'Unspecified')),
+            str(plant_rows_ms['PlateCondition'].iloc[0]) if not plant_rows_ms.empty else 'Unspecified',
+            str(plant_rows_ms['ExtraVariable'].iloc[0]) if not plant_rows_ms.empty else 'Unspecified',
+        )
+        drops_by_combo[key][d['reason']] += 1
+
+    all_reasons = ['incomplete_series', 'near_zero_length', 'growth_spike']
+    rows = []
+    all_keys = set(before_counts.keys()) | set(after_counts.keys())
+    for key in sorted(all_keys):
+        exp, plate, extra = key
+        n_before = before_counts.get(key, 0)
+        n_kept = after_counts.get(key, 0)
+        n_dropped = n_before - n_kept
+        row = {'Experiment': exp, 'PlateCondition': plate, 'ExtraVariable': extra,
+               'n_before': n_before, 'n_dropped': n_dropped, 'n_kept': n_kept}
+        for r in all_reasons:
+            row[r] = drops_by_combo.get(key, Counter()).get(r, 0)
+        rows.append(row)
+        print(f'{exp} | {plate} | {extra}: kept {n_kept} (dropped {n_dropped})', flush=True)
+
+    if rows:
+        counts_path = data_file(conf, 'qc_plant_counts.csv')
+        pd.DataFrame(rows).to_csv(counts_path, index=False)
+        print(f'Wrote {counts_path}', flush=True)
+    print()
+
+    # Build result dirs and jobs
     grouped = valid_seeds.groupby(['Video', 'Plant_id'], sort=True)
     plant_index_by_key = {}
     next_index_by_exp_video = {}
+    jobs = []
 
     for (video, plant_id), plant_rows in grouped:
         plant_rows = plant_rows.sort_values('Frame').reset_index(drop=True)
@@ -189,44 +312,76 @@ def postprocess_tracking(merged_seeds, conf):
         plant_index = plant_index_by_key[(video, plant_id)]
 
         pixel_size = plant_rows['pixel_size'].iloc[0] if 'pixel_size' in plant_rows.columns else 1.0
-        result_dir = plant_result_dir(project_dir, experiment, video, plant_index)
+        rpi, cam = resolve_rpi_cam(
+            rpi=plant_rows['rpi'].iloc[0] if 'rpi' in plant_rows.columns else '',
+            cam=plant_rows['cam'].iloc[0] if 'cam' in plant_rows.columns else '',
+            analysis_id=video,
+        )
+        plant_rows = plant_rows.copy()
+        plant_rows['rpi'] = rpi
+        plant_rows['cam'] = cam
+        result_dir = plant_result_dir(project_dir, experiment, rpi, cam, plant_index)
         os.makedirs(result_dir, exist_ok=True)
 
         raw_path = _write_results_raw(plant_rows, result_dir)
         metadata = _write_metadata(plant_rows, result_dir, pixel_size, time_step)
 
-        try:
-            dataWork(conf, raw_path, result_dir, N_exp=None)
-        except Exception as exc:
-            print(f'Postprocess skipped {plant_id}: {exc}')
-            continue
+        jobs.append({
+            'result_dir': result_dir,
+            'raw_path': raw_path,
+            'metadata': metadata,
+            'pixel_size': pixel_size,
+            'conf': conf,
+            'experiment': experiment,
+            'plant_id': plant_id,
+            'rpi': rpi,
+            'cam': cam,
+        })
 
-        hourly_path = os.path.join(result_dir, 'PostProcess_Hour.csv')
-        if not os.path.isfile(hourly_path):
-            print(f'Postprocess skipped {plant_id}: missing PostProcess_Hour.csv')
-            continue
-
-        hourly = pd.read_csv(hourly_path)
-        hourly = _attach_area_mm(hourly, pixel_size)
-        hourly['Experiment'] = metadata['Experiment']
-        hourly['Plant_id'] = metadata['Plant_id']
-        hourly['PlateCondition'] = metadata['PlateCondition']
-        hourly['ExtraVariable'] = metadata['ExtraVariable']
-        hourly['Video'] = metadata['Video']
-        hourly.to_csv(hourly_path, index=False)
-
-        plot_name = f"{convertToPathSafe(experiment)}_{metadata['Plant_id']}.png"
-        try:
-            plot_individual_plant(result_dir, hourly, plot_name, conf)
-        except Exception as exc:
-            print(f'Individual plot skipped for {plant_id}: {exc}')
-
-        plant_frames.append(hourly)
+    total = len(jobs)
+    done = 0
+    last_decile = 0
+    with ProcessPoolExecutor(max_workers=min(MAX_PLANT_WORKERS, max(1, len(jobs)))) as executor:
+        future_to_pid = {executor.submit(process_one_screening_plant, job): job['plant_id'] for job in jobs}
+        for future in as_completed(future_to_pid):
+            done += 1
+            plant_id_res, hourly, err = future.result()
+            if err:
+                print(f'Postprocess skipped {plant_id_res}: {err}')
+            else:
+                plant_frames.append(hourly)
+            decile = int(10 * done / total) if total else 10
+            if done == total or decile > last_decile:
+                pct = 100 if done == total else decile * 10
+                print(f'Postprocess {done}/{total} ({pct}%)', flush=True)
+                last_decile = decile
 
     if not plant_frames:
         raise ValueError('Postprocess produced no hourly tables')
 
-    all_data = pd.concat(plant_frames, ignore_index=True)
+    # NaN-pad per video so all kept plants share the same hour grid
+    id_cols = ['Experiment', 'Plant_id', 'PlateCondition', 'ExtraVariable', 'Video', 'rpi', 'cam']
+    padded_frames = []
+    frames_by_video = defaultdict(list)
+    for hdf in plant_frames:
+        vid = hdf['Video'].iloc[0] if 'Video' in hdf.columns else 'default'
+        frames_by_video[vid].append(hdf)
+
+    for vid, vframes in frames_by_video.items():
+        max_hour = int(max(hdf['ElapsedTime (h)'].max() for hdf in vframes))
+        target_hours = list(range(max_hour + 1))
+        for hdf in vframes:
+            hdf_indexed = hdf.set_index('ElapsedTime (h)')
+            hdf_padded = hdf_indexed.reindex(target_hours)
+            # Fill identity columns
+            for col in id_cols:
+                if col in hdf.columns:
+                    hdf_padded[col] = hdf_padded[col].fillna(hdf[col].iloc[0])
+            hdf_padded = hdf_padded.reset_index()
+            hdf_padded = hdf_padded.rename(columns={'index': 'ElapsedTime (h)'}) if 'index' in hdf_padded.columns else hdf_padded
+            padded_frames.append(hdf_padded)
+
+    all_data = pd.concat(padded_frames, ignore_index=True)
     all_data = ensure_factor_columns(all_data)
     temporal_path = data_file(conf, 'Temporal_Data.csv')
     all_data.to_csv(temporal_path, index=False)

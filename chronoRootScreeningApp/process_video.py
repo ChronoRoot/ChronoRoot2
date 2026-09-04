@@ -15,6 +15,7 @@ from collections import defaultdict
 matplotlib.use('Agg')
 
 from skimage.morphology import skeletonize
+from robot_ids import resolve_rpi_cam
 
 # ignore future warnings from pandas
 import warnings
@@ -144,6 +145,8 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
             'ExtraVariable': params.get('ExtraVariable', '') or '',
             'video_directory': params['video_dir'],
             'segmentation_directory': params['segmentation_dir'],
+            'rpi': params.get('rpi', ''),
+            'cam': params.get('cam', ''),
             'start_time': start_time,
             'completion_time': None,
             'status': 'In Progress'
@@ -279,6 +282,8 @@ def process_video(params: Dict[str, Any]):
         'PlateCondition': params.get('PlateCondition', '') or '',
         'ExtraVariable': params.get('ExtraVariable', '') or '',
         'time_delta': params.get('time_delta'),
+        'rpi': params.get('rpi', ''),
+        'cam': params.get('cam', ''),
     }
 
     with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
@@ -542,6 +547,8 @@ def process_video(params: Dict[str, Any]):
 
     # --- Create DataFrame ONCE at the end ---
     dataframe = pd.DataFrame(all_data_rows, columns=column_names)
+    dataframe['rpi'] = params.get('rpi', '')
+    dataframe['cam'] = params.get('cam', '')
 
     # Post-processing
     if not dataframe.empty:
@@ -599,6 +606,19 @@ def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str
 
     return True
 
+
+def attach_rpi_cam(params: Dict[str, Any]) -> Dict[str, Any]:
+    rpi, cam = resolve_rpi_cam(
+        rpi=params.get('rpi'),
+        cam=params.get('cam'),
+        video_dir=params.get('video_dir'),
+        analysis_id=params.get('analysis_id'),
+    )
+    params['rpi'] = rpi
+    params['cam'] = cam
+    return params
+
+
 def build_params_from_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, 'r') as f:
         config = json.load(f)
@@ -623,6 +643,8 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
         'seed_counts': config['seed_counts'],
         'PlateCondition': config.get('PlateCondition', '') or '',
         'ExtraVariable': config.get('ExtraVariable', '') or '',
+        'rpi': config.get('rpi', ''),
+        'cam': config.get('cam', ''),
     }
 
     if params['has_qr']:
@@ -636,7 +658,7 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
     if 'group_rois' in config and config['group_rois']:
         params['group_rois'] = config['group_rois']
 
-    return params
+    return attach_rpi_cam(params)
 
 
 def build_params_from_args(args) -> Dict[str, Any]:
@@ -667,7 +689,7 @@ def build_params_from_args(args) -> Dict[str, Any]:
     if args.group_rois:
         params['group_rois'] = args.group_rois
 
-    return params
+    return attach_rpi_cam(params)
 
 
 def main():

@@ -22,7 +22,7 @@ from chrono_root_backend import (
     makeFourierPlots,
     metric_dir,
     performFPCA,
-    performStatisticalAnalysis,
+    performStatisticalAnalysisForMetrics,
     perform_scalar_pairwise_stats,
     plot_info_all,
     purge_disabled_comparison_outputs,
@@ -37,8 +37,9 @@ from scipy.stats import norm
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from postprocess import postprocess_tracking
+from postprocess import postprocess_tracking, MAX_PLANT_WORKERS
 from data_processing.germination_analysis import GerminationAnalyzer
+from robot_ids import resolve_rpi_cam
 
 SCREENING_TEMPORAL_METRICS = [
     'MainRootLength (mm)',
@@ -128,8 +129,40 @@ def merge_analysis_files(project_dir, name_mapping_file=None):
                     df['ExtraVariable'] = group_info.get('ExtraVariable', '')
                 if 'pixel_size' not in df.columns and 'pixel_size' in group_info:
                     df['pixel_size'] = group_info['pixel_size']
+                if 'rpi' not in df.columns:
+                    df['rpi'] = group_info.get('rpi', '')
+                if 'cam' not in df.columns:
+                    df['cam'] = group_info.get('cam', '')
 
             df['Video'] = analysis_id
+            rpi_val = ''
+            cam_val = ''
+            video_dir = ''
+            if not df.empty:
+                if 'rpi' in df.columns:
+                    rpi_val = df['rpi'].iloc[0]
+                if 'cam' in df.columns:
+                    cam_val = df['cam'].iloc[0]
+            tracking_meta_path = os.path.join(analysis_dir_root, analysis_id, 'metadata.json')
+            if os.path.exists(tracking_meta_path):
+                try:
+                    with open(tracking_meta_path, 'r') as handle:
+                        tracking_meta = json.load(handle)
+                    video_dir = tracking_meta.get('video_directory') or tracking_meta.get('video_dir') or ''
+                    if not rpi_val:
+                        rpi_val = tracking_meta.get('rpi', '')
+                    if not cam_val:
+                        cam_val = tracking_meta.get('cam', '')
+                except (OSError, ValueError, TypeError):
+                    pass
+            rpi, cam = resolve_rpi_cam(
+                rpi=rpi_val,
+                cam=cam_val,
+                video_dir=video_dir,
+                analysis_id=analysis_id,
+            )
+            df['rpi'] = rpi
+            df['cam'] = cam
             if 'SeedCount' not in df.columns:
                 df['SeedCount'] = 0
             else:
@@ -270,12 +303,13 @@ def main():
 
     print('Merging tracking files...')
     combined = merge_analysis_files(project_dir, conf.get('nameMapping'))
-    os.makedirs(os.path.join(project_dir, 'results'), exist_ok=True)
-    combined.to_csv(os.path.join(project_dir, 'results', 'Raw_Data.tsv'), sep='\t', index=False)
+    raw_path = data_file(conf, 'Raw_Data.tsv')
+    combined.to_csv(raw_path, sep='\t', index=False)
+    print(f'Wrote {raw_path}')
 
     all_data = pd.DataFrame()
     if do_growth:
-        print('Postprocessing tracking through dataWork...')
+        print(f'Postprocessing tracking through dataWork (up to {MAX_PLANT_WORKERS} workers)...')
         all_data = postprocess_tracking(combined, conf)
         all_data = ensure_factor_columns(all_data)
 
@@ -286,12 +320,7 @@ def main():
         purge_disabled_comparison_outputs(conf, effective_modes)
 
         temporal_selected = [m for m in temporal_selected if m != 'GerminationTime']
-        for parameter in temporal_selected:
-            if parameter not in all_data.columns:
-                print(f'Skipping {parameter}: column not in Temporal_Data')
-                continue
-            print(f'Temporal analysis — {parameter}')
-            performStatisticalAnalysis(conf, all_data, parameter)
+        performStatisticalAnalysisForMetrics(conf, all_data, temporal_selected)
 
         plot_info_all(conf, all_data)
         generateTableTemporal(conf, all_data)

@@ -120,6 +120,10 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         'normalize_fpca': analysis_tab.fpca_normalize_checkbox.isChecked(),
         'groups': groups,
     }
+    if hasattr(analysis_tab, 'current_rpi_cam'):
+        rpi, cam = analysis_tab.current_rpi_cam()
+        payload['rpi'] = rpi
+        payload['cam'] = cam
     if hasattr(analysis_tab, 'averagePerPlantStats'):
         payload['averagePerPlantStats'] = analysis_tab.averagePerPlantStats.isChecked()
         payload['everyXhourField'] = analysis_tab.everyXhourField.text()
@@ -272,6 +276,8 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
         analysis_tab.toggle_calibration_mode()
         analysis_tab.toggle_plant_growth_options()
         analysis_tab.on_project_dir_changed()
+        if hasattr(analysis_tab, '_remember_auto_identifier'):
+            analysis_tab._remember_auto_identifier()
     finally:
         for widget in signal_widgets:
             widget.blockSignals(False)

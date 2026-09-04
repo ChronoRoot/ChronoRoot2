@@ -14,7 +14,7 @@ from analysis import convex_hull
 from analysis.report import (
     plot_individual_plant,
     plot_info_all,
-    performStatisticalAnalysis,
+    performStatisticalAnalysisForMetrics,
     generateTableTemporal,
 )
 from analysis.stats_utils import (
@@ -204,9 +204,7 @@ if __name__ == "__main__":
     # --- Phase 3: figures and statistics ---
     print('Phase 3/3: generating report figures and statistics...')
 
-    for parameter in temporal_parameters:
-        print(f'Phase 3/3: temporal analysis — {parameter}')
-        performStatisticalAnalysis(conf, all_data, parameter)
+    performStatisticalAnalysisForMetrics(conf, all_data, temporal_parameters)
 
     plot_info_all(conf, all_data)
     generateTableTemporal(conf, all_data)

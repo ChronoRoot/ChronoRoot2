@@ -23,6 +23,7 @@ from analysis.dataWork import dataWork  # noqa: E402
 from analysis.report import (  # noqa: E402
     generateTableTemporal,
     performStatisticalAnalysis,
+    performStatisticalAnalysisForMetrics,
     plot_individual_plant,
     plot_info_all,
 )

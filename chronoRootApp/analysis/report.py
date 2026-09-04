@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import os
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import scipy.stats as stats
 import numpy as np
 import logging
@@ -77,6 +79,8 @@ METRIC_TITLES = {
     'Area (mm2)': 'Plant area',
     'DenseRootArea (mm2)': 'Dense root area',
 }
+
+MAX_METRIC_WORKERS = 4
 
 
 def _include_lateral_root_plots(conf):
@@ -169,6 +173,47 @@ def performStatisticalAnalysis(conf, data, metric):
         metric_label=metric,
     )
     return
+
+
+def _run_one_temporal_metric(job):
+    """Spawn-safe worker: one temporal metric's stats and comparison plots."""
+    conf = job['conf']
+    data = job['data']
+    metric = job['metric']
+    print(f'Temporal analysis — {metric}', flush=True)
+    performStatisticalAnalysis(conf, data, metric)
+    return metric
+
+
+def performStatisticalAnalysisForMetrics(conf, data, metrics, max_workers=MAX_METRIC_WORKERS):
+    """Run performStatisticalAnalysis for each metric, in parallel when there are several."""
+    selected = []
+    for metric in metrics:
+        if metric in data.columns:
+            selected.append(metric)
+        else:
+            print(f'Skipping {metric}: column not in Temporal_Data', flush=True)
+    metrics = selected
+    if not metrics:
+        return
+    if len(metrics) == 1:
+        print(f'Temporal analysis — {metrics[0]}', flush=True)
+        performStatisticalAnalysis(conf, data, metrics[0])
+        print('Metrics 1/1', flush=True)
+        return
+
+    ctx = multiprocessing.get_context('spawn')
+    workers = min(max_workers, len(metrics))
+    total = len(metrics)
+    print(f'Temporal analysis ({total} metrics, up to {workers} workers)...', flush=True)
+    jobs = [{'conf': conf, 'data': data, 'metric': metric} for metric in metrics]
+    done = 0
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+        futures = [executor.submit(_run_one_temporal_metric, job) for job in jobs]
+        for future in as_completed(futures):
+            metric = future.result()
+            done += 1
+            print(f'Metrics {done}/{total} ({metric} done)', flush=True)
 
 
 def _write_metric_summary_table(conf, data, metric, slug):
@@ -303,8 +348,9 @@ def plot_info_all(conf, dataframe):
         return
 
     def _plot_metric(ax, y_col, title):
+        plot_df = dataframe.dropna(subset=[y_col]) if y_col in dataframe.columns else dataframe
         sns.lineplot(
-            x='ElapsedTime (h)', y=y_col, data=dataframe, hue='Experiment',
+            x='ElapsedTime (h)', y=y_col, data=plot_df, hue='Experiment',
             errorbar='se', ax=ax, palette=geno_palette,
         )
         ax.set_title(title, fontsize=16)
@@ -323,6 +369,26 @@ def plot_info_all(conf, dataframe):
         ax.set_ylabel(_overview_ylabel(col), fontsize=12)
 
     plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_subplots.png'), dpi=300, bbox_inches='tight')
+
+    plt.cla()
+    plt.clf()
+    plt.close('all')
+
+    fig_n = plt.figure(figsize=(4 * ncols, 4 * nrows), constrained_layout=True)
+    gs_n = fig_n.add_gridspec(nrows, ncols)
+    axes_n = [fig_n.add_subplot(gs_n[i // ncols, i % ncols]) for i in range(n)]
+    for ax, (col, title) in zip(axes_n, metrics):
+        n_df = dataframe.copy()
+        n_df['_n'] = n_df[col].notna().astype(int)
+        sns.lineplot(
+            x='ElapsedTime (h)', y='_n', data=n_df, hue='Experiment',
+            errorbar=None, estimator='sum', ax=ax, palette=geno_palette,
+        )
+        ax.set_title(title, fontsize=16)
+        ax.set_xlabel('Elapsed Time (h)', fontsize=12)
+        ax.set_ylabel('Number of plants', fontsize=12)
+        ax.legend(loc='best', title=geno_label)
+    plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_n.png'), dpi=300, bbox_inches='tight')
 
     plt.cla()
     plt.clf()
