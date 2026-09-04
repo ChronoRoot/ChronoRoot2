@@ -375,7 +375,10 @@ def process_video(params: Dict[str, Any]):
     # Calculate pixel size from calibration method
     pixel_size = 0.004  # Default value in case something fails
     try:
-        if params['has_qr']:
+        if params.get('pixel_size') not in (None, ''):
+            pixel_size = float(params['pixel_size'])
+            print(f"Using stored pixel size: {pixel_size:.6f} mm/pixel")
+        elif params['has_qr']:
             # QR code calibration
             j = 0
             for img_file in image_files:
@@ -404,9 +407,11 @@ def process_video(params: Dict[str, Any]):
     with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
         json.dump(group_info, f, indent=4)
 
+    seg_subdir = params.get('segmentation_subdir') or 'Ensemble'
+
     # Process frames
     for img_file in image_files:
-        seg_file = os.path.join(params['segmentation_dir'], "Ensemble", img_file)
+        seg_file = os.path.join(params['segmentation_dir'], seg_subdir, img_file)
         original_seg = cv2.imread(seg_file, cv2.IMREAD_GRAYSCALE)
         if original_seg is None:
             print(f'Warning: Could not read segmentation file: {seg_file}')
@@ -616,7 +621,8 @@ def process_video(params: Dict[str, Any]):
     return dataframe
 
 
-def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str = None):
+def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str = None,
+                         segmentation_subdir: str = 'Ensemble'):
     """Validate directory structure and files."""
     if not os.path.exists(video_dir):
         raise ValueError(f"Video directory does not exist: {video_dir}")
@@ -624,11 +630,12 @@ def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str
     if segmentation_dir is None:
         segmentation_dir = os.path.join(video_dir, "Segmentation")
 
-    seg_dir = os.path.join(segmentation_dir, "Ensemble")
-    if not os.path.exists(seg_dir):
+    subdir = segmentation_subdir or 'Ensemble'
+    seg_dir = os.path.join(segmentation_dir, subdir)
+    if not os.path.exists(seg_dir) and subdir == 'Ensemble':
         seg_dir = os.path.join(segmentation_dir, "Seg")
     if not os.path.exists(seg_dir):
-        raise ValueError(f"Segmentation directory not found: {segmentation_dir}")
+        raise ValueError(f"Segmentation directory not found: {seg_dir}")
 
     if not os.path.exists(project_dir):
         raise ValueError(f"Project directory does not exist: {project_dir}")
@@ -686,9 +693,14 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
         'ExtraVariable': config.get('ExtraVariable', '') or '',
         'rpi': config.get('rpi', ''),
         'cam': config.get('cam', ''),
+        'segmentation_subdir': config.get('segmentation_subdir') or 'Ensemble',
     }
+    if config.get('pixel_size') not in (None, ''):
+        params['pixel_size'] = float(config['pixel_size'])
 
-    if params['has_qr']:
+    if params.get('pixel_size') not in (None, ''):
+        pass
+    elif params['has_qr']:
         pass
     else:
         if config.get('known_distance') is None or config.get('pixel_distance') is None:
@@ -775,14 +787,19 @@ def main():
 
             params = build_params_from_args(args)
 
-        validate_directories(params['video_dir'], params['project_dir'], params['segmentation_dir'])
+        validate_directories(
+            params['video_dir'], params['project_dir'], params['segmentation_dir'],
+            params.get('segmentation_subdir') or 'Ensemble',
+        )
 
         print(f"Starting analysis: {params['analysis_id']}")
         print("Groups to analyze:")
         for name, count in zip(params['group_names'], params['seed_counts']):
             print(f"  - {name}: {count} seeds")
 
-        if params['has_qr']:
+        if params.get('pixel_size') not in (None, ''):
+            pass
+        elif params['has_qr']:
             print("Using QR code calibration")
         else:
             print(f"Using manual calibration: {params['known_distance']}mm = {params['pixel_distance']}px")
