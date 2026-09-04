@@ -3,6 +3,8 @@
 import json
 import os
 
+from analysis.time_windows import parse_hour_list
+
 APP_NAME = "chronoroot"
 PROJECT_CONFIG_NAME = "project_config.json"
 GLOBAL_CONFIG_DIR = os.path.expanduser(f"~/.config/{APP_NAME}")
@@ -19,6 +21,21 @@ LEGACY_CONFIG_ALIASES = {
 }
 
 os.makedirs(GLOBAL_CONFIG_DIR, exist_ok=True)
+
+
+def _apply_snapshot_hours_field(field, data, specific_key, legacy_days_key):
+    if specific_key in data:
+        hours = parse_hour_list(data.get(specific_key))
+        field.setText(','.join(str(h) for h in hours))
+        return
+    if data.get('snapshotHours') not in (None, ''):
+        hours = parse_hour_list(data.get('snapshotHours'))
+        if hours:
+            field.setText(','.join(str(h) for h in hours))
+            return
+    if legacy_days_key in data and data.get(legacy_days_key) not in (None,):
+        hours = parse_hour_list(data.get(legacy_days_key))
+        field.setText(','.join(str(h) for h in hours) if hours else str(data.get(legacy_days_key)))
 
 
 class ConfigStore:
@@ -89,13 +106,8 @@ class ConfigStore:
 
     data["daysConvexHull"] = host.daysConvexField.text()
     data["daysAngles"] = host.daysAnglesField.text()
-    snapshot = getattr(host, 'snapshotHours', None)
-    if snapshot:
-      data["snapshotHours"] = snapshot
-      data["daysConvexHull"] = ','.join(str(h) for h in snapshot)
-      data["daysAngles"] = ','.join(str(h) for h in snapshot)
-    elif snapshot is not None:
-      data["snapshotHours"] = snapshot
+    data["snapshotHoursConvex"] = parse_hour_list(host.daysConvexField.text())
+    data["snapshotHoursAngles"] = parse_hour_list(host.daysAnglesField.text())
     for key in (
         'timeSyncMode', 'timeDurationHours', 'reportFolderName',
         'figureClockTicks', 'showFigureClockTicks', 'timeGroups', 'timePeriodSources',
@@ -201,10 +213,14 @@ class ConfigStore:
       host.knownDistanceField.setText(str(data["knownDistance"]))
     if "pixelDistance" in data:
       host.pixelDistanceField.setText(str(data["pixelDistance"]))
-    if "daysConvexHull" in data:
-      host.daysConvexField.setText(str(data["daysConvexHull"]))
-    if "daysAngles" in data:
-      host.daysAnglesField.setText(str(data["daysAngles"]))
+    _apply_snapshot_hours_field(
+        host.daysConvexField, data,
+        'snapshotHoursConvex', 'daysConvexHull',
+    )
+    _apply_snapshot_hours_field(
+        host.daysAnglesField, data,
+        'snapshotHoursAngles', 'daysAngles',
+    )
     for key, default in (
         ('timeSyncMode', 'clock'),
         ('timeDurationHours', None),
@@ -212,6 +228,8 @@ class ConfigStore:
         ('figureClockTicks', ['00:00']),
         ('showFigureClockTicks', None),
         ('snapshotHours', None),
+        ('snapshotHoursConvex', None),
+        ('snapshotHoursAngles', None),
         ('timeGroups', []),
         ('timePeriodSources', []),
     ):
@@ -224,6 +242,8 @@ class ConfigStore:
         setattr(host, key, mode != 'anchor')
       elif not hasattr(host, key):
         setattr(host, key, default)
+    if hasattr(host, '_sync_snapshot_hour_fields'):
+      host._sync_snapshot_hour_fields()
 
   def resolve_config_path(self, host):
     project_cfg = os.path.join(host.projectField.text(), PROJECT_CONFIG_NAME)

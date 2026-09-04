@@ -161,7 +161,7 @@ if __name__ == "__main__":
     if conf.get('doConvex'):
         print('Phase 2/3: convex hull analysis...')
         global_shape, global_center = convex_hull.calculate_atlas_geometry(experiments)
-        snapshot_h = snapshot_hours(conf)
+        snapshot_h = snapshot_hours(conf, kind='convex')
         timestep = int(conf['timeStep'])
         convex_overview = overview_dir(conf, MODULE_CONVEX)
         convex_frames = []

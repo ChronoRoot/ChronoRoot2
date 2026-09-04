@@ -832,7 +832,7 @@ class AnalysisTab(QWidget):
 
     def open_time_window_dialog(self):
         from gui.time_window_dialog import TimeWindowDialog
-        dialog = TimeWindowDialog(self, show_snapshots=False)
+        dialog = TimeWindowDialog(self)
         dialog.set_main_folder(self.proj_dir_edit.text().strip())
         conf = {
             'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),

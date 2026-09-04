@@ -135,18 +135,20 @@ def parse_hour_list(raw):
     return hours
 
 
-def snapshot_hours(conf):
+def snapshot_hours(conf, kind='convex'):
+    """Elapsed snapshot hours for convex-hull or lateral-angle figures."""
     if conf is None:
         return []
-    if conf.get('snapshotHours') not in (None, ''):
-        hours = parse_hour_list(conf.get('snapshotHours'))
-        if hours:
-            return hours
-    for key in ('daysConvexHull', 'daysAngles'):
-        days = parse_hour_list(conf.get(key))
-        if days:
-            return [d * 24 for d in days]
-    return []
+    kind = 'angles' if kind == 'angles' else 'convex'
+    specific = 'snapshotHoursAngles' if kind == 'angles' else 'snapshotHoursConvex'
+    hours = parse_hour_list(conf.get(specific))
+    if hours:
+        return hours
+    hours = parse_hour_list(conf.get('snapshotHours'))
+    if hours:
+        return hours
+    legacy = 'daysAngles' if kind == 'angles' else 'daysConvexHull'
+    return parse_hour_list(conf.get(legacy))
 
 
 def elapsed_hour_windows(data, dt, hour_col='ElapsedTime (h)'):

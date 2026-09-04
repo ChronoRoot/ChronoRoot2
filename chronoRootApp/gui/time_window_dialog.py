@@ -1,4 +1,4 @@
-"""Dialog to set the analysis period, anchors, clock ticks, and snapshot hours."""
+"""Dialog to set the analysis period, anchors, and clock ticks."""
 
 from datetime import timedelta
 
@@ -8,28 +8,61 @@ from analysis.time_windows import (
     collect_acquisition_spans,
     default_duration_hours,
     detect_time_groups,
+    elapsed_hours_from_t0,
     format_datetime,
     groups_to_config,
     parse_clock_ticks,
     parse_datetime,
-    parse_hour_list,
-    snapshot_hours,
     time_period_sources,
 )
 
 
 HELP_TEXT = (
-    "Acquisitions whose clock times overlap are one group (for example one launch). "
-    "Duration is shared by every group and defaults to the shortest group. "
-    "Real-time sync uses the same start for the group: later videos are padded, "
-    "and hours before start are dropped. "
-    "Anchor sync sets elapsed 0 at a treatment time (hours before that stay negative)."
+    "Real-time sync uses one start per group (later videos are padded, hours before start are dropped). "
+    "Anchor sync sets elapsed 0 at a treatment time."
 )
 
 ANCHOR_TOOLTIP = (
     "Treatment / application time. Elapsed time is 0 at this instant; "
     "hours before it are negative."
 )
+
+PREVIEW_CAPTION = (
+    "Elapsed-hour grid shared by every group. "
+    "A gap after 0 is padding (video started later). "
+    "Acquisition outside the window is cropped."
+)
+
+EDITOR_MIN_WIDTH = 220
+AXIS_LABEL_H = 18
+TABLE_LEFT_PAD = 10
+READ_ONLY_EDITOR_STYLE = (
+    "QDateEdit, QTimeEdit { background: white; color: black; }"
+)
+
+
+def _format_display_datetime(value):
+    ts = parse_datetime(value)
+    if ts is None:
+        return str(value or '').replace('T', ' ')
+    return ts.strftime('%Y-%m-%d %H:%M')
+
+
+def _draw_axis_end_labels(painter, width, height, left_text, right_text, left=8):
+    painter.setPen(QtGui.QColor(80, 80, 80))
+    y = height - AXIS_LABEL_H
+    usable = max(width - left - 8, 80)
+    half = usable // 2
+    painter.drawText(
+        QtCore.QRect(left, y, half, AXIS_LABEL_H),
+        QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+        left_text,
+    )
+    painter.drawText(
+        QtCore.QRect(left + half, y, max(width - left - half - 8, 40), AXIS_LABEL_H),
+        QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+        right_text,
+    )
 
 
 def _to_qdate(value):
@@ -46,11 +79,23 @@ def _to_qtime(value):
     return QtCore.QTime(ts.hour, ts.minute, 0)
 
 
+def _elapsed_int(value, t0):
+    ts = parse_datetime(value)
+    if ts is None or parse_datetime(t0) is None:
+        return None
+    series = elapsed_hours_from_t0([ts], t0)
+    if series.isna().iloc[0]:
+        return None
+    return int(series.iloc[0])
+
+
 class _DateTimeEditor(QtWidgets.QWidget):
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, value=None, parent=None):
+    def __init__(self, value=None, parent=None, read_only=False):
         super().__init__(parent)
+        self.setMinimumWidth(EDITOR_MIN_WIDTH)
+        self._read_only = False
         self.date_edit = QtWidgets.QDateEdit(_to_qdate(value))
         self.date_edit.setDisplayFormat("yyyy-MM-dd")
         self.date_edit.setCalendarPopup(True)
@@ -63,6 +108,43 @@ class _DateTimeEditor(QtWidgets.QWidget):
         layout.addWidget(self.time_edit)
         self.date_edit.dateChanged.connect(self.changed)
         self.time_edit.timeChanged.connect(self.changed)
+        if read_only:
+            self.set_read_only(True)
+
+    def set_read_only(self, read_only):
+        self._read_only = bool(read_only)
+        self.date_edit.setReadOnly(read_only)
+        self.time_edit.setReadOnly(read_only)
+        self.date_edit.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.NoButtons if read_only
+            else QtWidgets.QAbstractSpinBox.UpDownArrows
+        )
+        self.time_edit.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.NoButtons if read_only
+            else QtWidgets.QAbstractSpinBox.UpDownArrows
+        )
+        self.date_edit.setCalendarPopup(not read_only)
+        focus = QtCore.Qt.NoFocus if read_only else QtCore.Qt.StrongFocus
+        self.date_edit.setFocusPolicy(focus)
+        self.time_edit.setFocusPolicy(focus)
+        self.setStyleSheet(READ_ONLY_EDITOR_STYLE if read_only else '')
+        palette = self.date_edit.palette()
+        palette.setColor(QtGui.QPalette.Base, QtGui.QColor('white'))
+        palette.setColor(QtGui.QPalette.Text, QtGui.QColor('black'))
+        self.date_edit.setPalette(palette)
+        self.time_edit.setPalette(palette)
+        self.date_edit.installEventFilter(self)
+        self.time_edit.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if self._read_only and obj in (self.date_edit, self.time_edit):
+            if event.type() in (
+                QtCore.QEvent.Wheel,
+                QtCore.QEvent.KeyPress,
+                QtCore.QEvent.KeyRelease,
+            ):
+                return True
+        return super().eventFilter(obj, event)
 
     def set_datetime(self, value):
         self.date_edit.blockSignals(True)
@@ -137,7 +219,7 @@ class _TimelineWidget(QtWidgets.QWidget):
             return
 
         n = len(self._groups)
-        row_h = max(16, min(28, (height - 24) // max(n, 1)))
+        row_h = max(16, min(28, (height - AXIS_LABEL_H - 8) // max(n, 1)))
         colors = [
             QtGui.QColor(70, 130, 180),
             QtGui.QColor(60, 160, 110),
@@ -172,40 +254,198 @@ class _TimelineWidget(QtWidgets.QWidget):
             label = f"G{group.get('id', i + 1)} n={group.get('n_plants', 0)}"
             painter.drawText(rect.adjusted(4, 0, -4, 0), QtCore.Qt.AlignVCenter, label)
 
-        painter.setPen(QtGui.QColor(80, 80, 80))
         if self._span_start is not None:
-            painter.drawText(8, height - 4, self._span_start.strftime('%Y-%m-%d %H:%M'))
-            painter.drawText(
-                width - 140, height - 4, 132, 12,
-                QtCore.Qt.AlignRight, self._span_end.strftime('%Y-%m-%d %H:%M'),
+            _draw_axis_end_labels(
+                painter, width, height,
+                self._span_start.strftime('%Y-%m-%d %H:%M'),
+                self._span_end.strftime('%Y-%m-%d %H:%M'),
             )
 
 
+class _ElapsedTimelineWidget(QtWidgets.QWidget):
+    """Read-only Gantt on a shared elapsed-hour axis."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self._groups = []
+        self._h_min = 0
+        self._h_max = 1
+        self._show_anchor = False
+        self._label_width = 300
+
+    def set_groups(self, groups, show_anchor=False, duration_hours=None):
+        self._groups = list(groups or [])
+        self._show_anchor = bool(show_anchor)
+        starts = [
+            int(group['e_start'])
+            for group in self._groups
+            if group.get('e_start') is not None
+        ]
+        ends = [
+            int(group['e_end'])
+            for group in self._groups
+            if group.get('e_end') is not None
+        ]
+        if starts:
+            self._h_min = min(starts)
+            try:
+                duration = int(duration_hours) if duration_hours not in (None, '') else None
+            except (TypeError, ValueError):
+                duration = None
+            self._h_max = self._h_min + duration if duration else (max(ends) if ends else self._h_min + 1)
+            if ends:
+                self._h_max = max(self._h_max, max(ends))
+            if self._show_anchor:
+                self._h_min = min(self._h_min, 0)
+                self._h_max = max(self._h_max, 0)
+            if self._h_max <= self._h_min:
+                self._h_max = self._h_min + 1
+        else:
+            self._h_min = 0
+            self._h_max = 1
+        self.update()
+
+    def _x_for_hour(self, hour, width):
+        left = self._label_width
+        if hour is None:
+            return left
+        total = float(self._h_max - self._h_min)
+        if total <= 0:
+            return left
+        frac = (float(hour) - self._h_min) / total
+        frac = min(max(frac, 0.0), 1.0)
+        return int(left + frac * max(width - left - 16, 1))
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor(248, 248, 248))
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        width = self.width()
+        height = self.height()
+        if not self._groups:
+            painter.setPen(QtGui.QColor(120, 120, 120))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "No groups to preview")
+            return
+
+        n = len(self._groups)
+        row_h = max(36, min(48, (height - AXIS_LABEL_H - 8) // max(n, 1)))
+        colors = [
+            QtGui.QColor(70, 130, 180),
+            QtGui.QColor(60, 160, 110),
+            QtGui.QColor(180, 110, 60),
+            QtGui.QColor(130, 90, 170),
+        ]
+        bar_top_pad = 4
+        bar_h = row_h - 10
+        for i, group in enumerate(self._groups):
+            y = 8 + i * row_h
+            label_rect = QtCore.QRect(8, y, self._label_width - 16, row_h - 6)
+            start_text = group.get('start_label') or ''
+            end_text = group.get('end_label') or ''
+            group_line = f"G{group.get('id', i + 1)}  n={group.get('n_plants', 0)}"
+            time_line = (
+                f"{start_text} → {end_text}" if start_text and end_text
+                else (start_text or end_text)
+            )
+            painter.setPen(QtGui.QColor(40, 40, 40))
+            painter.drawText(
+                label_rect.adjusted(0, 0, 0, -label_rect.height() // 2),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                group_line,
+            )
+            painter.setPen(QtGui.QColor(70, 70, 70))
+            painter.drawText(
+                label_rect.adjusted(0, label_rect.height() // 2, 0, 0),
+                QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+                time_line,
+            )
+
+            bar_y = y + bar_top_pad
+            x1 = self._x_for_hour(group.get('e_span_start'), width)
+            x2 = self._x_for_hour(group.get('e_span_end'), width)
+            if (
+                group.get('e_span_start') is not None
+                and group.get('e_span_end') is not None
+            ):
+                if x2 - x1 < 6:
+                    x2 = x1 + 6
+                rect = QtCore.QRect(x1, bar_y, x2 - x1, bar_h)
+                painter.setBrush(colors[i % len(colors)])
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.drawRoundedRect(rect, 3, 3)
+
+            start_x = self._x_for_hour(group.get('e_start'), width)
+            painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 2))
+            painter.drawLine(start_x, bar_y, start_x, bar_y + bar_h)
+
+            end_x = self._x_for_hour(group.get('e_end'), width)
+            painter.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90), 2))
+            painter.drawLine(end_x, bar_y, end_x, bar_y + bar_h)
+
+            if self._show_anchor:
+                t0_x = self._x_for_hour(0, width)
+                painter.setPen(QtGui.QPen(QtGui.QColor(200, 40, 40), 2))
+                painter.drawLine(t0_x, bar_y - 2, t0_x, bar_y + bar_h + 2)
+
+        if self._h_min < 0 < self._h_max:
+            zero_x = self._x_for_hour(0, width)
+            painter.setPen(QtGui.QColor(80, 80, 80))
+            painter.drawText(
+                QtCore.QRect(zero_x - 10, height - AXIS_LABEL_H, 20, AXIS_LABEL_H),
+                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+                "0",
+            )
+        _draw_axis_end_labels(
+            painter, width, height,
+            f"{self._h_min} h",
+            f"{self._h_max} h",
+            left=self._label_width,
+        )
+
+
+class AlignmentPreviewDialog(QtWidgets.QDialog):
+    def __init__(self, groups, show_anchor, duration_hours=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preview alignment")
+        self.setModal(True)
+        self.resize(860, 380)
+        caption = QtWidgets.QLabel(PREVIEW_CAPTION)
+        caption.setWordWrap(True)
+        legend = QtWidgets.QLabel(
+            "Black = window start.  Gray = window end."
+            + ("  Red = anchor (elapsed 0)." if show_anchor else "")
+        )
+        legend.setStyleSheet("color: #444;")
+        timeline = _ElapsedTimelineWidget()
+        timeline.set_groups(groups, show_anchor=show_anchor, duration_hours=duration_hours)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(caption)
+        layout.addWidget(legend)
+        layout.addWidget(timeline, 1)
+        layout.addWidget(buttons)
+
+
 class TimeWindowDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, show_snapshots=True):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Set analysis period")
         self.setModal(True)
-        self.resize(860, 660)
-        self.show_snapshots = show_snapshots
+        self.resize(920, 660)
         self._group_rows = []
         self._updating = False
         self._ticks_touched = False
         self.main_folder = ''
-
-        self.help_label = QtWidgets.QLabel(HELP_TEXT)
-        self.help_label.setWordWrap(True)
 
         self.clock_radio = QtWidgets.QRadioButton("Synchronize by real time")
         self.anchor_radio = QtWidgets.QRadioButton("Synchronize by anchor time")
         self.clock_radio.setChecked(True)
         self.detect_btn = QtWidgets.QPushButton("Detect groups")
         self.detect_btn.clicked.connect(self.detect_groups)
-        mode_row = QtWidgets.QHBoxLayout()
-        mode_row.addWidget(self.clock_radio)
-        mode_row.addWidget(self.anchor_radio)
-        mode_row.addStretch()
-        mode_row.addWidget(self.detect_btn)
+        self.preview_btn = QtWidgets.QPushButton("Preview alignment")
+        self.preview_btn.clicked.connect(self._open_alignment_preview)
 
         self.duration_edit = QtWidgets.QSpinBox()
         self.duration_edit.setRange(1, 24 * 60)
@@ -214,35 +454,48 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.show_ticks_check = QtWidgets.QCheckBox("Show clock times on figures")
         self.show_ticks_check.setChecked(True)
         self.ticks_edit = QtWidgets.QLineEdit("00:00")
-        self.snapshot_edit = QtWidgets.QLineEdit("0, 24")
+        self.ticks_edit.setPlaceholderText("HH:MM")
+        self.ticks_edit.setMaximumWidth(120)
 
-        ticks_row = QtWidgets.QHBoxLayout()
-        ticks_row.addWidget(self.show_ticks_check)
-        ticks_row.addWidget(self.ticks_edit)
-        ticks_host = QtWidgets.QWidget()
-        ticks_host.setLayout(ticks_row)
-
-        form = QtWidgets.QFormLayout()
-        form.addRow("Duration", self.duration_edit)
-        form.addRow("Clock times (HH:MM)", ticks_host)
-        self.snapshot_label = QtWidgets.QLabel("Snapshot hours (convex / angles)")
-        form.addRow(self.snapshot_label, self.snapshot_edit)
-        if not show_snapshots:
-            self.snapshot_label.hide()
-            self.snapshot_edit.hide()
+        top = QtWidgets.QGridLayout()
+        top.addWidget(self.clock_radio, 0, 0)
+        top.addWidget(self.anchor_radio, 0, 1)
+        top.setColumnStretch(2, 1)
+        top.addWidget(self.detect_btn, 0, 3)
+        top.addWidget(self.preview_btn, 0, 4)
+        duration_row = QtWidgets.QHBoxLayout()
+        duration_row.setContentsMargins(0, 0, 0, 0)
+        duration_row.addWidget(QtWidgets.QLabel("Duration"))
+        duration_row.addWidget(self.duration_edit)
+        duration_row.addStretch(1)
+        top.addLayout(duration_row, 1, 0)
+        top.addWidget(self.show_ticks_check, 1, 1)
+        top.addWidget(self.ticks_edit, 1, 3)
+        self.help_label = QtWidgets.QLabel(HELP_TEXT)
+        self.help_label.setWordWrap(True)
+        top.addWidget(self.help_label, 2, 0, 1, 5)
 
         self.legend_label = QtWidgets.QLabel("")
         self.legend_label.setStyleSheet("color: #444;")
-
         self.timeline = _TimelineWidget()
 
-        self._rows_host = QtWidgets.QWidget()
-        self._rows_layout = QtWidgets.QVBoxLayout(self._rows_host)
-        self._rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._rows_layout.addStretch()
+        self._table_host = QtWidgets.QWidget()
+        self._table_grid = QtWidgets.QGridLayout(self._table_host)
+        self._table_grid.setContentsMargins(TABLE_LEFT_PAD, 6, 8, 6)
+        self._table_grid.setHorizontalSpacing(10)
+        self._table_grid.setVerticalSpacing(8)
+        self._table_grid.setColumnStretch(0, 2)
+        self._table_grid.setColumnStretch(1, 1)
+        self._table_grid.setColumnStretch(2, 1)
+        self._table_grid.setColumnStretch(3, 1)
+        self._header_group = QtWidgets.QLabel("<b>Group</b>")
+        self._header_start = QtWidgets.QLabel("<b>Start</b>")
+        self._header_end = QtWidgets.QLabel("<b>End</b>")
+        self._header_anchor = QtWidgets.QLabel("<b>Anchor (elapsed = 0)</b>")
+        self._header_anchor.setToolTip(ANCHOR_TOOLTIP)
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(self._rows_host)
+        self.scroll.setWidget(self._table_host)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
@@ -251,26 +504,33 @@ class TimeWindowDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self.help_label)
-        layout.addLayout(mode_row)
-        layout.addLayout(form)
+        layout.addLayout(top)
         layout.addWidget(self.legend_label)
         layout.addWidget(self.timeline)
         layout.addWidget(self.scroll, 1)
         layout.addWidget(buttons)
 
+        self._add_table_header()
         self.duration_edit.valueChanged.connect(self._refresh_end_labels)
         self.clock_radio.toggled.connect(self._on_mode_changed)
+        self.anchor_radio.toggled.connect(self._on_mode_changed)
         self.show_ticks_check.toggled.connect(self._on_ticks_toggled)
         self._apply_mode_tick_default()
         self._sync_ticks_enabled()
         self._update_legend()
+        self._sync_anchor_fields()
 
     def set_main_folder(self, folder):
         self.main_folder = folder or ''
 
     def _anchor_mode(self):
         return self.anchor_radio.isChecked()
+
+    def _add_table_header(self):
+        self._table_grid.addWidget(self._header_group, 0, 0)
+        self._table_grid.addWidget(self._header_start, 0, 1)
+        self._table_grid.addWidget(self._header_end, 0, 2)
+        self._table_grid.addWidget(self._header_anchor, 0, 3)
 
     def _apply_mode_tick_default(self):
         self.show_ticks_check.blockSignals(True)
@@ -297,7 +557,11 @@ class TimeWindowDialog(QtWidgets.QDialog):
                 "Black line = window start.  Gray line = window end."
             )
 
-    def _on_mode_changed(self):
+    def _on_mode_changed(self, checked=True):
+        if not checked:
+            return
+        if self._updating:
+            return
         if self.clock_radio.isChecked():
             for row in self._group_rows:
                 row['t0_edit'].set_datetime(row['start_edit'].to_string())
@@ -309,8 +573,10 @@ class TimeWindowDialog(QtWidgets.QDialog):
 
     def _sync_anchor_fields(self):
         show = self._anchor_mode()
+        self._header_anchor.setVisible(show)
+        self._table_grid.setColumnStretch(3, 1 if show else 0)
+        self._table_grid.setColumnMinimumWidth(3, EDITOR_MIN_WIDTH if show else 0)
         for row in self._group_rows:
-            row['t0_label'].setVisible(show)
             row['t0_edit'].setVisible(show)
 
     def load_from_conf(self, conf):
@@ -334,9 +600,6 @@ class TimeWindowDialog(QtWidgets.QDialog):
             self.show_ticks_check.setChecked(bool(conf.get('showFigureClockTicks')))
         else:
             self.show_ticks_check.setChecked(mode != 'anchor')
-        hours = snapshot_hours(conf)
-        if hours:
-            self.snapshot_edit.setText(', '.join(str(h) for h in hours))
         groups = conf.get('timeGroups') or []
         self._updating = False
         if groups:
@@ -345,6 +608,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
             self.detect_groups()
         self._sync_ticks_enabled()
         self._update_legend()
+        self._sync_anchor_fields()
 
     def detect_groups(self):
         data = collect_acquisition_spans(self.main_folder)
@@ -367,12 +631,14 @@ class TimeWindowDialog(QtWidgets.QDialog):
 
     def _clear_rows(self):
         self._group_rows = []
-        while self._rows_layout.count() > 0:
-            item = self._rows_layout.takeAt(0)
+        while self._table_grid.count():
+            item = self._table_grid.takeAt(0)
             widget = item.widget()
-            if widget is not None:
+            if widget is not None and widget not in (
+                self._header_group, self._header_start, self._header_end, self._header_anchor,
+            ):
                 widget.deleteLater()
-        self._rows_layout.addStretch()
+        self._add_table_header()
 
     def _set_groups(self, groups):
         self._updating = True
@@ -385,39 +651,33 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self._update_timeline()
 
     def _add_group_row(self, group):
-        row = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(row)
-        grid.setContentsMargins(0, 4, 0, 4)
+        row_index = len(self._group_rows) + 1
         title = QtWidgets.QLabel(
-            f"Group {group.get('id', '')}  ·  {group.get('n_plants', 0)} plants  ·  "
-            f"{group.get('spanStart', '')} → {group.get('spanEnd', '')}"
+            f"Group {group.get('id', '')}  ·  {group.get('n_plants', 0)} plants\n"
+            f"{_format_display_datetime(group.get('spanStart', ''))} → "
+            f"{_format_display_datetime(group.get('spanEnd', ''))}"
         )
         title.setWordWrap(True)
+        title.setContentsMargins(4, 0, 8, 0)
         start_edit = _DateTimeEditor(group.get('start') or group.get('spanStart'))
+        end_edit = _DateTimeEditor(group.get('end') or group.get('spanEnd'), read_only=True)
         t0_edit = _DateTimeEditor(group.get('t0') or group.get('start'))
+        t0_edit.setToolTip(ANCHOR_TOOLTIP)
         start_edit.changed.connect(self._refresh_end_labels)
         t0_edit.changed.connect(self._refresh_end_labels)
-        end_label = QtWidgets.QLabel("")
-        t0_label = QtWidgets.QLabel("Anchor (elapsed = 0)")
-        t0_label.setToolTip(ANCHOR_TOOLTIP)
-        t0_edit.setToolTip(ANCHOR_TOOLTIP)
-        grid.addWidget(title, 0, 0, 1, 4)
-        grid.addWidget(QtWidgets.QLabel("Start"), 1, 0)
-        grid.addWidget(start_edit, 1, 1)
-        grid.addWidget(t0_label, 1, 2)
-        grid.addWidget(t0_edit, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("End"), 2, 0)
-        grid.addWidget(end_label, 2, 1, 1, 3)
-        self._rows_layout.insertWidget(self._rows_layout.count() - 1, row)
+        self._table_grid.addWidget(title, row_index, 0)
+        self._table_grid.addWidget(start_edit, row_index, 1)
+        self._table_grid.addWidget(end_edit, row_index, 2)
+        self._table_grid.addWidget(t0_edit, row_index, 3)
         self._group_rows.append({
             'id': group.get('id'),
             'n_plants': group.get('n_plants', 0),
             'spanStart': group.get('spanStart') or '',
             'spanEnd': group.get('spanEnd') or '',
             'start_edit': start_edit,
+            'end_edit': end_edit,
             't0_edit': t0_edit,
-            't0_label': t0_label,
-            'end_label': end_label,
+            'title': title,
         })
 
     def _groups_from_rows(self):
@@ -440,6 +700,53 @@ class TimeWindowDialog(QtWidgets.QDialog):
             })
         return groups
 
+    def _elapsed_preview_groups(self):
+        rows = []
+        for group in self._groups_from_rows():
+            t0 = group.get('t0')
+            e_start = _elapsed_int(group.get('start'), t0)
+            e_end = _elapsed_int(group.get('end'), t0)
+            e_span_start = _elapsed_int(group.get('spanStart'), t0)
+            e_span_end = _elapsed_int(group.get('spanEnd'), t0)
+            if e_start is not None and e_span_start is not None:
+                e_span_start = max(e_span_start, e_start)
+            if e_end is not None and e_span_end is not None:
+                e_span_end = min(e_span_end, e_end)
+            if (
+                e_span_start is not None
+                and e_span_end is not None
+                and e_span_end < e_span_start
+            ):
+                e_span_start = None
+                e_span_end = None
+            rows.append({
+                'id': group.get('id'),
+                'n_plants': group.get('n_plants'),
+                'e_start': e_start,
+                'e_end': e_end,
+                'e_span_start': e_span_start,
+                'e_span_end': e_span_end,
+                'start_label': _format_display_datetime(group.get('start')),
+                'end_label': _format_display_datetime(group.get('end')),
+            })
+        return rows
+
+    def _open_alignment_preview(self):
+        if not self._group_rows:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Preview alignment",
+                "Detect groups first.",
+            )
+            return
+        dialog = AlignmentPreviewDialog(
+            self._elapsed_preview_groups(),
+            show_anchor=self._anchor_mode(),
+            duration_hours=self.duration_edit.value(),
+            parent=self,
+        )
+        dialog.exec_()
+
     def _refresh_end_labels(self):
         if self._updating:
             return
@@ -450,10 +757,8 @@ class TimeWindowDialog(QtWidgets.QDialog):
         for row in self._group_rows:
             start_ts = parse_datetime(row['start_edit'].to_string())
             if start_ts is None:
-                row['end_label'].setText('')
                 continue
-            end = start_ts + duration
-            row['end_label'].setText(end.strftime('%Y-%m-%d %H:%M'))
+            row['end_edit'].set_datetime(start_ts + duration)
         self._update_timeline()
 
     def _update_timeline(self):
@@ -469,7 +774,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
         ]
         if show_ticks and not ticks:
             ticks = ['00:00']
-        payload = {
+        return {
             'timeSyncMode': 'anchor' if self._anchor_mode() else 'clock',
             'timeDurationHours': int(self.duration_edit.value()),
             'showFigureClockTicks': show_ticks,
@@ -477,6 +782,3 @@ class TimeWindowDialog(QtWidgets.QDialog):
             'timeGroups': groups_to_config(self._groups_from_rows()),
             'timePeriodSources': time_period_sources(self.main_folder),
         }
-        if self.show_snapshots:
-            payload['snapshotHours'] = parse_hour_list(self.snapshot_edit.text())
-        return payload

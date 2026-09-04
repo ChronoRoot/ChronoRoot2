@@ -410,7 +410,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
     def open_time_window_dialog(self):
         self.saveFieldsIntoJson()
-        dialog = TimeWindowDialog(self, show_snapshots=True)
+        dialog = TimeWindowDialog(self)
         dialog.set_main_folder(self.projectField.text().strip())
         conf = self.config_store.build_payload(self)
         dialog.load_from_conf(conf)
@@ -419,12 +419,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         payload = dialog.to_conf()
         for key, value in payload.items():
             setattr(self, key, value)
-        hours = payload.get('snapshotHours') or []
-        hour_text = ','.join(str(h) for h in hours)
-        if hours:
-            self.daysConvexField.setText(hour_text)
-            self.daysAnglesField.setText(hour_text)
         self.saveFieldsIntoJson()
+
+    def _sync_snapshot_hour_fields(self):
+        convex_on = self.doConvex.isChecked()
+        self.daysConvexField.setEnabled(convex_on)
+        self.daysConvexLabel.setEnabled(convex_on)
+        self.daysConvexText.setEnabled(convex_on)
+        self.saveImagesConvex.setEnabled(convex_on)
+        angles_on = self.doLateralAngles.isChecked()
+        self.daysAnglesField.setEnabled(angles_on)
+        self.daysAnglesText.setEnabled(angles_on)
+        self.daysAnglesHint.setEnabled(angles_on)
 
     def open_remap_identifiers_dialog(self):
         project = self.projectField.text().strip()
@@ -1483,7 +1489,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.tab1TimePeriodButton.setObjectName("tab1TimePeriodButton")
         self.tab1TimePeriodButton.setText("Set analysis\nperiod")
         self.tab1TimePeriodButton.setToolTip(
-            "Set duration, per-group start/t0, clock ticks, and snapshot hours "
+            "Set duration, per-group start/t0, and clock ticks "
             "before processing all plants."
         )
         self.tab1TimePeriodButton.clicked.connect(self.open_time_window_dialog)
@@ -1820,24 +1826,22 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.saveImagesConvex = QtWidgets.QCheckBox(self.tab4)
         self.saveImagesConvex.setGeometry(QtCore.QRect(370, 120, 311, 31))
         self.saveImagesConvex.setObjectName("saveImagesConvex")
-        self.saveImagesConvex.setText("Save images for each day")
+        self.saveImagesConvex.setText("Save images for each snapshot")
 
         self.daysConvexLabel = QtWidgets.QLabel(self.tab4)
-        self.daysConvexLabel.setGeometry(QtCore.QRect(10, 160, 131, 31))
+        self.daysConvexLabel.setGeometry(QtCore.QRect(10, 160, 141, 31))
         self.daysConvexLabel.setObjectName("daysConvexLabel")
-        self.daysConvexLabel.setText("Days to report")
-        self.daysConvexLabel.hide()
+        self.daysConvexLabel.setText("Snapshot hours")
 
         self.daysConvexField = QtWidgets.QLineEdit(self.tab4)
-        self.daysConvexField.setGeometry(QtCore.QRect(120, 160, 221, 31))
+        self.daysConvexField.setGeometry(QtCore.QRect(150, 160, 191, 31))
         self.daysConvexField.setObjectName("daysConvexField")
-        self.daysConvexField.hide()
+        self.daysConvexField.setPlaceholderText("0, 24")
 
         self.daysConvexText = QtWidgets.QLabel(self.tab4)
         self.daysConvexText.setGeometry(QtCore.QRect(350, 160, 351, 31))
         self.daysConvexText.setObjectName("daysConvexText")
-        self.daysConvexText.setText("(Numbers separated by commas)")
-        self.daysConvexText.hide()
+        self.daysConvexText.setText("(elapsed hours, e.g. 0, 24)")
 
         self.convexSectionSeparator = QtWidgets.QFrame(self.tab4)
         self.convexSectionSeparator.setGeometry(QtCore.QRect(-40, 190, 891, 41))
@@ -1880,15 +1884,19 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportEmergenceDistanceHintLabel.setText("(in millimeters, default: 2 mm)")
 
         self.daysAnglesText = QtWidgets.QLabel(self.tab4)
-        self.daysAnglesText.setGeometry(QtCore.QRect(10, 330, 131, 31))
+        self.daysAnglesText.setGeometry(QtCore.QRect(10, 330, 141, 31))
         self.daysAnglesText.setObjectName("daysAnglesText")
-        self.daysAnglesText.setText("Days to report")
-        self.daysAnglesText.hide()
+        self.daysAnglesText.setText("Snapshot hours")
 
         self.daysAnglesField = QtWidgets.QLineEdit(self.tab4)
-        self.daysAnglesField.setGeometry(QtCore.QRect(120, 330, 221, 31))
+        self.daysAnglesField.setGeometry(QtCore.QRect(150, 330, 191, 31))
         self.daysAnglesField.setObjectName("daysAnglesField")
-        self.daysAnglesField.hide()
+        self.daysAnglesField.setPlaceholderText("0, 24")
+
+        self.daysAnglesHint = QtWidgets.QLabel(self.tab4)
+        self.daysAnglesHint.setGeometry(QtCore.QRect(350, 330, 351, 31))
+        self.daysAnglesHint.setObjectName("daysAnglesHint")
+        self.daysAnglesHint.setText("(elapsed hours, e.g. 0, 24)")
 
         self.anglesSectionSeparator = QtWidgets.QFrame(self.tab4)
         self.anglesSectionSeparator.setGeometry(QtCore.QRect(-30, 360, 961, 41))
@@ -1955,7 +1963,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportTimeWindowsButton.setObjectName("reportTimeWindowsButton")
         self.reportTimeWindowsButton.setText("Set analysis\nperiod")
         self.reportTimeWindowsButton.setToolTip(
-            "Set analysis duration, per-group start/t0, clock ticks, and snapshot hours."
+            "Set analysis duration, per-group start/t0, and clock ticks."
         )
         self.reportTimeWindowsButton.clicked.connect(self.open_time_window_dialog)
 
@@ -2014,6 +2022,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         ]
         for widget in interactive_widgets:
             widget.raise_()
+
+        self.doConvex.toggled.connect(self._sync_snapshot_hour_fields)
+        self.doLateralAngles.toggled.connect(self._sync_snapshot_hour_fields)
+        self._sync_snapshot_hour_fields()
 
         return
 

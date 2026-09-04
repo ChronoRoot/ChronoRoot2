@@ -503,7 +503,7 @@ def analyze_hull_statistics(conf, data, metric):
     if 'ElapsedTime (h)' not in data.columns and 'Day' in data.columns:
         data['ElapsedTime (h)'] = data['Day']
     data['ElapsedTime (h)'] = data['ElapsedTime (h)'].astype(str)
-    hours = [str(h) for h in conf_snapshot_hours(conf)]
+    hours = [str(h) for h in conf_snapshot_hours(conf, kind='convex')]
     slug = metric_slug(metric)
     table_path = table_file(conf, MODULE_CONVEX, slug, 'summary_table.csv')
     perform_interval_pairwise_stats(

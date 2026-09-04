@@ -564,7 +564,7 @@ def makeLateralAnglesPlots(conf):
     groups, _mode = resolved_time_groups(conf, None)
     if not groups:
         groups, _mode = resolved_time_groups(conf, collect_hourly_data(parent_folder))
-    hours = conf_snapshot_hours(conf)
+    hours = conf_snapshot_hours(conf, kind='angles')
     duration = conf.get('timeDurationHours')
     if duration in (None, '') and groups:
         duration = default_duration_hours(groups)
@@ -776,7 +776,7 @@ def performStatisticalAnalysisAngles(conf, data, metric):
     if 'ElapsedTime (h)' not in data.columns and 'Day' in data.columns:
         data['ElapsedTime (h)'] = data['Day']
     data['ElapsedTime (h)'] = data['ElapsedTime (h)'].astype(int).astype(str)
-    hours = [str(h) for h in conf_snapshot_hours(conf)]
+    hours = [str(h) for h in conf_snapshot_hours(conf, kind='angles')]
     slug = 'mean_emergence_angle'
     table_path = table_file(conf, MODULE_ANGLES, slug, 'summary_table.csv')
     perform_interval_pairwise_stats(
