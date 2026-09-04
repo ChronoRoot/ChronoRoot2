@@ -34,6 +34,15 @@ from .utils.fileUtilities import (
     attach_plant_metadata_columns,
     build_plant_id,
 )
+from .time_windows import (
+    collect_hourly_data,
+    default_duration_hours,
+    elapsed_hours_from_t0,
+    match_time_group,
+    parse_datetime,
+    resolved_time_groups,
+    snapshot_hours as conf_snapshot_hours,
+)
 from .utils.report_paths import (
     MODULE_ANGLES,
     angle_overlays_dir,
@@ -53,7 +62,6 @@ from .stats_utils import (
     _stratify_label,
 )
 from .report_plots import emit_interval_comparison_plots
-from .utils.report_paths import metric_dir
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 import cv2
 import logging
@@ -424,82 +432,35 @@ def getAngles(conf, path):
     return
 
 
-def dataWork(df, first_day, last_day):
-    """
-    Process and normalize time series data for angle measurements.
-    
-    Extracts datetime from image filenames, filters to the specified date range,
-    fills gaps in the time series, and aggregates by day and hour.
-    
-    Args:
-        df: DataFrame with angle measurements and 'Img' column containing timestamps
-        first_day: Start of the analysis period (datetime)
-        last_day: End of the analysis period (datetime)
-    
-    Returns:
-        DataFrame: Processed data with 'Day', 'Hour', and angle measurements,
-                   or empty DataFrame if no valid data
-    """
-    # Extract datetime components from image filename
+def dataWork(df, t0, start=None, end=None):
+    """Process angle rows onto elapsed hours relative to t0."""
     datetime_strings = df['Img'].str.extract(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})')
     datetime_strings.columns = ['Year', 'Month', 'Day', 'Hour', 'Minute']
     datetime_strings = datetime_strings.astype(int)
 
     df = df.drop(['Img'], axis=1)
     df['Date'] = pd.to_datetime(datetime_strings[['Year', 'Month', 'Day', 'Hour', 'Minute']])
-
-    # Remove timezone info if present for consistent comparison
-    if first_day.tzinfo is not None:
-        first_day = first_day.tz_localize(None)
-    if last_day.tzinfo is not None:
-        last_day = last_day.tz_localize(None)
-
-    beginning = df['Date'].min()
-
-    # Handle data that starts before first_day
-    if beginning < first_day:
-        df = df[df['Date'] >= first_day]
-        if df.empty:
-            return pd.DataFrame()
-    # Handle data that starts after first_day (fill gaps with zeros)
-    elif beginning > first_day:
-        rows = pd.DataFrame()
-        # CHANGED: '15T' -> '15min' (Compatible with Pandas < 2.2 and > 2.2)
-        rows['Date'] = pd.date_range(start=first_day, end=beginning, freq='15min')
-        for col in ['Number of lateral roots', 'Mean tip angle', 'Mean emergence angle', 
-                    'First LR tip', 'First LR emergence']:
-            rows[col] = 0
-        df = pd.concat([rows, df], ignore_index=True)
-
-    end = df['Date'].max()
-
-    # Handle data that extends beyond last_day
-    if end > last_day:
-        df = df[df['Date'] <= last_day]
-    # Handle data that ends before last_day (extend with last values)
-    elif end < last_day:
-        rows = pd.DataFrame()
-        # CHANGED: '15T' -> '15min' (Compatible with Pandas < 2.2 and > 2.2)
-        rows['Date'] = pd.date_range(start=end, end=last_day, freq='15min')
-        for col in ['Number of lateral roots', 'Mean tip angle', 'Mean emergence angle', 
-                    'First LR tip', 'First LR emergence']:
-            rows[col] = df[col].iloc[-1]
-        df = pd.concat([df, rows], ignore_index=True)
-
+    t0 = parse_datetime(t0)
+    start = parse_datetime(start)
+    end = parse_datetime(end)
+    if t0 is None:
+        t0 = df['Date'].min()
+    if start is not None:
+        df = df[df['Date'] >= start]
+    if end is not None:
+        df = df[df['Date'] <= end]
     if df.empty:
         return pd.DataFrame()
 
-    # Calculate days and hours elapsed from first_day
-    time_elapsed = df['Date'] - first_day
-    df['Day'] = time_elapsed.dt.days
+    elapsed = elapsed_hours_from_t0(df['Date'], t0)
+    df = df.loc[elapsed.notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df['ElapsedTime (h)'] = elapsed.loc[df.index].astype(int)
+    df['Day'] = df['ElapsedTime (h)']
     df['Hour'] = df['Date'].dt.hour
-    
     df = df.drop(['Date'], axis=1)
-    
-    # Aggregate by day and hour
-    df = df.groupby(['Day', 'Hour']).mean(numeric_only=True).reset_index()
-    df = df.astype(float)
-    
+    df = df.groupby(['ElapsedTime (h)', 'Day', 'Hour']).mean(numeric_only=True).reset_index()
     return df
 
 
@@ -600,6 +561,13 @@ def makeLateralAnglesPlots(conf):
     first_lr_slug = 'first_lr_tip_angle'
 
     all_data = pd.DataFrame()
+    groups, _mode = resolved_time_groups(conf, None)
+    if not groups:
+        groups, _mode = resolved_time_groups(conf, collect_hourly_data(parent_folder))
+    hours = conf_snapshot_hours(conf)
+    duration = conf.get('timeDurationHours')
+    if duration in (None, '') and groups:
+        duration = default_duration_hours(groups)
         
     for exp in experiments:
         plants = utils.load_paths(exp, '*/*/*')
@@ -628,9 +596,19 @@ def makeLateralAnglesPlots(conf):
             
             date1 = pd.to_datetime(data2.loc[0, "Date"], dayfirst=False)
             date2 = pd.to_datetime(data2.iloc[-1]["Date"], dayfirst=False)
+            group = match_time_group(groups, date1, date2) if groups else None
+            t0 = parse_datetime(group.get('t0')) if group else date1
+            start = parse_datetime(group.get('start')) if group else date1
+            end = None
+            if start is not None and duration not in (None, ''):
+                end = start + pd.Timedelta(hours=float(duration))
+            elif group:
+                end = parse_datetime(group.get('spanEnd')) or date2
+            else:
+                end = date2
                         
             data = pd.read_csv(file)
-            data = dataWork(data, date1, date2)
+            data = dataWork(data, t0, start, end)
 
             if data.empty:
                 continue
@@ -651,9 +629,16 @@ def makeLateralAnglesPlots(conf):
     # Filter data for specified analysis days
     frame = []
     if not all_data.empty:
-        for day in conf['daysAngles'].split(','):
-            aux = all_data[all_data['Day'] == int(day)]
-            aux = aux[aux['Hour'] == 0]
+        if 'ElapsedTime (h)' not in all_data.columns and 'Day' in all_data.columns:
+            all_data['ElapsedTime (h)'] = all_data['Day']
+        snapshot = hours
+        elapsed = pd.to_numeric(all_data['ElapsedTime (h)'], errors='coerce')
+        for hour in snapshot:
+            delta = (elapsed - int(hour)).abs()
+            if delta.empty:
+                continue
+            nearest_hour = elapsed.loc[delta.idxmin()]
+            aux = all_data.loc[elapsed == nearest_hour]
             aux = aux[aux['Mean emergence angle'] > 0]
             frame.append(aux)
     
@@ -669,10 +654,10 @@ def makeLateralAnglesPlots(conf):
 
             ax = plt.subplots()
 
-            sns.violinplot(x='Day', y='Mean emergence angle', data=frame,
+            sns.violinplot(x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
                           hue='Experiment', inner=None, zorder=2, legend=False,
                           palette=geno_palette)
-            ax = sns.swarmplot(x='Day', y='Mean emergence angle', data=frame,
+            ax = sns.swarmplot(x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
                               hue='Experiment', dodge=True, size=4,
                               palette=geno_palette, edgecolor='black',
                               linewidth=0.5, zorder=1, s=2)
@@ -693,16 +678,15 @@ def makeLateralAnglesPlots(conf):
             performStatisticalAnalysisAngles(conf, frame, 'Mean emergence angle')
 
             # Generate summary table
-            summary_data = frame.groupby(['Day', 'Experiment']).agg(
+            summary_data = frame.groupby(['ElapsedTime (h)', 'Experiment']).agg(
                 {'Mean emergence angle': ['count', 'mean', 'std']}
             )
             summary_data.columns = [' '.join(col).strip() for col in summary_data.columns.values]
             summary_data = summary_data.reset_index()
-            summary_data.columns = ['Day', 'Experiment', 'N Samples', 
+            summary_data.columns = ['ElapsedTime (h)', 'Experiment', 'N Samples', 
                                    'Mean Emergence Angle (Mean)', 'Mean Emergence Angle (std)']
             summary_data = summary_data.round(3)
-            summary_data['Day'] = summary_data['Day'].astype('int')
-            summary_data = summary_data.sort_values(by='Day', ascending=True)
+            summary_data = summary_data.sort_values(by='ElapsedTime (h)', ascending=True)
             summary_data.to_csv(table_file(conf, MODULE_ANGLES, emergence_slug, 'summary_table.csv'),
                                index=False)
     
@@ -789,16 +773,18 @@ def makeLateralAnglesPlots(conf):
 
 def performStatisticalAnalysisAngles(conf, data, metric):
     data = ensure_factor_columns(data)
-    data['Day'] = data['Day'].astype(int).astype(str)
-    days = conf['daysAngles'].split(',')
+    if 'ElapsedTime (h)' not in data.columns and 'Day' in data.columns:
+        data['ElapsedTime (h)'] = data['Day']
+    data['ElapsedTime (h)'] = data['ElapsedTime (h)'].astype(int).astype(str)
+    hours = [str(h) for h in conf_snapshot_hours(conf)]
     slug = 'mean_emergence_angle'
     table_path = table_file(conf, MODULE_ANGLES, slug, 'summary_table.csv')
     perform_interval_pairwise_stats(
         conf, data, metric, output_dir=None,
-        interval_col='Day',
-        intervals=days,
+        interval_col='ElapsedTime (h)',
+        intervals=hours,
         plant_id_col='Plant_id',
-        interval_label='Day',
+        interval_label='ElapsedTime (h)',
         module=MODULE_ANGLES,
         metric_slug_name=slug,
         table_file_path=table_path,
@@ -807,6 +793,7 @@ def performStatisticalAnalysisAngles(conf, data, metric):
         conf, data, metric, metric_dir(conf, MODULE_ANGLES, slug),
         module=MODULE_ANGLES, metric_slug_name=slug,
         metric_label='Mean emergence angle',
+        x_col='ElapsedTime (h)',
     )
     return
 

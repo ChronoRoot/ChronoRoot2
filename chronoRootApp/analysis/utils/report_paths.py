@@ -4,6 +4,7 @@ import os
 import re
 
 from .report_utils import ensure_directory
+from ..time_windows import report_folder_name
 
 MODULE_TEMPORAL = 'temporal_parameters'
 MODULE_CONVEX = 'convex_hull'
@@ -34,6 +35,7 @@ CONVEX_METRICS = [
 FOURIER_PARENT_METRICS = {
     'MR': 'main_root_length',
     'TR': 'total_root_length',
+    'HY': 'hypocotyl_length',
 }
 
 ANGLE_METRICS = {
@@ -51,7 +53,7 @@ def metric_slug(display_name: str) -> str:
 
 
 def report_root(conf) -> str:
-    return os.path.join(conf['MainFolder'], 'Report')
+    return os.path.join(conf['MainFolder'], report_folder_name(conf))
 
 
 def data_file(conf, filename: str) -> str:

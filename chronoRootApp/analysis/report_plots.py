@@ -12,6 +12,7 @@ from .stats_utils import (
 )
 from .utils.fileUtilities import normalize_factor_value, UNSPECIFIED_FACTOR
 from .utils.report_paths import comparison_plot_path
+from .time_windows import draw_clock_ticks
 from .utils.report_style import (
     apply_factor_axis_labels,
     axis_label_for_column,
@@ -171,6 +172,9 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
             return
         axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
+        if x_col in ('ElapsedTime (h)', 'Time'):
+            for ax in g.axes.flat:
+                draw_clock_ticks(ax, count_data, conf, twin_axis=False)
         g.set_ylabels('Number of plants')
         g.fig.suptitle(title, y=1.02)
         g.savefig(count_path, dpi=300, bbox_inches='tight')
@@ -230,6 +234,9 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
 
         axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
+        if x_col in ('ElapsedTime (h)', 'Time'):
+            for ax in g.axes.flat:
+                draw_clock_ticks(ax, plot_data, conf, twin_axis=False)
         g.fig.suptitle(title, y=1.02)
         g.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close('all')

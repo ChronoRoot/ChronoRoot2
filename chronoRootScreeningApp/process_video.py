@@ -116,6 +116,44 @@ class GroupROISelector:
 def natural_sort_key(s):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
 
+
+def _datetime_from_image_name(name):
+    nums = re.findall(r'\d+', os.path.basename(str(name)))
+    if len(nums) < 5:
+        return None
+    try:
+        return datetime(int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3]), int(nums[4]))
+    except (ValueError, TypeError):
+        return None
+
+
+def record_acquisition_span(analysis_dir, image_files):
+    """Store first/last picture names and parsed clock times on tracking metadata."""
+    names = [f for f in (image_files or []) if f]
+    if not names:
+        return
+    first_image = os.path.basename(str(names[0]))
+    last_image = os.path.basename(str(names[-1]))
+    first_dt = _datetime_from_image_name(first_image)
+    last_dt = _datetime_from_image_name(last_image)
+    metadata_path = os.path.join(analysis_dir, 'metadata.json')
+    metadata = {}
+    if os.path.isfile(metadata_path):
+        try:
+            with open(metadata_path, 'r') as handle:
+                metadata = json.load(handle) or {}
+        except Exception:
+            metadata = {}
+    metadata['first_image'] = first_image
+    metadata['last_image'] = last_image
+    if first_dt is not None:
+        metadata['first_datetime'] = first_dt.strftime('%Y-%m-%dT%H:%M:%S')
+    if last_dt is not None:
+        metadata['last_datetime'] = last_dt.strftime('%Y-%m-%dT%H:%M:%S')
+    with open(metadata_path, 'w') as handle:
+        json.dump(metadata, handle, indent=4)
+
+
 def get_group_for_position(x: int, y: int, groups: Dict[str, Tuple[int, int, int, int]]) -> str:
     for group_name, (x1, y1, x2, y2) in groups.items():
         if x1 <= x <= x2 and y1 <= y <= y2:
@@ -295,6 +333,8 @@ def process_video(params: Dict[str, Any]):
 
     if not image_files:
         raise ValueError("No image files found in the video directory")
+
+    record_acquisition_span(analysis_dir, image_files)
 
     if params.get('group_rois'):
         groups = load_group_rois(params['group_rois'], params['group_names'])
@@ -569,6 +609,7 @@ def process_video(params: Dict[str, Any]):
     # Update metadata
     completion_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_metadata(analysis_dir, params, completion_time=completion_time)
+    record_acquisition_span(analysis_dir, image_files)
 
     print(f"Results saved in: {results_path}")
 

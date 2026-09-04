@@ -43,6 +43,7 @@ from .utils.report_paths import (
 )
 from .stats_utils import perform_temporal_pairwise_stats, ensure_factor_columns
 from .report_plots import emit_temporal_comparison_plots
+from .time_windows import draw_clock_ticks, elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 
 
@@ -89,24 +90,8 @@ def _include_lateral_root_plots(conf):
     return conf.get('includeLateralRootPlots', True)
 
 
-def _add_day_axis(ax, dataframe, day_tick_size=12):
-    ax_days = ax.twiny()
-    ax_days.set_xlim(ax.get_xlim())
-    max_hours = dataframe['ElapsedTime (h)'].max()
-    if pd.notna(max_hours) and max_hours > 0:
-        total_days = np.ceil(max_hours / 24).astype(int)
-        if total_days > 0:
-            day_ticks = np.arange(24, total_days * 24 + 1, 24)
-            day_labels = [f'Day {i}' for i in range(1, total_days + 1)]
-            ax_days.set_xticks(day_ticks)
-            ax_days.set_xticklabels(day_labels, rotation=45, ha='left', fontsize=day_tick_size)
-        else:
-            ax_days.set_xticks([])
-    else:
-        ax_days.set_xticks([])
-    ax_days.tick_params(axis='x', which='major', length=8, width=2, color='black')
-    ax_days.tick_params(axis='x', which='minor', length=4, width=1, color='black')
-    return ax_days
+def _add_day_axis(ax, dataframe, day_tick_size=12, conf=None):
+    return draw_clock_ticks(ax, dataframe, conf, twin_axis=True)
 
 
 def plot_individual_plant(savepath, dataframe, name, conf=None):
@@ -146,7 +131,7 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
     else:
         ax1.set_xlabel('Elapsed Time (h)', fontsize=LABEL_SIZE)
 
-    _add_day_axis(ax1, dataframe, DAY_TICK_SIZE)
+    _add_day_axis(ax1, dataframe, DAY_TICK_SIZE, conf=conf)
 
     plt.tight_layout()
 
@@ -219,15 +204,9 @@ def performStatisticalAnalysisForMetrics(conf, data, metrics, max_workers=MAX_ME
 def _write_metric_summary_table(conf, data, metric, slug):
     """Per-metric descriptive summary across intervals and grouping factors."""
     dt = int(conf['everyXhourField'])
-    max_hour = data['ElapsedTime (h)'].max()
-    if pd.isna(max_hour):
-        return
-
-    n_steps = int(round((max_hour + 1) / dt, 0))
     rows = []
-    for step in range(n_steps):
-        end = int(min(dt * (step + 1), max_hour))
-        hours = np.arange(dt * step, end)
+    for start, end in elapsed_hour_windows(data, dt):
+        hours = np.arange(start, end)
         subdata = data[data['ElapsedTime (h)'].isin(hours)]
         subdata = subdata.groupby(
             ['Experiment', 'PlateCondition', 'ExtraVariable', 'Plant_id']
@@ -237,7 +216,7 @@ def _write_metric_summary_table(conf, data, metric, slug):
             mean=(metric, 'mean'),
             sd=(metric, 'std'),
         ).reset_index()
-        grouped['hours_interval'] = f'{dt * step}-{end - 1}'
+        grouped['hours_interval'] = f'{start}-{end - 1}'
         rows.append(grouped)
 
     if not rows:
@@ -247,8 +226,8 @@ def _write_metric_summary_table(conf, data, metric, slug):
     result = result.round(3)
     result.to_csv(table_file(conf, MODULE_TEMPORAL, slug, 'summary_table.csv'), index=False)
 
-def _build_temporal_summary_table(data, group_cols, dt, max_hour, include_laterals=True):
-    n_steps = int(round((max_hour + 1) / dt, 0))
+
+def _build_temporal_summary_table(data, group_cols, dt, include_laterals=True):
     summary_df = []
 
     agg_cols = {
@@ -267,15 +246,14 @@ def _build_temporal_summary_table(data, group_cols, dt, max_hour, include_latera
     if not agg_cols:
         return pd.DataFrame()
 
-    for step in range(n_steps):
-        end = int(min(dt * (step + 1), max_hour))
-        hours = np.arange(dt * step, end)
+    for start, end in elapsed_hour_windows(data, dt):
+        hours = np.arange(start, end)
         subdata = data[data['ElapsedTime (h)'].isin(hours)]
         subdata = subdata.groupby(group_cols + ['Plant_id']).mean(numeric_only=True).reset_index()
         subdata = subdata.groupby(group_cols).agg(agg_cols)
         subdata.columns = [' '.join(col).strip() for col in subdata.columns.values]
         subdata = subdata.reset_index()
-        subdata['Hours interval'] = f'{dt * step}-{end - 1}'
+        subdata['Hours interval'] = f'{start}-{end - 1}'
         summary_df.append(subdata)
 
     if not summary_df:
@@ -292,17 +270,16 @@ def _build_temporal_summary_table(data, group_cols, dt, max_hour, include_latera
 def generateTableTemporal(conf, data):
     data = ensure_factor_columns(data)
     dt = int(conf['everyXhourField'])
-    max_hour = data['ElapsedTime (h)'].max()
     include_laterals = _include_lateral_root_plots(conf)
 
     tables = [
         (_build_temporal_summary_table(
-            data, ['Experiment'], dt, max_hour, include_laterals), 'summary_by_genotype.csv'),
+            data, ['Experiment'], dt, include_laterals), 'summary_by_genotype.csv'),
         (_build_temporal_summary_table(
-            data, ['PlateCondition', 'Experiment'], dt, max_hour, include_laterals),
+            data, ['PlateCondition', 'Experiment'], dt, include_laterals),
          'summary_by_plate.csv'),
         (_build_temporal_summary_table(
-            data, ['ExtraVariable', 'Experiment'], dt, max_hour, include_laterals),
+            data, ['ExtraVariable', 'Experiment'], dt, include_laterals),
          'summary_by_extra_variable.csv'),
     ]
 
@@ -353,6 +330,7 @@ def plot_info_all(conf, dataframe):
             x='ElapsedTime (h)', y=y_col, data=plot_df, hue='Experiment',
             errorbar='se', ax=ax, palette=geno_palette,
         )
+        draw_clock_ticks(ax, plot_df, conf, twin_axis=False)
         ax.set_title(title, fontsize=16)
         ax.legend(loc='best', title=geno_label)
 
@@ -384,6 +362,7 @@ def plot_info_all(conf, dataframe):
             x='ElapsedTime (h)', y='_n', data=n_df, hue='Experiment',
             errorbar=None, estimator='sum', ax=ax, palette=geno_palette,
         )
+        draw_clock_ticks(ax, n_df, conf, twin_axis=False)
         ax.set_title(title, fontsize=16)
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
         ax.set_ylabel('Number of plants', fontsize=12)

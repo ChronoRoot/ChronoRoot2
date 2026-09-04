@@ -36,6 +36,7 @@ from analysis.stats_utils import (  # noqa: E402
 from analysis.report_plots import emit_scalar_comparison_plots  # noqa: E402
 from analysis.fpca_analysis import performFPCA  # noqa: E402
 from analysis.fourier_analysis import makeFourierPlots  # noqa: E402
+from analysis.time_windows import apply_time_windows  # noqa: E402
 from analysis.utils.fileUtilities import (  # noqa: E402
     convertToPathSafe,
     normalize_factor_value,

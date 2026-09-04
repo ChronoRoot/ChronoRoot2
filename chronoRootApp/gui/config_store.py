@@ -89,6 +89,19 @@ class ConfigStore:
 
     data["daysConvexHull"] = host.daysConvexField.text()
     data["daysAngles"] = host.daysAnglesField.text()
+    snapshot = getattr(host, 'snapshotHours', None)
+    if snapshot:
+      data["snapshotHours"] = snapshot
+      data["daysConvexHull"] = ','.join(str(h) for h in snapshot)
+      data["daysAngles"] = ','.join(str(h) for h in snapshot)
+    elif snapshot is not None:
+      data["snapshotHours"] = snapshot
+    for key in (
+        'timeSyncMode', 'timeDurationHours', 'reportFolderName',
+        'figureClockTicks', 'showFigureClockTicks', 'timeGroups', 'timePeriodSources',
+    ):
+      if hasattr(host, key):
+        data[key] = getattr(host, key)
 
     data["rpi"] = host.rpiField.text()
     data["rpiField"] = host.rpiField.text()
@@ -192,6 +205,25 @@ class ConfigStore:
       host.daysConvexField.setText(str(data["daysConvexHull"]))
     if "daysAngles" in data:
       host.daysAnglesField.setText(str(data["daysAngles"]))
+    for key, default in (
+        ('timeSyncMode', 'clock'),
+        ('timeDurationHours', None),
+        ('reportFolderName', 'Report'),
+        ('figureClockTicks', ['00:00']),
+        ('showFigureClockTicks', None),
+        ('snapshotHours', None),
+        ('timeGroups', []),
+        ('timePeriodSources', []),
+    ):
+      if key in data:
+        setattr(host, key, data[key])
+      elif key == 'timePeriodSources':
+        setattr(host, key, [])
+      elif key == 'showFigureClockTicks':
+        mode = getattr(host, 'timeSyncMode', 'clock')
+        setattr(host, key, mode != 'anchor')
+      elif not hasattr(host, key):
+        setattr(host, key, default)
 
   def resolve_config_path(self, host):
     project_cfg = os.path.join(host.projectField.text(), PROJECT_CONFIG_NAME)

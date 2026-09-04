@@ -14,6 +14,8 @@ from scipy import signal
 import json
 import warnings
 
+from .time_windows import elapsed_hours_from_t0
+
 def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5):
     """
     Process root measurement data.
@@ -251,7 +253,7 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
         data = data.rename(columns={'index': 'Date'})
     
     data['NewDay'] = (data['Date'].dt.hour == 0) & (data['Date'].dt.minute == 0)
-    data['ElapsedTime (h)'] = ((data['Date'] - data['Date'][0]).dt.total_seconds() / 3600).round(0)
+    data['ElapsedTime (h)'] = elapsed_hours_from_t0(data['Date'], data['Date'].iloc[0])
     data['NumberOfLateralRoots'] = data['NumberOfLateralRoots'].round(0)
 
     # Calculate gradients

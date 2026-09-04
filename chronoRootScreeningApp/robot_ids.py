@@ -40,8 +40,18 @@ def rpi_cam_from_identifier(analysis_id):
     return None, None
 
 
-def identifier_from_rpi_cam(rpi, cam):
-    return f'rpi{rpi}_cam_{cam}'
+def identifier_suffix(extra):
+    """Filesystem-safe extra token for analysis identifiers."""
+    text = re.sub(r'[^A-Za-z0-9_]+', '_', str(extra or '').strip()).strip('_')
+    return text
+
+
+def identifier_from_rpi_cam(rpi, cam, extra=None):
+    base = f'rpi{rpi}_cam_{cam}'
+    suffix = identifier_suffix(extra)
+    if suffix:
+        return f'{base}_{suffix}'
+    return base
 
 
 def _clean_id(value):

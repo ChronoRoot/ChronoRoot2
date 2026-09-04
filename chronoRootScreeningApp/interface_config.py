@@ -132,6 +132,13 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         payload['genotypeAxisLabel'] = analysis_tab.genotypeAxisLabelField.text()
         payload['plateConditionAxisLabel'] = analysis_tab.plateConditionAxisLabelField.text()
         payload['extraVariableLabel'] = analysis_tab.extraVariableLabelField.text()
+        payload['timeSyncMode'] = getattr(analysis_tab, 'timeSyncMode', 'clock')
+        payload['timeDurationHours'] = getattr(analysis_tab, 'timeDurationHours', None)
+        payload['reportFolderName'] = getattr(analysis_tab, 'reportFolderName', 'Report')
+        payload['figureClockTicks'] = getattr(analysis_tab, 'figureClockTicks', ['00:00'])
+        payload['showFigureClockTicks'] = getattr(analysis_tab, 'showFigureClockTicks', True)
+        payload['timeGroups'] = getattr(analysis_tab, 'timeGroups', [])
+        payload['timePeriodSources'] = getattr(analysis_tab, 'timePeriodSources', [])
         for name in (
             'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
             'statsByPlateCondition', 'statsByExtraVariable',
@@ -260,6 +267,25 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
                 widget = getattr(analysis_tab, name, None)
                 if widget is not None:
                     _set_checkbox_from_keys(widget, data, (name,))
+            if 'timeSyncMode' in data:
+                analysis_tab.timeSyncMode = data.get('timeSyncMode') or 'clock'
+            if 'timeDurationHours' in data:
+                analysis_tab.timeDurationHours = data.get('timeDurationHours')
+            if 'reportFolderName' in data:
+                analysis_tab.reportFolderName = data.get('reportFolderName') or 'Report'
+            if 'figureClockTicks' in data:
+                analysis_tab.figureClockTicks = data.get('figureClockTicks') or ['00:00']
+            if 'showFigureClockTicks' in data:
+                analysis_tab.showFigureClockTicks = bool(data.get('showFigureClockTicks'))
+            else:
+                mode = getattr(analysis_tab, 'timeSyncMode', 'clock')
+                analysis_tab.showFigureClockTicks = mode != 'anchor'
+            if 'timeGroups' in data:
+                analysis_tab.timeGroups = data.get('timeGroups') or []
+            if 'timePeriodSources' in data:
+                analysis_tab.timePeriodSources = data.get('timePeriodSources') or []
+            else:
+                analysis_tab.timePeriodSources = []
 
         groups = data.get('groups')
         if groups is None and 'group_names' in data:

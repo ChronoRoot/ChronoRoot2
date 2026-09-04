@@ -33,12 +33,14 @@ from analysis.utils.fileUtilities import (
     build_plant_id,
     normalize_factor_value,
 )
+from analysis.time_windows import apply_time_windows, snapshot_hours
 from analysis.utils.report_paths import (
     data_file,
     individual_plots_dir,
     overview_dir,
     MODULE_CONVEX,
     purge_disabled_comparison_outputs,
+    report_root,
 )
 
 
@@ -75,7 +77,7 @@ if __name__ == "__main__":
     analysis_folder = os.path.join(conf['MainFolder'], 'Analysis')
     experiments = utils.load_paths(analysis_folder, '*')
 
-    utils.ensure_directory(os.path.join(conf['MainFolder'], 'Report'))
+    utils.ensure_directory(report_root(conf))
 
     print("Report generation began. This may take a while.")
 
@@ -142,6 +144,8 @@ if __name__ == "__main__":
                         shutil.copy(iplot_cache, report_dest)
 
     all_data = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
+    if not all_data.empty:
+        all_data = apply_time_windows(all_data, conf)
     all_data.to_csv(temporal_data_path, index=False)
     print(f'Phase 1/3: wrote {temporal_data_path}')
 
@@ -157,7 +161,7 @@ if __name__ == "__main__":
     if conf.get('doConvex'):
         print('Phase 2/3: convex hull analysis...')
         global_shape, global_center = convex_hull.calculate_atlas_geometry(experiments)
-        convex_days = [int(d) for d in conf['daysConvexHull'].split(',') if str(d).strip()]
+        snapshot_h = snapshot_hours(conf)
         timestep = int(conf['timeStep'])
         convex_overview = overview_dir(conf, MODULE_CONVEX)
         convex_frames = []
@@ -169,11 +173,12 @@ if __name__ == "__main__":
 
             atlases, current_convex_df = convex_hull.generate_root_atlases(
                 exp_dir,
-                days=convex_days,
+                snapshot_hours=snapshot_h,
                 timestep=timestep,
                 canvas_shape=global_shape,
                 center_coords=global_center,
                 rotate_root=True,
+                conf=conf,
             )
 
             if not current_convex_df.empty:
@@ -181,17 +186,18 @@ if __name__ == "__main__":
                 convex_frames.append(current_convex_df)
 
             if conf.get('saveImagesConvex') and atlases:
-                for i, day in enumerate(convex_days):
+                for i, hour in enumerate(snapshot_h):
                     at_hull, at_cont, at_root = atlases[i]
                     convex_hull.visualize_single_atlas(
                         at_hull, at_cont, at_root,
-                        convex_overview, exp_dir_name, day,
+                        convex_overview, exp_dir_name, hour,
                     )
             elif atlases:
                 at_hull, at_cont, at_root = atlases[-1]
                 convex_hull.visualize_single_atlas(
                     at_hull, at_cont, at_root,
                     convex_overview, exp_dir_name,
+                    snapshot_h[-1] if snapshot_h else None,
                 )
 
         convex_hull_df = pd.concat(convex_frames, ignore_index=True) if convex_frames else pd.DataFrame()

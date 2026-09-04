@@ -36,6 +36,12 @@ from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
 from gui import pipeline_runner
 from gui.stats_config_dialog import StatsConfigDialog
 from gui.remap_identifiers_dialog import RemapIdentifiersDialog
+from gui.time_window_dialog import TimeWindowDialog
+from analysis.time_windows import (
+    PERIOD_GATE_MESSAGE,
+    analysis_period_is_current,
+    report_folder_name,
+)
 from gui.report_browser import ReportBranch, load_report_catalog
 from analysis.utils.remap_identifiers import (
     RemapError,
@@ -402,6 +408,24 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def open_stats_config_dialog(self):
         self.stats_config_dialog.exec_()
 
+    def open_time_window_dialog(self):
+        self.saveFieldsIntoJson()
+        dialog = TimeWindowDialog(self, show_snapshots=True)
+        dialog.set_main_folder(self.projectField.text().strip())
+        conf = self.config_store.build_payload(self)
+        dialog.load_from_conf(conf)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        payload = dialog.to_conf()
+        for key, value in payload.items():
+            setattr(self, key, value)
+        hours = payload.get('snapshotHours') or []
+        hour_text = ','.join(str(h) for h in hours)
+        if hours:
+            self.daysConvexField.setText(hour_text)
+            self.daysAnglesField.setText(hour_text)
+        self.saveFieldsIntoJson()
+
     def open_remap_identifiers_dialog(self):
         project = self.projectField.text().strip()
         analysis_folder = os.path.join(project, "Analysis") if project else ""
@@ -551,9 +575,14 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         # UI Fallback if everything fails
         QtWidgets.QMessageBox.information(None, 'Manual Action', f'Auto-open failed. Path:\n{path}')
         
+    def current_report_dir(self):
+        return os.path.join(
+            self.projectField.text(),
+            report_folder_name({'reportFolderName': getattr(self, 'reportFolderName', 'Report')}),
+        )
+
     def open_report_folder(self):
-        report_path = os.path.join(self.projectField.text(), "Report")
-        self.universal_open(report_path)
+        self.universal_open(self.current_report_dir())
         
     def open_selected_path_tab3(self):
         self.selected_plant = self.current_plant_path()
@@ -605,6 +634,14 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.analysisEmergenceDistanceField.setText("2")
         self.numComponentsFPCAField.setText("2")
         self.stats_config_dialog.set_defaults()
+        self.timeSyncMode = 'clock'
+        self.timeDurationHours = None
+        self.reportFolderName = 'Report'
+        self.figureClockTicks = ['00:00']
+        self.showFigureClockTicks = True
+        self.snapshotHours = None
+        self.timeGroups = []
+        self.timePeriodSources = []
 
     def validate_numeric_input(self, field):
         """Validate numeric input fields"""
@@ -1058,7 +1095,44 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch preview:\n{e}')
         
+    def _period_conf(self):
+        return {
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
+        }
+
+    def _ensure_analysis_period(self):
+        folder = self.projectField.text().strip()
+        if not folder:
+            QtWidgets.QMessageBox.warning(
+                self, 'Error', 'Please select a project directory first.',
+            )
+            return False
+        if analysis_period_is_current(self._period_conf(), folder):
+            return True
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            'Analysis period required',
+            PERIOD_GATE_MESSAGE + '\n\nOpen Set analysis period now?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return False
+        self.open_time_window_dialog()
+        if analysis_period_is_current(self._period_conf(), folder):
+            return True
+        QtWidgets.QMessageBox.warning(
+            self,
+            'Analysis period required',
+            'Process all plants was cancelled. '
+            'Set an analysis period for this set of plants first.',
+        )
+        return False
+
     def PostProcess(self):
+        if not self._ensure_analysis_period():
+            return
         self.saveFieldsIntoJson()
         pipeline_runner.run_postprocess(self.projectField.text())
     
@@ -1404,8 +1478,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "3. Process the growth tracking graph.")
         self.analysisButton.clicked.connect(self.analysis)
 
+        self.tab1TimePeriodButton = QtWidgets.QPushButton(self.tab1)
+        self.tab1TimePeriodButton.setGeometry(QtCore.QRect(660, 300, 141, 81))
+        self.tab1TimePeriodButton.setObjectName("tab1TimePeriodButton")
+        self.tab1TimePeriodButton.setText("Set analysis\nperiod")
+        self.tab1TimePeriodButton.setToolTip(
+            "Set duration, per-group start/t0, clock ticks, and snapshot hours "
+            "before processing all plants."
+        )
+        self.tab1TimePeriodButton.clicked.connect(self.open_time_window_dialog)
+
         self.PostProcessButton = QtWidgets.QPushButton(self.tab1)
-        self.PostProcessButton.setGeometry(QtCore.QRect(660, 300, 141, 81))
+        self.PostProcessButton.setGeometry(QtCore.QRect(660, 400, 141, 81))
         self.PostProcessButton.setObjectName("PostProcessButton")
         self.PostProcessButton.setText("Process\nall plants")
         self.PostProcessButton.setToolTip(
@@ -1413,16 +1497,16 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.PostProcessButton.clicked.connect(self.PostProcess)
 
         self.loadConfigFileButton = QtWidgets.QPushButton(self.tab1)
-        self.loadConfigFileButton.setGeometry(QtCore.QRect(660, 400, 141, 81))
+        self.loadConfigFileButton.setGeometry(QtCore.QRect(660, 500, 141, 40))
         self.loadConfigFileButton.setObjectName("loadConfigFileButton")
-        self.loadConfigFileButton.setText("Load\nconfig json\nfrom file")
+        self.loadConfigFileButton.setText("Load from file")
         self.loadConfigFileButton.setToolTip("Import settings from an existing configuration file.")
         self.loadConfigFileButton.clicked.connect(self.read_config_from_file)
 
         self.loadLastConfigButton = QtWidgets.QPushButton(self.tab1)
-        self.loadLastConfigButton.setGeometry(QtCore.QRect(660, 500, 141, 81))
+        self.loadLastConfigButton.setGeometry(QtCore.QRect(660, 540, 141, 41))
         self.loadLastConfigButton.setObjectName("loadLastConfigButton")
-        self.loadLastConfigButton.setText("Load\nprevious\nconfiguration")
+        self.loadLastConfigButton.setText("Load previous conf")
         self.loadLastConfigButton.setToolTip("Restore the most recently used settings.")
         self.loadLastConfigButton.clicked.connect(self.loadJsonIntoFields)
 
@@ -1436,7 +1520,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.saveImagesButton, self.videoHasQRbutton, self.manual_calib_widget,
             self.processingLimitField, self.captureIntervalField, self.analysisEmergenceDistanceField,
             self.saveButton, self.previewAnalysisButton, self.analysisButton,
-            self.PostProcessButton, self.loadConfigFileButton, self.loadLastConfigButton,
+            self.tab1TimePeriodButton, self.PostProcessButton,
+            self.loadConfigFileButton, self.loadLastConfigButton,
         ]
         for widget in tab1_interactive:
             widget.raise_()
@@ -1506,11 +1591,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "Useful for fixing typos or assigning genotype names after short codes.")
         self.remap_identifiers_button.clicked.connect(self.open_remap_identifiers_dialog)
 
-        self.postprocess_plants_button = QPushButton("Process all plants")
-        self.postprocess_plants_button.setToolTip(
-            "Refresh global statistics for all plants currently in the project.")
-        self.postprocess_plants_button.clicked.connect(self.PostProcess)
-
         # Set up the layout
         buttons_layout = QHBoxLayout()
         buttons_layout.addWidget(self.refresh_button)
@@ -1518,7 +1598,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         buttons_layout.addWidget(self.remove_path_button)
         buttons_layout.addWidget(self.remap_identifiers_button)
         buttons_layout.addWidget(self.rerun_analysis_button_tab2)
-        buttons_layout.addWidget(self.postprocess_plants_button)
 
         # Set up the main layout
         layout = QVBoxLayout()
@@ -1747,15 +1826,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.daysConvexLabel.setGeometry(QtCore.QRect(10, 160, 131, 31))
         self.daysConvexLabel.setObjectName("daysConvexLabel")
         self.daysConvexLabel.setText("Days to report")
+        self.daysConvexLabel.hide()
 
         self.daysConvexField = QtWidgets.QLineEdit(self.tab4)
         self.daysConvexField.setGeometry(QtCore.QRect(120, 160, 221, 31))
         self.daysConvexField.setObjectName("daysConvexField")
+        self.daysConvexField.hide()
 
         self.daysConvexText = QtWidgets.QLabel(self.tab4)
         self.daysConvexText.setGeometry(QtCore.QRect(350, 160, 351, 31))
         self.daysConvexText.setObjectName("daysConvexText")
         self.daysConvexText.setText("(Numbers separated by commas)")
+        self.daysConvexText.hide()
 
         self.convexSectionSeparator = QtWidgets.QFrame(self.tab4)
         self.convexSectionSeparator.setGeometry(QtCore.QRect(-40, 190, 891, 41))
@@ -1801,10 +1883,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.daysAnglesText.setGeometry(QtCore.QRect(10, 330, 131, 31))
         self.daysAnglesText.setObjectName("daysAnglesText")
         self.daysAnglesText.setText("Days to report")
+        self.daysAnglesText.hide()
 
         self.daysAnglesField = QtWidgets.QLineEdit(self.tab4)
         self.daysAnglesField.setGeometry(QtCore.QRect(120, 330, 221, 31))
         self.daysAnglesField.setObjectName("daysAnglesField")
+        self.daysAnglesField.hide()
 
         self.anglesSectionSeparator = QtWidgets.QFrame(self.tab4)
         self.anglesSectionSeparator.setGeometry(QtCore.QRect(-30, 360, 961, 41))
@@ -1866,12 +1950,14 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportCaptureIntervalField.setObjectName("reportCaptureIntervalField")
         self.reportCaptureIntervalField.textChanged.connect(self.syncCaptureIntervalField)
 
-        self.reportSaveConfigButton = QtWidgets.QPushButton(self.tab4)
-        self.reportSaveConfigButton.setGeometry(QtCore.QRect(20, 510, 131, 81))
-        self.reportSaveConfigButton.setObjectName("reportSaveConfigButton")
-        self.reportSaveConfigButton.setText("Save")
-        self.reportSaveConfigButton.setToolTip("Save current reporting preferences.")
-        self.reportSaveConfigButton.clicked.connect(self.saveFieldsIntoJson)
+        self.reportTimeWindowsButton = QtWidgets.QPushButton(self.tab4)
+        self.reportTimeWindowsButton.setGeometry(QtCore.QRect(20, 510, 131, 81))
+        self.reportTimeWindowsButton.setObjectName("reportTimeWindowsButton")
+        self.reportTimeWindowsButton.setText("Set analysis\nperiod")
+        self.reportTimeWindowsButton.setToolTip(
+            "Set analysis duration, per-group start/t0, clock ticks, and snapshot hours."
+        )
+        self.reportTimeWindowsButton.clicked.connect(self.open_time_window_dialog)
 
         self.reportPostProcessButton = QtWidgets.QPushButton(self.tab4)
         self.reportPostProcessButton.setGeometry(QtCore.QRect(180, 510, 131, 81))
@@ -1898,10 +1984,17 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "Generate visual charts, CSV data, and perform statistical comparisons between varieties.")
         self.reportGenerateButton.clicked.connect(self.report)
 
+        self.reportSaveConfigButton = QtWidgets.QPushButton(self.tab4)
+        self.reportSaveConfigButton.setGeometry(QtCore.QRect(650, 510, 141, 40))
+        self.reportSaveConfigButton.setObjectName("reportSaveConfigButton")
+        self.reportSaveConfigButton.setText("Save")
+        self.reportSaveConfigButton.setToolTip("Save current reporting preferences.")
+        self.reportSaveConfigButton.clicked.connect(self.saveFieldsIntoJson)
+
         self.reportLoadConfigButton = QtWidgets.QPushButton(self.tab4)
-        self.reportLoadConfigButton.setGeometry(QtCore.QRect(650, 510, 141, 81))
+        self.reportLoadConfigButton.setGeometry(QtCore.QRect(650, 550, 141, 41))
         self.reportLoadConfigButton.setObjectName("reportLoadConfigButton")
-        self.reportLoadConfigButton.setText("Load\nprevious\nconfiguration")
+        self.reportLoadConfigButton.setText("Load previous")
         self.reportLoadConfigButton.setToolTip(
             "Restore previous reporting and statistical parameters.")
         self.reportLoadConfigButton.clicked.connect(self.loadJsonIntoFields)
@@ -1912,6 +2005,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.doConvex, self.saveImagesConvex, self.daysConvexField,
             self.doFourier, self.doLateralAngles, self.reportEmergenceDistanceField,
             self.daysAnglesField, self.reportConfigureStatsButton,
+            self.reportTimeWindowsButton,
             self.reportProcessingLimitField, self.reportCaptureIntervalField,
             self.reportGenotypeAxisLabelField, self.reportPlateConditionAxisLabelField,
             self.reportExtraVariableAxisLabelField,
@@ -1971,7 +2065,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if not hasattr(self, 'projectField') or not hasattr(self, 'report_tree'):
             return
 
-        report_path = os.path.join(self.projectField.text(), "Report")
+        report_path = self.current_report_dir()
         current = self.report_tree.currentItem()
         current_report = current.data(0, REPORT_PLOT_ROLE) if current is not None else None
 
@@ -2017,7 +2111,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         self.report_tree.clear()
-        report_path = os.path.join(self.projectField.text(), "Report")
+        report_path = self.current_report_dir()
         if not os.path.isdir(report_path):
             self._show_report_placeholder()
             return

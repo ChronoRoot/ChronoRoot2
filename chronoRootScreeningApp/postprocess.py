@@ -18,6 +18,7 @@ from chrono_root_backend import (
     ensure_factor_columns,
     normalize_factor_value,
     plot_individual_plant,
+    apply_time_windows,
 )
 
 MAX_PLANT_WORKERS = 4
@@ -38,15 +39,16 @@ NEAR_ZERO_MM = 0.1
 SPIKE_SIGMA = 10
 
 
-def plant_result_dir(project_dir, experiment, rpi, cam, plant_index):
+def plant_result_dir(project_dir, experiment, rpi, cam, plant_index, video=None):
     safe_exp = convertToPathSafe(str(experiment))
-    rpi_name = convertToPathSafe(str(rpi) if rpi not in (None, '') else 'unspecified')
+    robot = video if video not in (None, '') else rpi
+    robot_name = convertToPathSafe(str(robot) if robot not in (None, '') else 'unspecified')
     cam_name = convertToPathSafe(cam_folder_name(cam))
     return os.path.join(
         project_dir,
         'Analysis',
         safe_exp,
-        rpi_name,
+        robot_name,
         cam_name,
         f'plant_{plant_index}',
         'Results_0',
@@ -320,7 +322,9 @@ def postprocess_tracking(merged_seeds, conf):
         plant_rows = plant_rows.copy()
         plant_rows['rpi'] = rpi
         plant_rows['cam'] = cam
-        result_dir = plant_result_dir(project_dir, experiment, rpi, cam, plant_index)
+        result_dir = plant_result_dir(
+            project_dir, experiment, rpi, cam, plant_index, video=video,
+        )
         os.makedirs(result_dir, exist_ok=True)
 
         raw_path = _write_results_raw(plant_rows, result_dir)
@@ -341,6 +345,7 @@ def postprocess_tracking(merged_seeds, conf):
     total = len(jobs)
     done = 0
     last_decile = 0
+    print('Postprocessing started.')
     with ProcessPoolExecutor(max_workers=min(MAX_PLANT_WORKERS, max(1, len(jobs)))) as executor:
         future_to_pid = {executor.submit(process_one_screening_plant, job): job['plant_id'] for job in jobs}
         for future in as_completed(future_to_pid):
@@ -359,29 +364,8 @@ def postprocess_tracking(merged_seeds, conf):
     if not plant_frames:
         raise ValueError('Postprocess produced no hourly tables')
 
-    # NaN-pad per video so all kept plants share the same hour grid
-    id_cols = ['Experiment', 'Plant_id', 'PlateCondition', 'ExtraVariable', 'Video', 'rpi', 'cam']
-    padded_frames = []
-    frames_by_video = defaultdict(list)
-    for hdf in plant_frames:
-        vid = hdf['Video'].iloc[0] if 'Video' in hdf.columns else 'default'
-        frames_by_video[vid].append(hdf)
-
-    for vid, vframes in frames_by_video.items():
-        max_hour = int(max(hdf['ElapsedTime (h)'].max() for hdf in vframes))
-        target_hours = list(range(max_hour + 1))
-        for hdf in vframes:
-            hdf_indexed = hdf.set_index('ElapsedTime (h)')
-            hdf_padded = hdf_indexed.reindex(target_hours)
-            # Fill identity columns
-            for col in id_cols:
-                if col in hdf.columns:
-                    hdf_padded[col] = hdf_padded[col].fillna(hdf[col].iloc[0])
-            hdf_padded = hdf_padded.reset_index()
-            hdf_padded = hdf_padded.rename(columns={'index': 'ElapsedTime (h)'}) if 'index' in hdf_padded.columns else hdf_padded
-            padded_frames.append(hdf_padded)
-
-    all_data = pd.concat(padded_frames, ignore_index=True)
+    all_data = pd.concat(plant_frames, ignore_index=True)
+    all_data = apply_time_windows(all_data, conf)
     all_data = ensure_factor_columns(all_data)
     temporal_path = data_file(conf, 'Temporal_Data.csv')
     all_data.to_csv(temporal_path, index=False)

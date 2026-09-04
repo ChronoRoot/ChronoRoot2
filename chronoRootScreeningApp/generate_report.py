@@ -26,6 +26,7 @@ from chrono_root_backend import (
     perform_scalar_pairwise_stats,
     plot_info_all,
     purge_disabled_comparison_outputs,
+    report_root,
     temporal_metric_slug,
 )
 from analysis.utils.report_paths import analysis_dir
@@ -287,20 +288,9 @@ def _germination_pairwise_stats(conf, germ_analyzer):
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description='ChronoRoot Screening: Report Generation')
-    parser.add_argument('--config', required=True, help='Path to report_config.json')
-    args = parser.parse_args()
-
-    conf = json.load(open(args.config, 'r'))
+def run_postprocess(conf):
+    """Merge tracking files and run dataWork into Temporal_Data.csv."""
     project_dir = conf['MainFolder']
-    selected = conf.get('selectedMetrics') or SCREENING_TEMPORAL_METRICS
-    temporal_selected = apply_screening_plot_defaults(conf, selected)
-    do_growth = conf.get('doPlantGrowth', True)
-    do_germination = conf.get('doGermination', True)
-    do_fpca = conf.get('doFPCA', False)
-    do_fourier = conf.get('doFourier', False)
-
     print('Merging tracking files...')
     combined = merge_analysis_files(project_dir, conf.get('nameMapping'))
     raw_path = data_file(conf, 'Raw_Data.tsv')
@@ -308,11 +298,45 @@ def main():
     print(f'Wrote {raw_path}')
 
     all_data = pd.DataFrame()
-    if do_growth:
+    if conf.get('doPlantGrowth', True):
         print(f'Postprocessing tracking through dataWork (up to {MAX_PLANT_WORKERS} workers)...')
         all_data = postprocess_tracking(combined, conf)
         all_data = ensure_factor_columns(all_data)
+    return combined, all_data
 
+
+def _load_postprocessed_tables(conf):
+    raw_path = data_file(conf, 'Raw_Data.tsv')
+    temporal_path = data_file(conf, 'Temporal_Data.csv')
+    if not os.path.isfile(raw_path):
+        raise FileNotFoundError(
+            f'No Raw_Data.tsv at {raw_path}. Run Postprocess before generating a report.'
+        )
+    combined = pd.read_csv(raw_path, sep='\t')
+    all_data = pd.DataFrame()
+    if conf.get('doPlantGrowth', True):
+        if not os.path.isfile(temporal_path):
+            raise FileNotFoundError(
+                f'No Temporal_Data.csv at {temporal_path}. Run Postprocess before generating a report.'
+            )
+        all_data = pd.read_csv(temporal_path)
+        all_data = ensure_factor_columns(all_data)
+    return combined, all_data
+
+
+def run_report(conf, combined, all_data):
+    selected = conf.get('selectedMetrics') or SCREENING_TEMPORAL_METRICS
+    temporal_selected = apply_screening_plot_defaults(conf, selected)
+    do_growth = conf.get('doPlantGrowth', True)
+    do_germination = conf.get('doGermination', True)
+    do_fpca = conf.get('doFPCA', False)
+    do_fourier = conf.get('doFourier', False)
+
+    if do_growth:
+        if all_data.empty:
+            raise FileNotFoundError(
+                'Temporal_Data is empty. Run Postprocess before generating a report.'
+            )
         config_modes = get_enabled_comparison_modes(conf)
         effective_modes = get_enabled_comparison_modes(conf, all_data)
         conf['effectiveComparisonModes'] = effective_modes
@@ -342,7 +366,7 @@ def main():
 
     if do_germination:
         print('Germination analysis...')
-        germ_dir = os.path.join(project_dir, 'Report')
+        germ_dir = report_root(conf)
         os.makedirs(germ_dir, exist_ok=True)
         germ_analyzer = GerminationAnalyzer(
             data=combined,
@@ -366,7 +390,29 @@ def main():
                 _germination_pairwise_stats(conf, germ_analyzer)
 
     print('Report generation finished.')
-    print(f'Results saved in: {os.path.join(project_dir, "Report")}')
+    print(f'Results saved in: {report_root(conf)}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='ChronoRoot Screening: Report Generation')
+    parser.add_argument('--config', required=True, help='Path to report_config.json')
+    parser.add_argument(
+        '--postprocess-only',
+        action='store_true',
+        help='Merge tracking files and run dataWork without generating figures',
+    )
+    args = parser.parse_args()
+
+    conf = json.load(open(args.config, 'r'))
+    if args.postprocess_only:
+        combined, all_data = run_postprocess(conf)
+        print('Postprocess finished.')
+        if not all_data.empty:
+            print(f'Temporal data plants: {all_data["Plant_id"].nunique() if "Plant_id" in all_data.columns else 0}')
+        return
+
+    combined, all_data = _load_postprocessed_tables(conf)
+    run_report(conf, combined, all_data)
 
 
 if __name__ == '__main__':

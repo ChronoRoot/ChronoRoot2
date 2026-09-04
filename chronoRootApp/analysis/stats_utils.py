@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 
+from .time_windows import elapsed_hour_windows
 from .utils.fileUtilities import UNSPECIFIED_FACTOR, normalize_factor_value
 from .utils.report_paths import stats_file as report_stats_file
 from .utils.report_style import get_extra_axis_label, get_genotype_axis_label, get_plate_axis_label
@@ -269,10 +270,6 @@ def perform_temporal_pairwise_stats(conf, data, metric, output_dir=None, plant_i
                                     analysis_type='temporal', table_file_path=None):
     data = ensure_factor_columns(data)
     dt = int(conf['everyXhourField'])
-    max_hour = data['ElapsedTime (h)'].max()
-    if pd.isna(max_hour):
-        return
-    n_steps = int(round((max_hour + 1) / dt, 0))
 
     for mode in comparison_modes_for_run(conf, data):
         spec = _mode_spec(mode, conf=conf)
@@ -286,11 +283,10 @@ def perform_temporal_pairwise_stats(conf, data, metric, output_dir=None, plant_i
             f.write(f"{spec['header']}\n")
             f.write(f'{_describe_averaging(conf)}\n\n')
 
-            for step in range(n_steps):
-                end = int(min(dt * (step + 1), max_hour))
-                hours = np.arange(dt * step, end)
+            for start, end in elapsed_hour_windows(data, dt):
+                hours = np.arange(start, end)
                 subdata = data[data['ElapsedTime (h)'].isin(hours)]
-                f.write(f'Hours from {step * dt} to {end}\n')
+                f.write(f'Hours from {start} to {end}\n')
                 run_pairwise_comparisons(
                     f, subdata, metric,
                     group_col=spec['group_col'],

@@ -21,10 +21,55 @@ from .utils.report_paths import (
     FOURIER_PARENT_METRICS,
     analysis_dir,
     comparison_plot_path,
+    data_file,
     plot_file,
     stats_file,
 )
+from .time_windows import draw_clock_ticks, elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
+
+def _interp_interior_nans(values):
+    """Fill NaNs between the first and last finite samples; keep end pads as NaN."""
+    y = np.asarray(values, dtype=float).copy()
+    finite = np.isfinite(y)
+    if finite.sum() < 2:
+        return y
+    first = int(np.argmax(finite))
+    last = len(y) - 1 - int(np.argmax(finite[::-1]))
+    seg = y[first:last + 1]
+    fin = np.isfinite(seg)
+    if not fin.all():
+        idx = np.arange(len(seg))
+        seg = seg.copy()
+        seg[~fin] = np.interp(idx[~fin], idx[fin], seg[fin])
+        y[first:last + 1] = seg
+    return y
+
+
+def _fft_ready_signal(values):
+    """Drop leading/trailing NaN pads; interpolate interior gaps. None if too short."""
+    y = np.asarray(values, dtype=float)
+    finite = np.isfinite(y)
+    if finite.sum() < 2:
+        return None
+    first = int(np.argmax(finite))
+    last = len(y) - 1 - int(np.argmax(finite[::-1]))
+    interior = _interp_interior_nans(y)[first:last + 1]
+    if not np.isfinite(interior).all() or len(interior) < 2:
+        return None
+    return interior
+
+
+def _column_has_signal(df, column):
+    if df is None or df.empty or column not in df.columns:
+        return False
+    series = pd.to_numeric(df[column], errors='coerce')
+    finite = series.to_numpy(dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return False
+    return float(np.nanmax(np.abs(finite))) > 1e-9
+
 
 class MetricConfig:
     """Configuration class for different metrics"""
@@ -38,6 +83,12 @@ class MetricConfig:
         'TR': {
             'column': 'TotalLengthGrad (mm/h)',
             'title': 'Total Root Growth Speed',
+            'ylabel': 'Speed (mm/h)',
+            'norm_ylabel': 'Normalized Speed'
+        },
+        'HY': {
+            'column': 'HypocotylLengthGrad (mm/h)',
+            'title': 'Hypocotyl Growth Speed',
             'ylabel': 'Speed (mm/h)',
             'norm_ylabel': 'Normalized Speed'
         }
@@ -55,186 +106,110 @@ class DataProcessor:
     
     def __init__(self, conf: dict):
         self.conf = conf
-        self.report_path = os.path.join(conf['MainFolder'], 'Report')
 
-    def process_single_file(self, filepath: str, N0: Optional[int] = None, 
-                          N: Optional[int] = None, root: str = 'MainRootLengthGrad (mm/h)',
-                          normalize: bool = False, detrend: bool = False, 
-                          medfilt: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Process a single data file"""
-        try:
-            data = pd.read_csv(filepath)
-            time = data['ElapsedTime (h)'].to_numpy().astype('int')
-            newDay = data['NewDay'].to_numpy()
+    def _prepare_signal(self, values, normalize=False, detrend=False, medfilt=False):
+        m_speed = np.array(values, copy=True, dtype=float)
+        valid = np.isfinite(m_speed)
+        if valid.sum() < 2:
+            return m_speed
+        filled = _interp_interior_nans(m_speed)
+        first = int(np.argmax(valid))
+        last = len(m_speed) - 1 - int(np.argmax(valid[::-1]))
+        work = filled[first:last + 1].copy()
+        if not np.isfinite(work).all():
+            return np.where(valid, m_speed, np.nan)
+        if normalize:
+            mean = np.mean(m_speed[valid])
+            std = np.std(m_speed[valid])
+            work = (work - mean) / std if std != 0 else work - mean
+        if medfilt:
+            work = signal.medfilt(work, 5)
+            work = work - signal.medfilt(work, 25)
+        if detrend:
+            work = signal.detrend(work)
+        out = np.full(m_speed.shape, np.nan, dtype=float)
+        out[first:last + 1] = work
+        return np.where(valid, out, np.nan)
 
-            # Handle time range selection
-            N0 = 0 if N0 is None else N0
-            N = len(time) if N is None else N
-            
-            # Adjust for new day
-            if not np.isscalar(newDay[N0]) or newDay[N0] != 0:
-                begin_indices = np.where(newDay == 0)[0]
-                if len(begin_indices) > 0:
-                    begin = begin_indices[0]
-                    if begin > N0:
-                        # Shift start point
-                        N0 = begin
-                        # We do NOT shift N here because we are limited by file length
-                    else:
-                        N0 = N0 + (24 - time[N0])
-            
-            # Ensure we don't go past the end of the file
-            max_len = len(time)
-            if N > max_len:
-                N = max_len
-
-            # 1. Calculate available duration
-            current_duration = N - N0
-            
-            # 2. Ensure duration is non-negative
-            if current_duration < 0:
-                current_duration = 0
-                
-            # 3. Make the DURATION a multiple of 24, not the index
-            valid_duration = current_duration - (current_duration % 24)
-            
-            # 4. Set new end index based on start + valid duration
-            N = N0 + valid_duration
-
-            # Extract and process speed data
-            mSpeed = np.array(data[root], copy=True)
-            mSpeed = np.nan_to_num(mSpeed, 0.0)
-
-            if normalize:
-                mean = np.mean(mSpeed)
-                std = np.std(mSpeed)
-                mSpeed = (mSpeed - mean) / std if std != 0 else mSpeed - mean
-
-            if medfilt:
-                mSpeed = signal.medfilt(mSpeed, 5)
-                mSpeed = mSpeed - signal.medfilt(mSpeed, 25)
-
-            if detrend:
-                mSpeed = signal.detrend(mSpeed)
-
-            return mSpeed[N0:N], time[N0:N] - N0, newDay[N0:N]
-        
-        except Exception as e:
-            raise Exception(f"Error processing file {filepath}: {str(e)}")
-
-    def read_and_process_data(self, experiments: List[str], root: str = 'MainRootLengthGrad (mm/h)',
-                             normalize: bool = False, detrend: bool = False, 
+    def read_and_process_data(self, temporal_df: pd.DataFrame, root: str = 'MainRootLengthGrad (mm/h)',
+                             normalize: bool = False, detrend: bool = False,
                              medfilt: bool = False) -> pd.DataFrame:
-        """Read and process data from multiple experiments with path-safe naming"""
-        all_data = []
-        valid_datasets = [] # Store dict (exp_label, signal, time)
-        
-        # 1. Collect all valid processed data first
-        for exp in experiments:
-            try:
-                # Get list of plant data files
-                plants = utils.load_paths(exp, '*/*/*')
-                raw_folder_name = os.path.basename(exp)
-                exp_label = convertFromPathSafe(raw_folder_name)
-                speeds = []
-                
-                # Collect PostProcess_Hour.csv files
-                for plant in plants:
-                    results = utils.load_paths(plant, '*')
-                    if results:
-                        results = results[-1]
-                        speeds.append(os.path.join(results, "PostProcess_Hour.csv"))
+        """Build aligned growth-speed series from Temporal_Data."""
+        if temporal_df is None or temporal_df.empty:
+            raise ValueError("No temporal data for Fourier analysis")
+        if root not in temporal_df.columns:
+            raise ValueError(f"Column {root} is not in Temporal_Data")
 
-                for speed_file in speeds:
-                    try:
-                        meta = load_result_metadata(os.path.dirname(speed_file))
-                        # Process individual file
-                        signal_arr, time_arr, _ = self.process_single_file(
-                            speed_file, 
-                            root=root,
-                            normalize=normalize,
-                            detrend=detrend,
-                            medfilt=medfilt
-                        )
-                        
-                        valid_datasets.append({
-                            'exp': exp_label,
-                            'file': speed_file,
-                            'signal': signal_arr,
-                            'time': time_arr,
-                            'meta': meta,
-                        })
-                        
-                    except Exception as e:
-                        print(f"Skipping file {speed_file}: {str(e)}")
-                        continue
+        work = ensure_factor_columns(temporal_df.copy())
+        if 'Plant_id' not in work.columns:
+            raise ValueError("Temporal_Data is missing Plant_id")
+        key_cols = ['Experiment', 'Plant_id']
+        if 'Video' in work.columns:
+            key_cols = ['Experiment', 'Video', 'Plant_id']
+        work = work.sort_values(key_cols + ['ElapsedTime (h)'])
 
-            except Exception as e:
-                print(f"Error processing experiment {exp}: {str(e)}")
+        valid_datasets = []
+        for i, (_key, group) in enumerate(work.groupby(key_cols, sort=False)):
+            group = group.sort_values('ElapsedTime (h)')
+            time_arr = pd.to_numeric(group['ElapsedTime (h)'], errors='coerce').to_numpy()
+            signal_arr = self._prepare_signal(
+                group[root].to_numpy(),
+                normalize=normalize, detrend=detrend, medfilt=medfilt,
+            )
+            if not np.isfinite(signal_arr).any():
                 continue
+            dates = group['Date'].to_numpy() if 'Date' in group.columns else [pd.NaT] * len(signal_arr)
+            valid_datasets.append({
+                'exp': str(group['Experiment'].iloc[0]) if 'Experiment' in group.columns else str(_key[0] if isinstance(_key, tuple) else _key),
+                'signal': signal_arr,
+                'time': time_arr,
+                'date': dates,
+                'meta': {
+                    'Experiment': str(group['Experiment'].iloc[0]) if 'Experiment' in group.columns else 'unspecified',
+                    'PlateCondition': normalize_factor_value(group['PlateCondition'].iloc[0]) if 'PlateCondition' in group.columns else 'unspecified',
+                    'ExtraVariable': normalize_factor_value(group['ExtraVariable'].iloc[0]) if 'ExtraVariable' in group.columns else 'unspecified',
+                },
+            })
 
         if not valid_datasets:
-            raise ValueError("No valid data processed from any experiment")
+            raise ValueError("No valid data processed from Temporal_Data")
 
-        # 2. Find the Common Denominator Length
-        lengths = [len(d['signal']) for d in valid_datasets]
-        min_common_length = min(lengths)
-        
-        # Ensure it's still a multiple of 24
-        min_common_length = min_common_length - (min_common_length % 24)
-        
-        # 3. Truncate all datasets to the minimum common length
-        time_series = None
-        
+        all_data = []
         for item in valid_datasets:
-            # Slice to common length
-            sig = item['signal'][:min_common_length]
-            t = item['time'][:min_common_length]
             meta = item.get('meta', {})
-            
-            if time_series is None:
-                time_series = t
-            
-            # Create DataFrame
             df = pd.DataFrame({
-                'Time': time_series,
-                'Signal': sig,
+                'Time': item['time'],
+                'ElapsedTime (h)': item['time'],
+                'Date': item['date'],
+                'Signal': item['signal'],
                 'Type': item['exp'],
                 'i': len(all_data),
                 'Experiment': meta.get('Experiment', item['exp']),
-                'PlateCondition': normalize_factor_value(meta.get('PlateCondition', '')),
-                'ExtraVariable': normalize_factor_value(meta.get('ExtraVariable', '')),
+                'PlateCondition': meta.get('PlateCondition', 'unspecified'),
+                'ExtraVariable': meta.get('ExtraVariable', 'unspecified'),
             })
             all_data.append(df)
 
-        if not all_data:
-            raise ValueError("No valid processed data after truncation")
-
         combined_df = pd.concat(all_data, ignore_index=True)
-
-        # 4. Calculate FFT (Now safe because lengths are identical)
-        time_length = min_common_length
-        freqs = np.fft.fftfreq(time_length, d=1)
-        
         fft_data = []
         for (exp_type, i), group in combined_df.groupby(['Type', 'i']):
-            signal_data = group['Signal'].values
-            fft_vals = np.abs(np.fft.fft(signal_data))
+            fft_input = _fft_ready_signal(group['Signal'].values)
+            if fft_input is None:
+                continue
+            freqs = np.fft.fftfreq(len(fft_input), d=1)
+            fft_vals = np.abs(np.fft.fft(fft_input))
             fft_df = pd.DataFrame({
                 'Freqs': freqs,
                 'FFT': fft_vals,
                 'Type': exp_type,
                 'i': i,
-                'Experiment': group['Experiment'].iloc[0] if 'Experiment' in group.columns else exp_type,
-                'PlateCondition': group['PlateCondition'].iloc[0] if 'PlateCondition' in group.columns else 'unspecified',
-                'ExtraVariable': group['ExtraVariable'].iloc[0] if 'ExtraVariable' in group.columns else 'unspecified',
+                'Experiment': group['Experiment'].iloc[0],
+                'PlateCondition': group['PlateCondition'].iloc[0],
+                'ExtraVariable': group['ExtraVariable'].iloc[0],
             })
             fft_data.append(fft_df)
-        
         if fft_data:
-            fft_combined = pd.concat(fft_data, ignore_index=True)
-            combined_df = pd.concat([combined_df, fft_combined], ignore_index=True)
-
+            combined_df = pd.concat([combined_df, pd.concat(fft_data, ignore_index=True)], ignore_index=True)
         return combined_df
     
     def perform_statistical_analysis(self, data_orig: pd.DataFrame, data_detrended: pd.DataFrame, metric_type: str):
@@ -247,7 +222,6 @@ class DataProcessor:
             data_detrended = ensure_factor_columns(data_detrended)
             dt = int(self.conf['everyXhourFieldFourier'])
             time_data = data_orig[data_orig['Time'].notna()]
-            n_steps = int(round((time_data['Time'].max() + 1) / dt, 0))
             fft_detrended = data_detrended[data_detrended['Freqs'].notna()]
             target_rhythms = {'24h Period': 1 / 24, '12h Period': 1 / 12}
 
@@ -262,10 +236,9 @@ class DataProcessor:
                     f.write(f'{_describe_averaging(self.conf)}\n')
                     f.write('PART 1: HOURLY GROWTH SPEED COMPARISONS (Original Data)\n')
 
-                    for step in range(n_steps):
-                        end = min(dt * (step + 1), time_data['Time'].max())
-                        subdata = time_data[time_data['Time'].isin(np.arange(dt * step, end))]
-                        f.write(f'\nWindow: {step * dt}h to {end}h\n')
+                    for start, end in elapsed_hour_windows(time_data, dt, hour_col='Time'):
+                        subdata = time_data[time_data['Time'].isin(np.arange(start, end))]
+                        f.write(f'\nWindow: {start}h to {end}h\n')
                         perform_fourier_pairwise_stats(
                             self.conf, subdata, 'Signal', f,
                             plant_id_col='i', type_col='Type', modes=[mode],
@@ -333,6 +306,12 @@ class Visualizer:
         self.metric_type = metric_type
         self.slug = FOURIER_PARENT_METRICS[metric_type]
         self._setup_plot_style()
+
+    def _clock_ticks(self, ax, data, twin_axis=False):
+        tick_df = data
+        if 'ElapsedTime (h)' not in tick_df.columns and 'Time' in tick_df.columns:
+            tick_df = tick_df.rename(columns={'Time': 'ElapsedTime (h)'})
+        draw_clock_ticks(ax, tick_df, self.conf, twin_axis=twin_axis)
 
     def _setup_plot_style(self):
         """Set up matplotlib plot style"""
@@ -421,25 +400,13 @@ class Visualizer:
             sns.lineplot(x="Time", y="Signal", data=exp_data,
                         errorbar='se', ax=ax, color=geno_palette.get(exp_name),
                         estimator=np.mean)
-            
-            for j in range(0, len(time)):
-                if j % 24 == 0:
-                    ax.axvline(j, color='green', alpha=1.0, linestyle='--')
+            tick_df = exp_data.rename(columns={'Time': 'ElapsedTime (h)'}) if 'ElapsedTime (h)' not in exp_data.columns else exp_data
+            draw_clock_ticks(ax, tick_df, self.conf, twin_axis=(i == 0))
             
             ax.set_ylabel(metric_config['ylabel'])
             ax.set_xlabel('')
             ax.set_ylim(min_signal, max_signal)
             ax.legend([f"{exp_name}"], loc='upper left')
-            
-            # Add day labels on top for first subplot only
-            if i == 0:
-                ax2 = ax.twiny()
-                ax2.set_xlim(ax.get_xlim())
-                total_days = np.ceil(exp_data['Time'].max() / 24).astype(int)
-                day_ticks = np.arange(24, total_days * 24 + 1, 24)
-                ax2.set_xticks(day_ticks)
-                ax2.set_xticklabels([f'Day {i}' for i in range(1, total_days+1)])
-                ax2.tick_params(axis='x', rotation=45)
         
         # Add reference sinusoids for original scale
         ax_sin = fig1.add_subplot(gs1[-1, 0])
@@ -447,10 +414,7 @@ class Visualizer:
         exp2 = 0.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
         ax_sin.plot(time, exp1, color='red', label='24h rhythm')
         ax_sin.plot(time, exp2, color='black', label='12h rhythm')
-        
-        for j in range(0, len(time)):
-            if j % 24 == 0:
-                ax_sin.axvline(j, color='green', alpha=1.0, linestyle='--')
+        self._clock_ticks(ax_sin, data, twin_axis=False)
         
         ax_sin.set_ylabel('Reference Patterns')
         ax_sin.set_xlabel('Time (h)')
@@ -478,25 +442,11 @@ class Visualizer:
             sns.lineplot(x="Time", y="Signal", data=exp_data_norm,
                         errorbar='se', ax=ax, color=geno_palette.get(exp_name),
                         estimator=np.mean)
-            
-            for j in range(0, len(time)):
-                if j % 24 == 0:
-                    ax.axvline(j, color='green', alpha=1.0, linestyle='--')
-            
+            self._clock_ticks(ax, exp_data_norm, twin_axis=(i == 0))
             ax.set_ylabel(metric_config['norm_ylabel'])
             ax.set_xlabel('')
             ax.set_ylim(-1, 1)
             ax.legend([f"{exp_name}"], loc='upper left')
-            
-            # Add day labels on top for first subplot only
-            if i == 0:
-                ax2 = ax.twiny()
-                ax2.set_xlim(ax.get_xlim())
-                total_days = np.ceil(exp_data_norm['Time'].max() / 24).astype(int)
-                day_ticks = np.arange(24, total_days * 24 + 1, 24)
-                ax2.set_xticks(day_ticks)
-                ax2.set_xticklabels([f'Day {i}' for i in range(1, total_days+1)])
-                ax2.tick_params(axis='x', rotation=45)
         
         # Add reference sinusoids for normalized scale
         ax_sin = fig2.add_subplot(gs2[-1, 0])
@@ -504,15 +454,10 @@ class Visualizer:
         exp2 = -0.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
         ax_sin.plot(time, exp1, color='red', label='24h rhythm')
         ax_sin.plot(time, exp2, color='black', label='12h rhythm')
-        
-        for j in range(0, len(time)):
-            if j % 24 == 0:
-                ax_sin.axvline(j, color='green', alpha=1.0, linestyle='--')
-        
+        self._clock_ticks(ax_sin, data_detrended, twin_axis=False)
         ax_sin.set_ylabel('Reference Patterns')
         ax_sin.set_xlabel('Time (h)')
         ax_sin.legend(loc='upper right')
-        
         plt.suptitle(f"{metric_config['title']} Analysis - Normalized", fontsize=16, y=1.02)
         
         # Save normalized plots
@@ -531,10 +476,7 @@ class Visualizer:
         sns.lineplot(x="Time", y="Signal", data=data,
                     hue="Type", errorbar='se', ax=ax,
                     estimator=np.mean, palette=geno_palette)
-        
-        for j in range(0, len(time)):
-            if j % 24 == 0:
-                ax.axvline(j, color='green', alpha=1.0, linestyle='--')
+        self._clock_ticks(ax, data, twin_axis=False)
         
         ax.set_ylabel(ylabel)
         ax.set_xlabel('Time (h)')
@@ -576,24 +518,30 @@ def makeFourierPlots(conf: dict):
     """Main function to create Fourier analysis plots"""
     try:
         processor = DataProcessor(conf)
+        temporal_path = data_file(conf, 'Temporal_Data.csv')
+        if not os.path.isfile(temporal_path):
+            raise FileNotFoundError(f'Temporal_Data not found: {temporal_path}')
+        temporal_df = pd.read_csv(temporal_path)
 
         for metric_type in MetricConfig.METRICS.keys():
             try:
                 metric_config = MetricConfig.get_config(metric_type)
+                if not _column_has_signal(temporal_df, metric_config['column']):
+                    print(
+                        f'Skipping Fourier metric {metric_type}: '
+                        f'{metric_config["column"]} is missing or unmeasured',
+                        flush=True,
+                    )
+                    continue
                 visualizer = Visualizer(conf, metric_type)
-                
-                # Get data paths
-                analysis_path = os.path.join(conf['MainFolder'], 'Analysis')
-                experiments = utils.load_paths(analysis_path, '*')
-                
-                # Process data
+
                 all_frames_original = processor.read_and_process_data(
-                    experiments, 
+                    temporal_df,
                     root=metric_config['column']
                 )
-                
+
                 all_frames_detrended = processor.read_and_process_data(
-                    experiments,
+                    temporal_df,
                     root=metric_config['column'],
                     normalize=True,
                     detrend=True,
@@ -608,7 +556,9 @@ def makeFourierPlots(conf: dict):
                 )
                 
                 # Create visualizations
-                time_series = all_frames_original['Time'].unique()
+                time_series = all_frames_original.loc[
+                    all_frames_original['Time'].notna(), 'Time'
+                ].drop_duplicates().to_numpy()
                 visualizer.create_joint_plot(
                     all_frames_original,
                     all_frames_detrended,

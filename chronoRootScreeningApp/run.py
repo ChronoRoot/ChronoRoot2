@@ -21,6 +21,11 @@ from PyQt5.QtGui import QColor, QPixmap, QIntValidator, QDoubleValidator
 import ui_errors
 import interface_config
 import chrono_root_backend  # noqa: F401
+from analysis.time_windows import (
+    PERIOD_GATE_MESSAGE,
+    analysis_period_is_current,
+    report_folder_name,
+)
 from robot_ids import identifier_from_rpi_cam, parse_robot_video_path, resolve_rpi_cam
 from stats_config_dialog import ScreeningStatsConfigDialog
 
@@ -73,6 +78,7 @@ class AnalysisTab(QWidget):
         self.calibration_window = None
         self.process_launchers = []
         self.report_launcher = None
+        self.postprocess_launcher = None
         self._auto_identifier = ''
         self._loading_config = False
         self._ui_ready = False
@@ -163,6 +169,7 @@ class AnalysisTab(QWidget):
         extra_hint.setStyleSheet('color: #666; font-size: 9pt;')
         extra_layout.addWidget(extra_hint)
         proj_layout.addLayout(extra_layout)
+        self.extraField.textChanged.connect(self._maybe_autofill_identifier)
 
         # Time delta field
         time_settings = QHBoxLayout()
@@ -294,18 +301,26 @@ class AnalysisTab(QWidget):
         buttons_layout.addWidget(self.preview_btn)
         
         # Process Button
+        # Process Video → Set analysis period → Postprocess → Configure → Generate Report
         self.process_btn = QPushButton('Process Video')
         self.process_btn.clicked.connect(self.process_video)
         buttons_layout.addWidget(self.process_btn)
 
-        # Generate Report Button
-        self.generate_report_btn = QPushButton('Generate Report')
-        self.generate_report_btn.clicked.connect(self.generate_report)
-        buttons_layout.addWidget(self.generate_report_btn)
+        self.time_windows_btn = QPushButton('Set analysis period')
+        self.time_windows_btn.clicked.connect(self.open_time_window_dialog)
+        buttons_layout.addWidget(self.time_windows_btn)
+
+        self.postprocess_btn = QPushButton('Postprocess')
+        self.postprocess_btn.clicked.connect(self.postprocess_plants)
+        buttons_layout.addWidget(self.postprocess_btn)
 
         self.configure_stats_btn = QPushButton('Configure Report Parameters')
         self.configure_stats_btn.clicked.connect(self.open_stats_config_dialog)
         buttons_layout.addWidget(self.configure_stats_btn)
+
+        self.generate_report_btn = QPushButton('Generate Report')
+        self.generate_report_btn.clicked.connect(self.generate_report)
+        buttons_layout.addWidget(self.generate_report_btn)
         
         # Add name mapping button to the buttons_layout
         self.name_mapping_btn = QPushButton('Edit Name Mapping')
@@ -324,6 +339,14 @@ class AnalysisTab(QWidget):
         self.stats_config_dialog = ScreeningStatsConfigDialog(self)
         self.stats_config_dialog.register_on_host(self)
         self.stats_config_dialog.set_defaults()
+        self.timeSyncMode = 'clock'
+        self.timeDurationHours = None
+        self.reportFolderName = 'Report'
+        self.figureClockTicks = ['00:00']
+        self.showFigureClockTicks = True
+        self.snapshotHours = None
+        self.timeGroups = []
+        self.timePeriodSources = []
         self.toggle_calibration_mode()
         self.toggle_plant_growth_options()
         self._ui_ready = True
@@ -465,13 +488,18 @@ class AnalysisTab(QWidget):
             analysis_id=self.identifier_edit.text().strip(),
         )
 
+    def _suggested_identifier(self):
+        rpi, cam = parse_robot_video_path(self.video_path_edit.text().strip())
+        if not rpi or not cam:
+            return ''
+        return identifier_from_rpi_cam(rpi, cam, self.extraField.text().strip())
+
     def _maybe_autofill_identifier(self):
         if self._loading_config:
             return
-        rpi, cam = parse_robot_video_path(self.video_path_edit.text().strip())
-        if not rpi or not cam:
+        suggested = self._suggested_identifier()
+        if not suggested:
             return
-        suggested = identifier_from_rpi_cam(rpi, cam)
         current = self.identifier_edit.text().strip()
         if current and current != self._auto_identifier:
             return
@@ -480,11 +508,8 @@ class AnalysisTab(QWidget):
             self.identifier_edit.setText(suggested)
 
     def _remember_auto_identifier(self):
-        rpi, cam = parse_robot_video_path(self.video_path_edit.text().strip())
-        if not rpi or not cam:
-            return
-        suggested = identifier_from_rpi_cam(rpi, cam)
-        if self.identifier_edit.text().strip() == suggested:
+        suggested = self._suggested_identifier()
+        if suggested and self.identifier_edit.text().strip() == suggested:
             self._auto_identifier = suggested
 
     def open_calibration_helper(self):
@@ -805,6 +830,29 @@ class AnalysisTab(QWidget):
         self.stats_config_dialog.exec_()
         self._autosave_config()
 
+    def open_time_window_dialog(self):
+        from gui.time_window_dialog import TimeWindowDialog
+        dialog = TimeWindowDialog(self, show_snapshots=False)
+        dialog.set_main_folder(self.proj_dir_edit.text().strip())
+        conf = {
+            'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),
+            'timeDurationHours': getattr(self, 'timeDurationHours', None),
+            'reportFolderName': getattr(self, 'reportFolderName', 'Report'),
+            'figureClockTicks': getattr(self, 'figureClockTicks', ['00:00']),
+            'showFigureClockTicks': getattr(self, 'showFigureClockTicks', True),
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
+        }
+        dialog.load_from_conf(conf)
+        if dialog.exec_() != QDialog.Accepted:
+            return False
+        for key, value in dialog.to_conf().items():
+            setattr(self, key, value)
+        self._autosave_config()
+        if self.main_window is not None:
+            self.main_window.set_project_dir(self.proj_dir_edit.text().strip())
+        return True
+
     def _int_field(self, widget, default):
         text = widget.text().strip() if hasattr(widget, 'text') else str(default)
         try:
@@ -845,6 +893,13 @@ class AnalysisTab(QWidget):
             'addTimeBeforePhoto': self._int_field(self.add_time_edit, 0),
             'germinationTimeCut': self._int_field(self.germination_time_edit, 0),
             'germinationEachVideo': self.store_each_video_checkbox.isChecked(),
+            'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),
+            'timeDurationHours': getattr(self, 'timeDurationHours', None),
+            'reportFolderName': getattr(self, 'reportFolderName', 'Report'),
+            'figureClockTicks': getattr(self, 'figureClockTicks', ['00:00']),
+            'showFigureClockTicks': getattr(self, 'showFigureClockTicks', True),
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
         }
         for name in (
             'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
@@ -857,6 +912,98 @@ class AnalysisTab(QWidget):
             conf['nameMapping'] = mapping_file
         return conf
 
+    def _cleanup_launcher(self, attr):
+        launcher = getattr(self, attr, None)
+        if launcher is None:
+            return None
+        if launcher.is_running():
+            return launcher
+        launcher.deleteLater()
+        setattr(self, attr, None)
+        return None
+
+    def _write_report_config_file(self):
+        project_dir = self.proj_dir_edit.text()
+        conf = self._build_report_config()
+        config_path = os.path.join(project_dir, 'report_config.json')
+        with open(config_path, 'w') as handle:
+            json.dump(conf, handle, indent=4)
+        return conf, config_path
+
+    def postprocess_plants(self):
+        if not self.proj_dir_edit.text():
+            ui_errors.show_warning(self, 'Error', 'Please select a project directory first!')
+            return
+        self._autosave_config()
+        if self._cleanup_launcher('postprocess_launcher') is not None:
+            ui_errors.show_warning(self, 'Busy', 'Postprocess is already running.')
+            return
+        if self._cleanup_launcher('report_launcher') is not None:
+            ui_errors.show_warning(self, 'Busy', 'Report generation is already running.')
+            return
+
+        project_dir = self.proj_dir_edit.text()
+        analysis_dir = os.path.join(project_dir, 'analysis')
+        if not os.path.isdir(analysis_dir):
+            ui_errors.show_warning(self, 'Error', 'No analysis directory found!')
+            return
+        analyses = [d for d in os.listdir(analysis_dir)
+                    if os.path.isdir(os.path.join(analysis_dir, d))]
+        if not analyses:
+            ui_errors.show_warning(self, 'Error', 'No analyses found to process!')
+            return
+
+        period_conf = {
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
+        }
+        if not analysis_period_is_current(period_conf, project_dir):
+            reply = QMessageBox.question(
+                self,
+                'Analysis period required',
+                PERIOD_GATE_MESSAGE + '\n\nOpen Set analysis period now?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            if not self.open_time_window_dialog():
+                return
+            period_conf = {
+                'timeGroups': getattr(self, 'timeGroups', []),
+                'timePeriodSources': getattr(self, 'timePeriodSources', []),
+            }
+            if not analysis_period_is_current(period_conf, project_dir):
+                ui_errors.show_warning(
+                    self, 'Analysis period required',
+                    'Postprocess was cancelled. '
+                    'Set an analysis period for this set of videos first.',
+                )
+                return
+
+        try:
+            conf, config_path = self._write_report_config_file()
+        except OSError as exc:
+            ui_errors.show_critical(self, 'Error', f'Failed to write report config:\n{exc}')
+            return
+
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        args = ["python", "generate_report.py", "--config", config_path, "--postprocess-only"]
+        log_dialog = ui_errors.WorkerLogDialog("Postprocessing…", parent=self)
+        self.postprocess_launcher = ui_errors.launch_worker(
+            args,
+            parent=self,
+            working_directory=app_dir,
+            error_title="Postprocess Error",
+            log_dialog=log_dialog,
+        )
+        if self.postprocess_launcher.is_running():
+            log_dialog.append_text(
+                "Postprocess started.\n"
+                f"Hourly tables will be written under: "
+                f"{os.path.join(project_dir, report_folder_name(conf))}\n\n"
+            )
+
     def generate_report(self):
         """Generate report on all completed experiments."""
         if not self.proj_dir_edit.text():
@@ -865,12 +1012,12 @@ class AnalysisTab(QWidget):
 
         self._autosave_config()
 
-        if self.report_launcher and self.report_launcher.is_running():
+        if self._cleanup_launcher('report_launcher') is not None:
             ui_errors.show_warning(self, "Busy", "Report generation is already running.")
             return
-        if self.report_launcher is not None:
-            self.report_launcher.deleteLater()
-            self.report_launcher = None
+        if self._cleanup_launcher('postprocess_launcher') is not None:
+            ui_errors.show_warning(self, "Busy", "Postprocess is already running.")
+            return
 
         project_dir = self.proj_dir_edit.text()
         analysis_dir = os.path.join(project_dir, 'analysis')
@@ -885,17 +1032,31 @@ class AnalysisTab(QWidget):
             return
 
         conf = self._build_report_config()
-        config_path = os.path.join(project_dir, 'report_config.json')
+        report_dir = os.path.join(project_dir, report_folder_name(conf))
+        raw_path = os.path.join(report_dir, 'data', 'Raw_Data.tsv')
+        temporal_path = os.path.join(report_dir, 'data', 'Temporal_Data.csv')
+        missing = []
+        if not os.path.isfile(raw_path):
+            missing.append('Raw_Data.tsv')
+        if conf.get('doPlantGrowth', True) and not os.path.isfile(temporal_path):
+            missing.append('Temporal_Data.csv')
+        if missing:
+            ui_errors.show_warning(
+                self,
+                'Postprocess required',
+                'Run Postprocess before generating a report.\n\nMissing: ' + ', '.join(missing),
+            )
+            return
+
         try:
-            with open(config_path, 'w') as handle:
-                json.dump(conf, handle, indent=4)
+            conf, config_path = self._write_report_config_file()
         except OSError as exc:
             ui_errors.show_critical(self, 'Error', f'Failed to write report config:\n{exc}')
             return
 
-        args = ["python", "generate_report.py", "--config", config_path]
         mapping_msg = " with name mapping" if conf.get('nameMapping') else ""
         app_dir = os.path.dirname(os.path.abspath(__file__))
+        args = ["python", "generate_report.py", "--config", config_path]
         log_dialog = ui_errors.WorkerLogDialog("Generating report…", parent=self)
         self.report_launcher = ui_errors.launch_worker(
             args,
@@ -907,7 +1068,7 @@ class AnalysisTab(QWidget):
         if self.report_launcher.is_running():
             log_dialog.append_text(
                 f"Report generation started{mapping_msg}.\n"
-                f"Results will be saved in: {os.path.join(project_dir, 'Report')}\n\n"
+                f"Results will be saved in: {os.path.join(project_dir, report_folder_name(conf))}\n\n"
             )
 
 class ResultsTab(QWidget):
@@ -1149,6 +1310,7 @@ class ReportsTab(QWidget):
         super().__init__(parent)
         self.project_dir = None
         self.report_root = None
+        self.report_folder_name = 'Report'
         self.current_plot = ''
         self.current_stats = ''
         self.initUI()
@@ -1184,8 +1346,10 @@ class ReportsTab(QWidget):
         layout.addLayout(right, 3)
         self.setLayout(layout)
 
-    def set_project_dir(self, dir_path):
+    def set_project_dir(self, dir_path, report_folder=None):
         self.project_dir = dir_path
+        if report_folder is not None:
+            self.report_folder_name = report_folder
         self.refresh_images()
 
     def _populate_tree(self, parent, nodes):
@@ -1207,7 +1371,10 @@ class ReportsTab(QWidget):
         self.open_stats_btn.setEnabled(False)
         if not self.project_dir:
             return
-        self.report_root = os.path.join(self.project_dir, 'Report')
+        self.report_root = os.path.join(
+            self.project_dir,
+            report_folder_name({'reportFolderName': getattr(self, 'report_folder_name', 'Report')}),
+        )
         if not os.path.isdir(self.report_root):
             self.image_label.setText('No Report folder yet. Generate a report first.')
             self.image_label.setPixmap(QPixmap())
@@ -1515,14 +1682,14 @@ class ScreeningGUI(QMainWindow):
     def set_project_dir(self, dir_path):
         """Update project directory for all tabs"""
         self.project_dir = dir_path
-        # Update Results tab
+        folder = 'Report'
+        if hasattr(self, 'analysis_tab'):
+            folder = getattr(self.analysis_tab, 'reportFolderName', 'Report') or 'Report'
         if hasattr(self, 'results_tab'):
             self.results_tab.set_project_dir(dir_path)
-            self.results_tab.refresh_results()  # Explicitly refresh the results
-        # Update Reports tab
+            self.results_tab.refresh_results()
         if hasattr(self, 'reports_tab'):
-            self.reports_tab.set_project_dir(dir_path)
-            self.reports_tab.refresh_images()  # Explicitly refresh the reports
+            self.reports_tab.set_project_dir(dir_path, report_folder=folder)
 
 def main():
     app = QApplication(sys.argv)
