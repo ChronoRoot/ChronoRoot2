@@ -151,6 +151,8 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
             widget = getattr(analysis_tab, name, None)
             if widget is not None:
                 payload[name] = widget.isChecked()
+        if getattr(analysis_tab, 'advanced_group', None) is not None:
+            payload['advancedComparisonModes'] = analysis_tab.advanced_group.isChecked()
     return payload
 
 
@@ -274,6 +276,10 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
                 widget = getattr(analysis_tab, name, None)
                 if widget is not None:
                     _set_checkbox_from_keys(widget, data, (name,))
+            if getattr(analysis_tab, 'advanced_group', None) is not None:
+                _set_checkbox_from_keys(
+                    analysis_tab.advanced_group, data, ('advancedComparisonModes',),
+                )
             if 'timeSyncMode' in data:
                 analysis_tab.timeSyncMode = data.get('timeSyncMode') or 'clock'
             if 'timeDurationHours' in data:

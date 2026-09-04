@@ -10,9 +10,17 @@ from .stats_utils import (
     _mode_spec,
     comparison_modes_for_run,
     ensure_factor_columns,
+    iter_replica_runs,
+    perform_scalar_pairwise_stats,
 )
 from .utils.fileUtilities import normalize_factor_value, UNSPECIFIED_FACTOR
-from .utils.report_paths import comparison_plot_path
+from .utils.report_paths import (
+    REPLICAS_DIR,
+    analysis_dir,
+    clear_replicas_subdir,
+    comparison_plot_path,
+    metric_dir,
+)
 from .time_windows import draw_clock_ticks
 from .utils.report_style import (
     apply_factor_axis_labels,
@@ -442,6 +450,33 @@ def emit_scalar_comparison_plots(conf, data, metric, base_dir, *, module, metric
     for mode in comparison_modes_for_run(conf, data):
         plot_scalar_comparison_mode(
             conf, data, metric, mode, base_dir,
+            module=module, metric_slug_name=metric_slug_name,
+            analysis_type=analysis_type, metric_label=metric_label or metric,
+        )
+
+
+def emit_replica_scalar_comparisons(
+    conf, data, metric, *, module, metric_slug_name,
+    analysis_type='scalar', metric_label=None, parent_subpath=(),
+    plant_id_col='Plant_id',
+):
+    """Scalar stats/plots per ExtraVariable, using non-extra comparison modes."""
+    parent_subpath = tuple(parent_subpath)
+    parent_dir = (
+        analysis_dir(conf, module, metric_slug_name, *parent_subpath)
+        if parent_subpath else metric_dir(conf, module, metric_slug_name)
+    )
+    clear_replicas_subdir(parent_dir)
+    for _extra, extra_slug, subset, replica_conf in iter_replica_runs(conf, data):
+        subpath = parent_subpath + (REPLICAS_DIR, extra_slug)
+        replica_dir = analysis_dir(conf, module, metric_slug_name, *subpath)
+        perform_scalar_pairwise_stats(
+            replica_conf, subset, metric, output_dir=None, plant_id_col=plant_id_col,
+            module=module, metric_slug_name=metric_slug_name,
+            subpath=subpath, analysis_type=analysis_type,
+        )
+        emit_scalar_comparison_plots(
+            replica_conf, subset, metric, replica_dir,
             module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type, metric_label=metric_label or metric,
         )

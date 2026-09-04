@@ -38,7 +38,7 @@ from analysis.time_windows import (
 )
 from analysis.utils.report_paths import analysis_dir, temporal_data_file
 from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
-from analysis.report_plots import relative_title
+from analysis.report_plots import relative_title, emit_replica_scalar_comparisons
 from skfda import FDataGrid
 from skfda.preprocessing.dim_reduction import FPCA
 from skfda.representation.basis import MonomialBasis
@@ -270,6 +270,12 @@ def _run_fpca_for_metrics(conf, columns):
                 module=MODULE_TEMPORAL, metric_slug_name=mag_slug,
                 analysis_type='fpca', metric_label=pc_label,
             )
+            emit_replica_scalar_comparisons(
+                conf, fpc_df, pc_col,
+                module=MODULE_TEMPORAL, metric_slug_name=mag_slug,
+                analysis_type='fpca', metric_label=pc_label,
+                parent_subpath=('fpca', f'pc{fpc1}'),
+            )
 
 
 def _germination_pairwise_stats(conf, germ_analyzer):
@@ -291,6 +297,11 @@ def _germination_pairwise_stats(conf, germ_analyzer):
     )
     emit_scalar_comparison_plots(
         conf, scalar, 'GerminationTime', base_dir,
+        module='germination', metric_slug_name=slug,
+        analysis_type='scalar', metric_label='Germination time',
+    )
+    emit_replica_scalar_comparisons(
+        conf, scalar, 'GerminationTime',
         module='germination', metric_slug_name=slug,
         analysis_type='scalar', metric_label='Germination time',
     )

@@ -104,6 +104,8 @@ class ConfigStore:
             host.statsExtraWithinGenotype,
         ]
     })
+    if getattr(host, 'advanced_group', None) is not None:
+        data['advancedComparisonModes'] = host.advanced_group.isChecked()
 
     data["daysConvexHull"] = host.daysConvexField.text()
     data["daysAngles"] = host.daysAnglesField.text()
@@ -210,6 +212,9 @@ class ConfigStore:
     ]:
       if field.objectName() in data:
         field.setChecked(data[field.objectName()])
+
+    if getattr(host, 'advanced_group', None) is not None and 'advancedComparisonModes' in data:
+      host.advanced_group.setChecked(bool(data['advancedComparisonModes']))
 
     if "knownDistance" in data:
       host.knownDistanceField.setText(str(data["knownDistance"]))

@@ -8,7 +8,7 @@ import scipy.stats as stats
 
 from .time_windows import elapsed_hour_windows
 from .utils.fileUtilities import UNSPECIFIED_FACTOR, normalize_factor_value
-from .utils.report_paths import stats_file as report_stats_file
+from .utils.report_paths import metric_slug, stats_file as report_stats_file
 from .utils.report_style import get_extra_axis_label, get_genotype_axis_label, get_plate_axis_label
 
 ALL_COMPARISON_MODES = (
@@ -30,6 +30,8 @@ _EXTRA_MODES = frozenset({
 
 
 def _modes_from_config(conf):
+    if conf.get('advancedComparisonModes') is False:
+        return ['by_genotype']
     modes = []
     if conf.get('statsByGenotype', True):
         modes.append('by_genotype')
@@ -78,6 +80,49 @@ def comparison_modes_for_run(conf, data=None):
     if data is not None:
         return get_enabled_comparison_modes(conf, data)
     return get_enabled_comparison_modes(conf)
+
+
+def specified_extra_values(data):
+    """Unique ExtraVariable values that are not unspecified, sorted stably."""
+    data = ensure_factor_columns(data)
+    values = []
+    seen = set()
+    for value in pd.Series(data['ExtraVariable']).dropna().unique():
+        normalized = normalize_factor_value(value)
+        if normalized == UNSPECIFIED_FACTOR or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return sorted(values, key=lambda item: str(item).lower())
+
+
+def replica_comparison_modes(conf, data=None):
+    """Enabled comparison modes that do not stratify or group by ExtraVariable."""
+    return [mode for mode in comparison_modes_for_run(conf, data) if mode not in _EXTRA_MODES]
+
+
+def iter_replica_runs(conf, data):
+    """Yield (extra_value, extra_slug, subset, replica_conf) for each specified extra.
+
+    replica_conf copies conf and sets effectiveComparisonModes to the non-extra
+    modes that still apply on that extra-variable subset.
+    """
+    data = ensure_factor_columns(data)
+    extras = specified_extra_values(data)
+    replica_modes = replica_comparison_modes(conf, data)
+    if not extras or not replica_modes:
+        return
+    extra_series = data['ExtraVariable'].astype(str)
+    for extra in extras:
+        subset = data[extra_series == str(extra)].copy()
+        if subset.empty:
+            continue
+        modes = [mode for mode in replica_modes if _mode_applicable_for_data(mode, subset, conf)]
+        if not modes:
+            continue
+        replica_conf = dict(conf)
+        replica_conf['effectiveComparisonModes'] = modes
+        yield extra, metric_slug(str(extra)), subset, replica_conf
 
 
 def log_auto_disabled_modes(conf, config_modes, effective_modes):

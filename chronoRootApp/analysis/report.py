@@ -36,12 +36,19 @@ plt.switch_backend('agg')
 from .utils.fileUtilities import convertFromPathSafe, convertToPathSafe
 from .utils.report_paths import (
     MODULE_TEMPORAL,
+    REPLICAS_DIR,
+    analysis_dir,
+    clear_replicas_subdir,
     metric_dir,
     overview_dir,
     table_file,
     temporal_metric_slug,
 )
-from .stats_utils import perform_temporal_pairwise_stats, ensure_factor_columns
+from .stats_utils import (
+    perform_temporal_pairwise_stats,
+    ensure_factor_columns,
+    iter_replica_runs,
+)
 from .report_plots import emit_temporal_comparison_plots, relative_title, subplot_grid
 from .time_windows import draw_clock_ticks, elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
@@ -157,6 +164,20 @@ def performStatisticalAnalysis(conf, data, metric):
         module=MODULE_TEMPORAL, metric_slug_name=slug,
         metric_label=metric,
     )
+    clear_replicas_subdir(base_dir)
+    for _extra, extra_slug, subset, replica_conf in iter_replica_runs(conf, data):
+        replica_dir = analysis_dir(conf, MODULE_TEMPORAL, slug, REPLICAS_DIR, extra_slug)
+        replica_subpath = (REPLICAS_DIR, extra_slug)
+        perform_temporal_pairwise_stats(
+            replica_conf, subset, metric,
+            module=MODULE_TEMPORAL, metric_slug_name=slug,
+            subpath=replica_subpath,
+        )
+        emit_temporal_comparison_plots(
+            replica_conf, subset, metric, replica_dir,
+            module=MODULE_TEMPORAL, metric_slug_name=slug,
+            metric_label=metric,
+        )
     return
 
 

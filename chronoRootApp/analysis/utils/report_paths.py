@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 
 from .report_utils import ensure_directory
 from ..time_windows import report_folder_name
@@ -13,6 +14,7 @@ MODULE_ANGLES = 'angles'
 OVERVIEW_SLUG = 'overview'
 INDIVIDUAL_PLOTS_DIR = 'individual_plots'
 RELATIVE_MEASUREMENTS_DIR = 'relative measurements'
+REPLICAS_DIR = 'replicas'
 
 TEMPORAL_METRICS = [
     'MainRootLength (mm)',
@@ -95,6 +97,13 @@ def analysis_dir(conf, module: str, metric_slug_name: str, *subpath: str) -> str
     path = os.path.join(metric_dir(conf, module, metric_slug_name), *subpath)
     ensure_directory(path)
     return path
+
+
+def clear_replicas_subdir(parent_dir: str) -> None:
+    """Remove a stale replicas/ folder under an existing metric or analysis dir."""
+    path = os.path.join(parent_dir, REPLICAS_DIR)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def comparison_stats_path(base_dir: str, mode: str, metric_slug: str = '') -> str:

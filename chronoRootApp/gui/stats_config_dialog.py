@@ -54,6 +54,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
     self.help_label.setWordWrap(True)
 
     self.advanced_group = QtWidgets.QGroupBox("Advanced comparison modes")
+    self.advanced_group.setObjectName("advancedComparisonModes")
     self.advanced_group.setCheckable(True)
     self.advanced_group.setChecked(False)
     advanced_layout = QtWidgets.QVBoxLayout()
@@ -104,6 +105,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
     host.everyXhourField = self.everyXhourField[1]
     host.everyXhourFieldFourier = self.everyXhourFieldFourier[1]
     host.everyXhourFieldAngles = self.everyXhourFieldAngles[1]
+    host.advanced_group = self.advanced_group
     for object_name, checkbox in self._mode_checkboxes.items():
       setattr(host, object_name, checkbox)
 
@@ -113,6 +115,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
     self.everyXhourField[1].setText("6")
     self.everyXhourFieldFourier[1].setText("6")
     self.everyXhourFieldAngles[1].setText("6")
+    self.advanced_group.setChecked(False)
     for checkbox in self._mode_checkboxes.values():
       checkbox.setChecked(True)
 
@@ -126,6 +129,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
         'everyXhourField': self.everyXhourField[1].text(),
         'everyXhourFieldFourier': self.everyXhourFieldFourier[1].text(),
         'everyXhourFieldAngles': self.everyXhourFieldAngles[1].text(),
+        'advancedComparisonModes': self.advanced_group.isChecked(),
         'modes': {
             name: checkbox.isChecked()
             for name, checkbox in self._mode_checkboxes.items()
@@ -148,3 +152,5 @@ class StatsConfigDialog(QtWidgets.QDialog):
       checkbox = self._mode_checkboxes.get(name)
       if checkbox is not None:
         checkbox.setChecked(bool(checked))
+    if 'advancedComparisonModes' in values:
+      self.advanced_group.setChecked(bool(values['advancedComparisonModes']))

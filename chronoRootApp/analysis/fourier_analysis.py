@@ -12,6 +12,7 @@ from .stats_utils import (
     perform_fourier_pairwise_stats,
     ensure_factor_columns,
     comparison_modes_for_run,
+    iter_replica_runs,
     _mode_spec,
     _describe_averaging,
 )
@@ -19,7 +20,9 @@ from .report_plots import plot_comparison_mode
 from .utils.report_paths import (
     MODULE_TEMPORAL,
     FOURIER_PARENT_METRICS,
+    REPLICAS_DIR,
     analysis_dir,
+    clear_replicas_subdir,
     comparison_plot_path,
     data_file,
     plot_file,
@@ -242,50 +245,79 @@ class DataProcessor:
             target_rhythms = {'24h Period': 1 / 24, '12h Period': 1 / 12}
 
             for mode in comparison_modes_for_run(self.conf):
-                spec = _mode_spec(mode, conf=self.conf)
-                stats_path = stats_file(self.conf, MODULE_TEMPORAL, slug, mode, 'growth_speed')
-                with open(stats_path, 'w') as f:
-                    f.write(f'CHRONOROOT 2.0 STATISTICAL REPORT - {metric_type}\n')
-                    f.write('=' * 60 + '\n')
-                    f.write('Using Mann Whitney U test to compare groups\n')
-                    f.write(f"{spec['header']}\n")
-                    f.write(f'{_describe_averaging(self.conf)}\n')
-                    f.write('PART 1: HOURLY GROWTH SPEED COMPARISONS (Original Data)\n')
-
-                    for start, end in elapsed_hour_windows(time_data, dt, hour_col='Time'):
-                        subdata = time_data[time_data['Time'].isin(np.arange(start, end))]
-                        f.write(f'\nWindow: {start}h to {end}h\n')
-                        perform_fourier_pairwise_stats(
-                            self.conf, subdata, 'Signal', f,
-                            plant_id_col='i', type_col='Type', modes=[mode],
-                        )
-
-                    f.write('\n' + '=' * 60 + '\n')
-                    f.write('PART 2: CIRCADIAN RHYTHM ANALYSIS (Detrended/Normalized FFT)\n')
-                    f.write('=' * 60 + '\n')
-
-                    for label, target_freq in target_rhythms.items():
-                        f.write(f'\nFrequency Bin: {label} ({target_freq:.4f} Hz)\n')
-                        available_freqs = fft_detrended['Freqs'].unique()
-                        closest_freq = available_freqs[np.argmin(np.abs(available_freqs - target_freq))]
-                        freq_subdata = fft_detrended[fft_detrended['Freqs'] == closest_freq]
-                        perform_fourier_pairwise_stats(
-                            self.conf, freq_subdata, 'FFT', f,
-                            plant_id_col='i', type_col='Type', modes=[mode],
-                        )
-
-                plot_data = ensure_factor_columns(time_data.copy())
-                plot_data['ElapsedTime (h)'] = plot_data['Time']
-                plot_comparison_mode(
-                    self.conf, plot_data, 'Signal', mode,
-                    comparison_plot_path(growth_dir, mode, metric_slug=slug),
-                    x_col='Time', metric_label=metric_label,
-                    module=MODULE_TEMPORAL, metric_slug_name=slug,
-                    analysis_type='growth_speed',
+                self._emit_growth_speed_mode(
+                    self.conf, mode, slug, metric_type, metric_label,
+                    time_data, fft_detrended, dt, target_rhythms, growth_dir,
+                    'growth_speed',
                 )
+
+            clear_replicas_subdir(growth_dir)
+            fft_extra = fft_detrended['ExtraVariable'].astype(str) if 'ExtraVariable' in fft_detrended.columns else None
+            for extra, extra_slug, subset, replica_conf in iter_replica_runs(self.conf, time_data):
+                replica_dir = analysis_dir(
+                    self.conf, MODULE_TEMPORAL, slug, 'growth_speed', REPLICAS_DIR, extra_slug,
+                )
+                if fft_extra is None:
+                    subset_fft = fft_detrended.iloc[0:0]
+                else:
+                    subset_fft = fft_detrended[fft_extra == str(extra)]
+                for mode in comparison_modes_for_run(replica_conf):
+                    self._emit_growth_speed_mode(
+                        replica_conf, mode, slug, metric_type, metric_label,
+                        subset, subset_fft, dt, target_rhythms, replica_dir,
+                        'growth_speed', REPLICAS_DIR, extra_slug,
+                    )
 
         except Exception as e:
             print(f"Error in statistical analysis: {str(e)}")
+
+    def _emit_growth_speed_mode(
+        self, conf, mode, slug, metric_type, metric_label,
+        time_data, fft_detrended, dt, target_rhythms, growth_dir, *stats_subpath,
+    ):
+        spec = _mode_spec(mode, conf=conf)
+        stats_path = stats_file(conf, MODULE_TEMPORAL, slug, mode, *stats_subpath)
+        with open(stats_path, 'w') as f:
+            f.write(f'CHRONOROOT 2.0 STATISTICAL REPORT - {metric_type}\n')
+            f.write('=' * 60 + '\n')
+            f.write('Using Mann Whitney U test to compare groups\n')
+            f.write(f"{spec['header']}\n")
+            f.write(f'{_describe_averaging(conf)}\n')
+            f.write('PART 1: HOURLY GROWTH SPEED COMPARISONS (Original Data)\n')
+
+            for start, end in elapsed_hour_windows(time_data, dt, hour_col='Time'):
+                subdata = time_data[time_data['Time'].isin(np.arange(start, end))]
+                f.write(f'\nWindow: {start}h to {end}h\n')
+                perform_fourier_pairwise_stats(
+                    conf, subdata, 'Signal', f,
+                    plant_id_col='i', type_col='Type', modes=[mode],
+                )
+
+            f.write('\n' + '=' * 60 + '\n')
+            f.write('PART 2: CIRCADIAN RHYTHM ANALYSIS (Detrended/Normalized FFT)\n')
+            f.write('=' * 60 + '\n')
+
+            if fft_detrended is not None and not fft_detrended.empty:
+                available_freqs = fft_detrended['Freqs'].unique()
+                if len(available_freqs):
+                    for label, target_freq in target_rhythms.items():
+                        f.write(f'\nFrequency Bin: {label} ({target_freq:.4f} Hz)\n')
+                        closest_freq = available_freqs[np.argmin(np.abs(available_freqs - target_freq))]
+                        freq_subdata = fft_detrended[fft_detrended['Freqs'] == closest_freq]
+                        perform_fourier_pairwise_stats(
+                            conf, freq_subdata, 'FFT', f,
+                            plant_id_col='i', type_col='Type', modes=[mode],
+                        )
+
+        plot_data = ensure_factor_columns(time_data.copy())
+        plot_data['ElapsedTime (h)'] = plot_data['Time']
+        plot_comparison_mode(
+            conf, plot_data, 'Signal', mode,
+            comparison_plot_path(growth_dir, mode, metric_slug=slug),
+            x_col='Time', metric_label=metric_label,
+            module=MODULE_TEMPORAL, metric_slug_name=slug,
+            analysis_type='growth_speed',
+        )
 
 
     def _write_comparison_stats(self, f, subdata: pd.DataFrame, exp1_name: str, exp2_name: str, col='Signal', is_fft=False):

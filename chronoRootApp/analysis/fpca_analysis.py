@@ -9,7 +9,7 @@ from skfda.representation.basis import MonomialBasis
 import seaborn as sns
 from scipy.stats import norm
 from .stats_utils import perform_scalar_pairwise_stats, ensure_factor_columns
-from .report_plots import emit_scalar_comparison_plots, relative_title
+from .report_plots import emit_scalar_comparison_plots, emit_replica_scalar_comparisons, relative_title
 from .utils.report_paths import (
     MODULE_TEMPORAL,
     analysis_dir,
@@ -220,4 +220,10 @@ def performFPCA(conf_path):
                 conf, fpc_df, pc_col, pc_dir,
                 module=MODULE_TEMPORAL, metric_slug_name=mag_slug,
                 analysis_type='fpca', metric_label=pc_label,
+            )
+            emit_replica_scalar_comparisons(
+                conf, fpc_df, pc_col,
+                module=MODULE_TEMPORAL, metric_slug_name=mag_slug,
+                analysis_type='fpca', metric_label=pc_label,
+                parent_subpath=('fpca', f'pc{fpc1}'),
             )

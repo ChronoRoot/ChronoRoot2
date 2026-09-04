@@ -917,6 +917,7 @@ class AnalysisTab(QWidget):
             'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
         ):
             conf[name] = getattr(self, name).isChecked()
+        conf['advancedComparisonModes'] = self.advanced_group.isChecked()
         mapping_file = os.path.join(self.proj_dir_edit.text(), 'name_mapping.json')
         if os.path.exists(mapping_file):
             conf['nameMapping'] = mapping_file
