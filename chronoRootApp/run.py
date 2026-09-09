@@ -30,6 +30,7 @@ from analysis.utils.fileUtilities import (
     load_result_metadata,
     normalize_factor_value,
     plant_slot_has_finished_analysis,
+    processing_limit_frame_count,
 )
 from analysis.utils.report_utils import natural_key as natural_keys
 from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
@@ -37,6 +38,7 @@ from gui import pipeline_runner
 from gui.stats_config_dialog import StatsConfigDialog
 from gui.remap_identifiers_dialog import RemapIdentifiersDialog
 from gui.time_window_dialog import TimeWindowDialog
+from gui.snapshot_hours_dialog import SnapshotHoursDialog
 from analysis.time_windows import (
     PERIOD_GATE_MESSAGE,
     analysis_period_is_current,
@@ -426,11 +428,23 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.daysConvexField.setEnabled(convex_on)
         self.daysConvexLabel.setEnabled(convex_on)
         self.daysConvexText.setEnabled(convex_on)
+        self.daysConvexChooseButton.setEnabled(convex_on)
         self.saveImagesConvex.setEnabled(convex_on)
         angles_on = self.doLateralAngles.isChecked()
         self.daysAnglesField.setEnabled(angles_on)
         self.daysAnglesText.setEnabled(angles_on)
         self.daysAnglesHint.setEnabled(angles_on)
+        self.daysAnglesChooseButton.setEnabled(angles_on)
+
+    def open_snapshot_hours_dialog(self, field):
+        dialog = SnapshotHoursDialog(
+            hours=field.text(),
+            duration_hours=getattr(self, 'timeDurationHours', None),
+            parent=self,
+        )
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        field.setText(dialog.selected_text())
 
     def open_remap_identifiers_dialog(self):
         project = self.projectField.text().strip()
@@ -968,10 +982,26 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 return
 
         image_paths, seg_paths = getImages(conf)
-        processing_limit = conf.get('processingLimit', None)
-        if processing_limit != 0:
-            image_paths = image_paths[: processing_limit * 24 * 4]
-            seg_paths = seg_paths[: processing_limit * 24 * 4]
+        limit_frames = processing_limit_frame_count(conf)
+        if limit_frames is not None:
+            image_paths = image_paths[:limit_frames]
+            seg_paths = seg_paths[:limit_frames]
+
+        try:
+            from analysis.utils.roi_selection import video_path_warnings
+            warnings_text = video_path_warnings(conf)
+        except Exception:
+            warnings_text = ''
+        if warnings_text:
+            reply = QtWidgets.QMessageBox.question(
+                None,
+                'Video path warning',
+                warnings_text + '\n\nContinue launching this analysis anyway?',
+                QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Yes,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
 
         bbox, seed = select_roi_and_seed(conf, image_paths, seg_paths)
         if seed is None:
@@ -1013,10 +1043,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         conf.pop('seed', None)
 
         image_paths, seg_paths = getImages(conf)
-        processing_limit = conf.get('processingLimit', None)
-        if processing_limit != 0:
-            image_paths = image_paths[: processing_limit * 24 * 4]
-            seg_paths = seg_paths[: processing_limit * 24 * 4]
+        limit_frames = processing_limit_frame_count(conf)
+        if limit_frames is not None:
+            image_paths = image_paths[:limit_frames]
+            seg_paths = seg_paths[:limit_frames]
 
         bbox, seed = select_roi_and_seed(
             conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
@@ -1834,12 +1864,23 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.daysConvexLabel.setText("Snapshot hours")
 
         self.daysConvexField = QtWidgets.QLineEdit(self.tab4)
-        self.daysConvexField.setGeometry(QtCore.QRect(150, 160, 191, 31))
+        self.daysConvexField.setGeometry(QtCore.QRect(150, 160, 130, 31))
         self.daysConvexField.setObjectName("daysConvexField")
         self.daysConvexField.setPlaceholderText("0, 24")
 
+        self.daysConvexChooseButton = QtWidgets.QPushButton(self.tab4)
+        self.daysConvexChooseButton.setGeometry(QtCore.QRect(285, 160, 70, 31))
+        self.daysConvexChooseButton.setObjectName("daysConvexChooseButton")
+        self.daysConvexChooseButton.setText("Choose")
+        self.daysConvexChooseButton.setToolTip(
+            "Pick snapshot hours by day, every X hours, or extra elapsed hours."
+        )
+        self.daysConvexChooseButton.clicked.connect(
+            lambda: self.open_snapshot_hours_dialog(self.daysConvexField)
+        )
+
         self.daysConvexText = QtWidgets.QLabel(self.tab4)
-        self.daysConvexText.setGeometry(QtCore.QRect(350, 160, 351, 31))
+        self.daysConvexText.setGeometry(QtCore.QRect(360, 160, 341, 31))
         self.daysConvexText.setObjectName("daysConvexText")
         self.daysConvexText.setText("(elapsed hours, e.g. 0, 24)")
 
@@ -1889,12 +1930,23 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.daysAnglesText.setText("Snapshot hours")
 
         self.daysAnglesField = QtWidgets.QLineEdit(self.tab4)
-        self.daysAnglesField.setGeometry(QtCore.QRect(150, 330, 191, 31))
+        self.daysAnglesField.setGeometry(QtCore.QRect(150, 330, 130, 31))
         self.daysAnglesField.setObjectName("daysAnglesField")
         self.daysAnglesField.setPlaceholderText("0, 24")
 
+        self.daysAnglesChooseButton = QtWidgets.QPushButton(self.tab4)
+        self.daysAnglesChooseButton.setGeometry(QtCore.QRect(285, 330, 70, 31))
+        self.daysAnglesChooseButton.setObjectName("daysAnglesChooseButton")
+        self.daysAnglesChooseButton.setText("Choose")
+        self.daysAnglesChooseButton.setToolTip(
+            "Pick snapshot hours by day, every X hours, or extra elapsed hours."
+        )
+        self.daysAnglesChooseButton.clicked.connect(
+            lambda: self.open_snapshot_hours_dialog(self.daysAnglesField)
+        )
+
         self.daysAnglesHint = QtWidgets.QLabel(self.tab4)
-        self.daysAnglesHint.setGeometry(QtCore.QRect(350, 330, 351, 31))
+        self.daysAnglesHint.setGeometry(QtCore.QRect(360, 330, 341, 31))
         self.daysAnglesHint.setObjectName("daysAnglesHint")
         self.daysAnglesHint.setText("(elapsed hours, e.g. 0, 24)")
 
@@ -2014,8 +2066,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.reportSelectProjectButton, self.reportProjectField,
             self.doFPCA, self.normFPCA, self.numComponentsFPCAField,
             self.doConvex, self.saveImagesConvex, self.daysConvexField,
+            self.daysConvexChooseButton,
             self.doFourier, self.doLateralAngles, self.reportEmergenceDistanceField,
-            self.daysAnglesField, self.reportConfigureStatsButton,
+            self.daysAnglesField, self.daysAnglesChooseButton, self.reportConfigureStatsButton,
             self.reportTimeWindowsButton,
             self.reportProcessingLimitField, self.reportCaptureIntervalField,
             self.reportGenotypeAxisLabelField, self.reportPlateConditionAxisLabelField,

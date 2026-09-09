@@ -378,6 +378,18 @@ def default_duration_hours(groups, data=None):
     return 40
 
 
+def shared_clock_origin(groups):
+    """Earliest group start; used as t0 when synchronizing by real time."""
+    starts = []
+    for group in groups or []:
+        ts = parse_datetime(group.get('start')) or parse_datetime(group.get('spanStart'))
+        if ts is not None:
+            starts.append(ts)
+    if not starts:
+        return None
+    return min(starts)
+
+
 def resolved_time_groups(conf, data=None):
     mode = (conf or {}).get('timeSyncMode') or 'clock'
     saved = list((conf or {}).get('timeGroups') or [])
@@ -387,9 +399,12 @@ def resolved_time_groups(conf, data=None):
     return detected, mode
 
 
-def _window_for_group(group, duration_hours):
+def _window_for_group(group, duration_hours, t0_override=None):
     start = parse_datetime(group.get('start')) or parse_datetime(group.get('spanStart'))
-    t0 = parse_datetime(group.get('t0')) or start
+    if t0_override is not None:
+        t0 = parse_datetime(t0_override)
+    else:
+        t0 = parse_datetime(group.get('t0')) or start
     if start is None:
         return None
     if duration_hours is None:
@@ -434,6 +449,9 @@ def apply_time_windows(data, conf):
     else:
         duration_hours = float(duration)
 
+    mode = (conf or {}).get('timeSyncMode') or 'clock'
+    clock_t0 = shared_clock_origin(groups) if mode != 'anchor' else None
+
     key_cols = _plant_key_columns(work)
     aligned = []
     elapsed_bounds = []
@@ -453,7 +471,7 @@ def apply_time_windows(data, conf):
             )
             n_unmatched += 1
             continue
-        window = _window_for_group(group, duration_hours)
+        window = _window_for_group(group, duration_hours, t0_override=clock_t0)
         if window is None:
             print(f'Skipping plant {key}: analysis-period group has no start', flush=True)
             n_unmatched += 1
@@ -585,6 +603,9 @@ def hourly_covers_analysis_period(hourly_df, conf):
     else:
         duration_hours = float(duration)
 
+    mode = (conf or {}).get('timeSyncMode') or 'clock'
+    clock_t0 = shared_clock_origin(groups) if mode != 'anchor' else None
+
     work = hourly_df.copy()
     work['Date'] = _ensure_dates(work['Date'])
     if 'Plant_id' not in work.columns:
@@ -609,7 +630,7 @@ def hourly_covers_analysis_period(hourly_df, conf):
     if not group_bounds:
         return False
     for i, group in enumerate(groups):
-        window = _window_for_group(group, duration_hours)
+        window = _window_for_group(group, duration_hours, t0_override=clock_t0)
         if window is None:
             return False
         start, _t0, end = window

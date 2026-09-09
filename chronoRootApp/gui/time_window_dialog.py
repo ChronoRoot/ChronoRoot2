@@ -13,12 +13,14 @@ from analysis.time_windows import (
     groups_to_config,
     parse_clock_ticks,
     parse_datetime,
+    shared_clock_origin,
     time_period_sources,
 )
 
 
 HELP_TEXT = (
-    "Real-time sync uses one start per group (later videos are padded, hours before start are dropped). "
+    "Real-time sync uses one shared clock origin (the earliest group start). "
+    "Later groups are padded; hours before that origin are dropped. "
     "Anchor sync sets elapsed 0 at a treatment time."
 )
 
@@ -29,8 +31,8 @@ ANCHOR_TOOLTIP = (
 
 PREVIEW_CAPTION = (
     "Elapsed-hour grid shared by every group. "
-    "A gap after 0 is padding (video started later). "
-    "Acquisition outside the window is cropped."
+    "Clock origin is the earliest start; later groups sit to the right (padding). "
+    "Acquisition outside each window is cropped."
 )
 
 EDITOR_MIN_WIDTH = 220
@@ -46,6 +48,31 @@ def _format_display_datetime(value):
     if ts is None:
         return str(value or '').replace('T', ' ')
     return ts.strftime('%Y-%m-%d %H:%M')
+
+
+def _overlay_saved_groups(saved, detected):
+    """Keep user start/t0 on detected groups matched by id."""
+    saved_by_id = {}
+    for group in saved or []:
+        try:
+            saved_by_id[int(group.get('id') or 0)] = group
+        except (TypeError, ValueError):
+            continue
+    merged = []
+    for det in detected or []:
+        row = dict(det)
+        try:
+            gid = int(det.get('id') or 0)
+        except (TypeError, ValueError):
+            gid = 0
+        old = saved_by_id.get(gid)
+        if old is not None:
+            if old.get('start'):
+                row['start'] = old['start']
+            if old.get('t0'):
+                row['t0'] = old['t0']
+        merged.append(row)
+    return merged
 
 
 def _draw_axis_end_labels(painter, width, height, left_text, right_text, left=8):
@@ -171,6 +198,12 @@ class _TimelineWidget(QtWidgets.QWidget):
         self._span_start = None
         self._span_end = None
         self._show_anchor = False
+        self._empty_text = "No groups to show on the timeline"
+
+    def set_empty_text(self, text):
+        self._empty_text = text or "No groups to show on the timeline"
+        if not self._groups:
+            self.update()
 
     def set_groups(self, groups, show_anchor=False):
         self._groups = list(groups or [])
@@ -214,7 +247,7 @@ class _TimelineWidget(QtWidgets.QWidget):
             painter.setPen(QtGui.QColor(120, 120, 120))
             painter.drawText(
                 self.rect(), QtCore.Qt.AlignCenter,
-                "Detect groups to show the timeline",
+                self._empty_text,
             )
             return
 
@@ -428,6 +461,41 @@ class AlignmentPreviewDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
 
+class TimeGroupDetectWorker(QtCore.QObject):
+    """Filesystem walk for analysis-period groups; results applied on the UI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, main_folder):
+        super().__init__()
+        self.main_folder = main_folder or ''
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            data = collect_acquisition_spans(self.main_folder)
+            if data is None or data.empty:
+                self.finished.emit({
+                    'groups': [],
+                    'duration': None,
+                    'sources': [],
+                    'empty': True,
+                })
+                return
+            groups = detect_time_groups(data)
+            duration = default_duration_hours(groups, data)
+            sources = time_period_sources(self.main_folder)
+            self.finished.emit({
+                'groups': groups_to_config(groups),
+                'duration': int(duration) if duration is not None else None,
+                'sources': list(sources or []),
+                'empty': False,
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class TimeWindowDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -438,12 +506,16 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self._updating = False
         self._ticks_touched = False
         self.main_folder = ''
+        self._saved_groups = []
+        self._saved_sources = []
+        self._duration_from_conf = False
+        self._detect_generation = 0
+        self._detect_thread = None
+        self._detect_worker = None
 
         self.clock_radio = QtWidgets.QRadioButton("Synchronize by real time")
         self.anchor_radio = QtWidgets.QRadioButton("Synchronize by anchor time")
         self.clock_radio.setChecked(True)
-        self.detect_btn = QtWidgets.QPushButton("Detect groups")
-        self.detect_btn.clicked.connect(self.detect_groups)
         self.preview_btn = QtWidgets.QPushButton("Preview alignment")
         self.preview_btn.clicked.connect(self._open_alignment_preview)
 
@@ -461,7 +533,6 @@ class TimeWindowDialog(QtWidgets.QDialog):
         top.addWidget(self.clock_radio, 0, 0)
         top.addWidget(self.anchor_radio, 0, 1)
         top.setColumnStretch(2, 1)
-        top.addWidget(self.detect_btn, 0, 3)
         top.addWidget(self.preview_btn, 0, 4)
         duration_row = QtWidgets.QHBoxLayout()
         duration_row.setContentsMargins(0, 0, 0, 0)
@@ -497,18 +568,19 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self._table_host)
 
-        buttons = QtWidgets.QDialogButtonBox(
+        self._buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        self._ok_button = self._buttons.button(QtWidgets.QDialogButtonBox.Ok)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.legend_label)
         layout.addWidget(self.timeline)
         layout.addWidget(self.scroll, 1)
-        layout.addWidget(buttons)
+        layout.addWidget(self._buttons)
 
         self._add_table_header()
         self.duration_edit.valueChanged.connect(self._refresh_end_labels)
@@ -562,9 +634,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
             return
         if self._updating:
             return
-        if self.clock_radio.isChecked():
-            for row in self._group_rows:
-                row['t0_edit'].set_datetime(row['start_edit'].to_string())
+        self._apply_shared_clock_t0()
         if not self._ticks_touched:
             self._apply_mode_tick_default()
         self._sync_anchor_fields()
@@ -587,7 +657,8 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.clock_radio.setChecked(mode != 'anchor')
         self.anchor_radio.setChecked(mode == 'anchor')
         duration = conf.get('timeDurationHours')
-        if duration not in (None, ''):
+        self._duration_from_conf = duration not in (None, '')
+        if self._duration_from_conf:
             try:
                 self.duration_edit.setValue(max(1, int(round(float(duration)))))
             except (TypeError, ValueError):
@@ -601,33 +672,114 @@ class TimeWindowDialog(QtWidgets.QDialog):
         else:
             self.show_ticks_check.setChecked(mode != 'anchor')
         groups = conf.get('timeGroups') or []
+        self._saved_groups = list(groups)
+        self._saved_sources = [str(s) for s in list(conf.get('timePeriodSources') or [])]
         self._updating = False
         if groups:
             self._set_groups(groups)
-        elif self.main_folder:
-            self.detect_groups()
         self._sync_ticks_enabled()
         self._update_legend()
         self._sync_anchor_fields()
+        if self.main_folder:
+            self._start_detect()
+        elif not groups:
+            self.timeline.set_empty_text("Select a project to detect time groups")
 
-    def detect_groups(self):
-        data = collect_acquisition_spans(self.main_folder)
-        if data is None or data.empty:
-            QtWidgets.QMessageBox.information(
-                self,
-                "No acquisitions found",
-                "No processed videos or image timestamps were found. "
-                "Process a video first (or finish plant analysis so Results_raw files exist).",
-            )
+    def _set_detecting(self, detecting):
+        if self._ok_button is not None:
+            self._ok_button.setEnabled(not detecting)
+        self.preview_btn.setEnabled(not detecting)
+        if detecting:
+            self.timeline.set_empty_text("Detecting groups…")
+        else:
+            self.timeline.set_empty_text("No groups to show on the timeline")
+
+    def _stop_detect_thread(self):
+        self._detect_generation += 1
+        thread = self._detect_thread
+        self._detect_thread = None
+        self._detect_worker = None
+        if thread is not None:
+            try:
+                thread.quit()
+            except RuntimeError:
+                pass
+
+    def _start_detect(self):
+        if not self.main_folder:
             return
-        mode = 'anchor' if self._anchor_mode() else 'clock'
-        groups = detect_time_groups(data, mode=mode)
-        if not groups:
-            QtWidgets.QMessageBox.information(self, "No groups", "Could not detect time groups.")
+        self._stop_detect_thread()
+        generation = self._detect_generation
+        self._set_detecting(True)
+        worker = TimeGroupDetectWorker(self.main_folder)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            lambda payload, gen=generation: self._on_detect_finished(gen, payload)
+        )
+        worker.failed.connect(
+            lambda message, gen=generation: self._on_detect_failed(gen, message)
+        )
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._detect_worker = worker
+        self._detect_thread = thread
+        thread.start()
+
+    def _on_detect_failed(self, generation, message):
+        if generation != self._detect_generation:
             return
-        duration = default_duration_hours(groups, data)
-        self.duration_edit.setValue(max(1, int(duration)))
+        self._set_detecting(False)
+        QtWidgets.QMessageBox.warning(
+            self, "Analysis period", f"Failed to detect time groups:\n{message}",
+        )
+
+    def _on_detect_finished(self, generation, payload):
+        if generation != self._detect_generation:
+            return
+        self._set_detecting(False)
+        payload = payload or {}
+        detected = list(payload.get('groups') or [])
+        if payload.get('empty') or not detected:
+            if not self._group_rows:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "No acquisitions found",
+                    "No processed videos or image timestamps were found. "
+                    "Process a video first (or finish plant analysis so Results_raw files exist).",
+                )
+            return
+        sources = [str(s) for s in list(payload.get('sources') or [])]
+        sources_match = bool(
+            self._saved_groups
+            and self._saved_sources
+            and sources
+            and self._saved_sources == sources
+        )
+        if sources_match:
+            groups = _overlay_saved_groups(self._saved_groups, detected)
+        else:
+            groups = detected
+            if not self._duration_from_conf:
+                duration = payload.get('duration')
+                if duration not in (None, ''):
+                    self.duration_edit.setValue(max(1, int(duration)))
         self._set_groups(groups)
+
+    def reject(self):
+        self._stop_detect_thread()
+        super().reject()
+
+    def accept(self):
+        self._stop_detect_thread()
+        super().accept()
+
+    def closeEvent(self, event):
+        self._stop_detect_thread()
+        super().closeEvent(event)
 
     def _clear_rows(self):
         self._group_rows = []
@@ -683,10 +835,21 @@ class TimeWindowDialog(QtWidgets.QDialog):
     def _groups_from_rows(self):
         groups = []
         clock_mode = not self._anchor_mode()
+        origin = None
+        if clock_mode:
+            origin = shared_clock_origin([
+                {'start': row['start_edit'].to_string()}
+                for row in self._group_rows
+            ])
+        duration = timedelta(hours=self.duration_edit.value())
         for i, row in enumerate(self._group_rows, start=1):
             start = row['start_edit'].to_string()
-            t0 = start if clock_mode else row['t0_edit'].to_string()
-            duration = timedelta(hours=self.duration_edit.value())
+            if clock_mode and origin is not None:
+                t0 = format_datetime(origin)
+            elif clock_mode:
+                t0 = start
+            else:
+                t0 = row['t0_edit'].to_string()
             start_ts = parse_datetime(start)
             end = format_datetime(start_ts + duration) if start_ts is not None else ''
             groups.append({
@@ -736,7 +899,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(
                 self,
                 "Preview alignment",
-                "Detect groups first.",
+                "No time groups to preview.",
             )
             return
         dialog = AlignmentPreviewDialog(
@@ -747,12 +910,22 @@ class TimeWindowDialog(QtWidgets.QDialog):
         )
         dialog.exec_()
 
+    def _apply_shared_clock_t0(self):
+        if self._anchor_mode() or not self._group_rows:
+            return
+        origin = shared_clock_origin([
+            {'start': row['start_edit'].to_string()}
+            for row in self._group_rows
+        ])
+        if origin is None:
+            return
+        for row in self._group_rows:
+            row['t0_edit'].set_datetime(origin)
+
     def _refresh_end_labels(self):
         if self._updating:
             return
-        if not self._anchor_mode():
-            for row in self._group_rows:
-                row['t0_edit'].set_datetime(row['start_edit'].to_string())
+        self._apply_shared_clock_t0()
         duration = timedelta(hours=self.duration_edit.value())
         for row in self._group_rows:
             start_ts = parse_datetime(row['start_edit'].to_string())

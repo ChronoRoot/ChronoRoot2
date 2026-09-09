@@ -33,7 +33,12 @@ from analysis.utils.fileUtilities import (
     build_plant_id,
     normalize_factor_value,
 )
-from analysis.time_windows import apply_time_windows, snapshot_hours, subtract_initial_stage
+from analysis.time_windows import (
+    apply_time_windows,
+    hourly_covers_analysis_period,
+    snapshot_hours,
+    subtract_initial_stage,
+)
 from analysis.utils.report_paths import (
     data_file,
     individual_plots_dir,
@@ -153,6 +158,13 @@ if __name__ == "__main__":
 
     all_data = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     if not all_data.empty:
+        if not hourly_covers_analysis_period(all_data, conf):
+            print(
+                'Warning: the current analysis period is not fully covered by existing hourly files. '
+                'Hours outside the stored Date range will be empty. '
+                'Run Postprocess if you need those extra hours.',
+                flush=True,
+            )
         all_data = apply_time_windows(all_data, conf)
     all_data.to_csv(temporal_data_path, index=False)
     print(f'Phase 1/3: wrote {temporal_data_path}')

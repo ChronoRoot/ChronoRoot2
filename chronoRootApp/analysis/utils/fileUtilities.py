@@ -77,6 +77,45 @@ def plant_slot_has_finished_analysis(conf):
     return False
 
 
+def processing_limit_frame_count(conf):
+    """First-N-days tracking cap as a frame count, using capture interval."""
+    limit = (conf or {}).get('processingLimit', None)
+    if limit in (None, '', 0, '0'):
+        return None
+    try:
+        days = int(round(float(limit)))
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    try:
+        time_step = int((conf or {}).get('timeStep') or 15)
+    except (TypeError, ValueError):
+        time_step = 15
+    if time_step <= 0:
+        time_step = 15
+    frames_per_day = (24 * 60) // time_step
+    return days * frames_per_day
+
+
+def expected_hourly_rows(n_frames, time_step):
+    """How many hourly bins a processing-limit frame cap should produce."""
+    try:
+        step = float(time_step)
+    except (TypeError, ValueError):
+        step = 15.0
+    if step <= 0:
+        step = 15.0
+    frames_per_hour = max(1, int(round(60.0 / step)))
+    try:
+        n_frames = int(n_frames)
+    except (TypeError, ValueError):
+        return None
+    if n_frames <= 0:
+        return None
+    return (n_frames + frames_per_hour - 1) // frames_per_hour
+
+
 def cleanup_superseded_results(plant_path, keep_result_path):
     """Delete all Results_* folders except the one to keep."""
     keep_result_path = os.path.abspath(keep_result_path)

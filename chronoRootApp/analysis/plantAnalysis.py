@@ -16,7 +16,14 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-from .utils.fileUtilities import createSaveFolder, getImages, saveMetadata, cleanup_superseded_results, plant_slot_path
+from .utils.fileUtilities import (
+    createSaveFolder,
+    getImages,
+    saveMetadata,
+    cleanup_superseded_results,
+    plant_slot_path,
+    processing_limit_frame_count,
+)
 from .imageUtils.seg import extract_root_segmentation, extract_skeleton
 from .imageUtils.plot import saveImages
 from .graphUtils.save import saveGraph, saveProps
@@ -51,11 +58,10 @@ def setupPlantAnalysis(conf, replicate):
     # Load image and segmentation file paths
     image_paths, segmentation_paths = getImages(conf)
     
-    # Limit the images loaded to the maximum specified in conf
-    processingLimit = conf.get('processingLimit', None)
-    if processingLimit != 0:
-        image_paths = image_paths[: processingLimit * 24 * 4]
-        segmentation_paths = segmentation_paths[: processingLimit * 24 * 4]
+    limit_frames = processing_limit_frame_count(conf)
+    if limit_frames is not None:
+        image_paths = image_paths[:limit_frames]
+        segmentation_paths = segmentation_paths[:limit_frames]
 
     if replicate:
         if 'bounding box' not in conf or 'seed' not in conf:
@@ -234,23 +240,44 @@ def plantAnalysis(conf, replicate=False):
         
         error_count = 0
         consecutive_errors = 0
+        tracking_lost = False
         
         for frame_idx in range(growth_start_frame + 1, total_frames):
             print(f'Processing frame {frame_idx + 1} of {total_frames}', end='\r')
             
             frame_failed = False
+            seg_exception = None
             
-            new_root_mask, new_hypocotyl_skeleton, new_hypocotyl_length, found_root, mc_filtered_mask, new_bbox = extract_root_segmentation(
-                segmentation_paths[frame_idx],
-                roi_bounds,
-                current_root_base,
-                fixed_seed_position,
-                previous_bbox=current_bbox
-            )
+            try:
+                new_root_mask, new_hypocotyl_skeleton, new_hypocotyl_length, found_root, mc_filtered_mask, new_bbox = extract_root_segmentation(
+                    segmentation_paths[frame_idx],
+                    roi_bounds,
+                    current_root_base,
+                    fixed_seed_position,
+                    previous_bbox=current_bbox
+                )
+            except Exception as e:
+                found_root = False
+                seg_exception = e
             
             if not found_root:
                 frame_failed = True
-                analysis_log.append(f'Frame {frame_idx}: Error in segmentation\n')
+                if seg_exception is not None:
+                    analysis_log.append(f'Frame {frame_idx}: Error in segmentation - {str(seg_exception)}\n')
+                else:
+                    analysis_log.append(f'Frame {frame_idx}: Error in segmentation\n')
+                
+                consecutive_errors += 1
+                if consecutive_errors >= 20:
+                    current_bbox = None
+                    current_root_base = fixed_seed_position.copy()
+                    tracking_lost = True
+                    consecutive_errors = 0
+                    print(f'\n\nWARNING: 20 consecutive segmentation errors at frame {frame_idx}')
+                    print('Dropping tracking memory and reinitializing from seed')
+                    analysis_log.append(f'Frame {frame_idx}: 20 consecutive segmentation errors, dropped tracking memory\n')
+            else:
+                consecutive_errors = 0
             
             if not frame_failed:
                 new_skeleton, branch_points, end_points, is_valid_skeleton = extract_skeleton(new_root_mask)
@@ -284,13 +311,18 @@ def plantAnalysis(conf, replicate=False):
             
             if not frame_failed:
                 try:
-                    new_graph = matchGraphs(current_graph, new_graph)
+                    if tracking_lost:
+                        print(f'\nFrame {frame_idx}: Tracking memory lost, reinitializing graph')
+                        new_graph = graphInit(new_graph)
+                        analysis_log.append(f'Frame {frame_idx}: Tracking memory lost, reinitialized graph\n')
+                    else:
+                        new_graph = matchGraphs(current_graph, new_graph)
                 except Exception as e:
                     # Matching failed - decide whether to reinitialize or fail
                     frames_since_start = frame_idx - growth_start_frame
                     
-                    if frames_since_start < 300:
-                        # Early in tracking - try reinitializing
+                    if tracking_lost or frames_since_start < 300:
+                        # Early in tracking, or bbox memory was dropped - try reinitializing
                         try:
                             print(f'\nFrame {frame_idx}: Matching failed, reinitializing graph')
                             new_graph = graphInit(new_graph)
@@ -321,19 +353,11 @@ def plantAnalysis(conf, replicate=False):
                     new_lateral_count = current_lateral_count
             
             if frame_failed:
-                # Frame failed - keep previous state
-                consecutive_errors += 1
-                
-                # Count error if we're past initialization phase
+                # Frame failed - keep previous state (mask/graph still last-good)
                 if frame_idx - growth_start_frame >= 50:
                     error_count += 1
                 
                 frame_errors.append(1)
-                
-                # Check if too many consecutive errors (likely segmentation failure)
-                if consecutive_errors >= 20:
-                    print(f'\n\nWARNING: {consecutive_errors} consecutive errors at frame {frame_idx}')
-                    print('Segmentation may have failed completely')
             else:
                 # Frame succeeded - update state
                 current_root_mask = new_root_mask
@@ -345,8 +369,8 @@ def plantAnalysis(conf, replicate=False):
                 current_hypocotyl_skeleton = new_hypocotyl_skeleton
                 current_root_base = updated_root_base
                 current_bbox = new_bbox
+                tracking_lost = False
                 
-                consecutive_errors = 0  # Reset consecutive error counter
                 frame_errors.append(0)
             
             frame_name = getImgName(images[frame_idx], conf)

@@ -15,6 +15,7 @@ import json
 import warnings
 
 from .time_windows import elapsed_hours_from_t0
+from .utils.fileUtilities import expected_hourly_rows
 
 def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5):
     """
@@ -231,7 +232,9 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
     
     # Handle N_exp for hourly data
     if N_exp is not None:
-        expected_hour_count = (N_exp + 3) // 4
+        expected_hour_count = expected_hourly_rows(N_exp, timeStep)
+        if expected_hour_count is None:
+            expected_hour_count = len(hour_data)
         
         if len(hour_data) < expected_hour_count:
             missing_hours = expected_hour_count - len(hour_data)
