@@ -28,7 +28,8 @@ from .utils.report_paths import (
     plot_file,
     stats_file,
 )
-from .time_windows import draw_clock_ticks, elapsed_hour_windows
+from .plot_time_axis import decorate_elapsed_time_axis
+from .time_windows import elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 
 
@@ -355,11 +356,11 @@ class Visualizer:
         self.slug = FOURIER_PARENT_METRICS[metric_type]
         self._setup_plot_style()
 
-    def _clock_ticks(self, ax, data, twin_axis=False):
+    def _clock_ticks(self, ax, data, *, day_axis=True):
         tick_df = data
         if 'ElapsedTime (h)' not in tick_df.columns and 'Time' in tick_df.columns:
             tick_df = tick_df.rename(columns={'Time': 'ElapsedTime (h)'})
-        draw_clock_ticks(ax, tick_df, self.conf, twin_axis=twin_axis)
+        decorate_elapsed_time_axis(ax, tick_df, self.conf, day_axis=day_axis)
 
     def _setup_plot_style(self):
         """Set up matplotlib plot style"""
@@ -449,7 +450,7 @@ class Visualizer:
                         errorbar='se', ax=ax, color=geno_palette.get(exp_name),
                         estimator=np.mean)
             tick_df = exp_data.rename(columns={'Time': 'ElapsedTime (h)'}) if 'ElapsedTime (h)' not in exp_data.columns else exp_data
-            draw_clock_ticks(ax, tick_df, self.conf, twin_axis=(i == 0))
+            decorate_elapsed_time_axis(ax, tick_df, self.conf, day_axis=True)
             
             ax.set_ylabel(metric_config['ylabel'])
             ax.set_xlabel('')
@@ -462,7 +463,7 @@ class Visualizer:
         exp2 = 0.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
         ax_sin.plot(time, exp1, color='red', label='24h rhythm')
         ax_sin.plot(time, exp2, color='black', label='12h rhythm')
-        self._clock_ticks(ax_sin, data, twin_axis=False)
+        self._clock_ticks(ax_sin, data, day_axis=True)
         
         ax_sin.set_ylabel('Reference Patterns')
         ax_sin.set_xlabel('Time (h)')
@@ -490,7 +491,7 @@ class Visualizer:
             sns.lineplot(x="Time", y="Signal", data=exp_data_norm,
                         errorbar='se', ax=ax, color=geno_palette.get(exp_name),
                         estimator=np.mean)
-            self._clock_ticks(ax, exp_data_norm, twin_axis=(i == 0))
+            self._clock_ticks(ax, exp_data_norm, day_axis=True)
             ax.set_ylabel(metric_config['norm_ylabel'])
             ax.set_xlabel('')
             ax.set_ylim(-1, 1)
@@ -502,7 +503,7 @@ class Visualizer:
         exp2 = -0.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
         ax_sin.plot(time, exp1, color='red', label='24h rhythm')
         ax_sin.plot(time, exp2, color='black', label='12h rhythm')
-        self._clock_ticks(ax_sin, data_detrended, twin_axis=False)
+        self._clock_ticks(ax_sin, data_detrended, day_axis=True)
         ax_sin.set_ylabel('Reference Patterns')
         ax_sin.set_xlabel('Time (h)')
         ax_sin.legend(loc='upper right')
@@ -524,7 +525,7 @@ class Visualizer:
         sns.lineplot(x="Time", y="Signal", data=data,
                     hue="Type", errorbar='se', ax=ax,
                     estimator=np.mean, palette=geno_palette)
-        self._clock_ticks(ax, data, twin_axis=False)
+        self._clock_ticks(ax, data, day_axis=True)
         
         ax.set_ylabel(ylabel)
         ax.set_xlabel('Time (h)')

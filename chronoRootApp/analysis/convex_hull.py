@@ -21,6 +21,7 @@ from analysis.time_windows import (
     resolved_time_groups,
     snapshot_hours as conf_snapshot_hours,
 )
+from analysis.plot_time_axis import draw_snapshot_day_axis
 from analysis.utils.report_paths import (
     MODULE_CONVEX,
     metric_slug,
@@ -483,6 +484,7 @@ def plot_hull_metrics_summary(conf, frame):
                        palette=geno_palette)
         plt.title(f'{y_col} — {title}')
         plt.ylabel(y_label)
+        draw_snapshot_day_axis(plt.gca())
         leg = plt.gca().get_legend()
         if leg is not None:
             leg.set_title(geno_label)

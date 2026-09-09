@@ -788,8 +788,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.image_label1.clear()
 
             try:
-                # Same pipeline as plant_viewer: BGR image + addWeighted overlay
-                # (keeps plant at full weight so the image does not go darker)
+                import plant_viewer
+
                 img = cv2.imread(image1_path)
                 if img is None:
                     raise ValueError(f"Could not read image: {image1_path}")
@@ -802,20 +802,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 if overlay_on and os.path.exists(overlay):
                     seg = cv2.imread(overlay, cv2.IMREAD_UNCHANGED)
                     if seg is not None:
-                        if len(seg.shape) == 3:
-                            if seg.shape[2] == 4:
-                                seg = cv2.cvtColor(seg, cv2.COLOR_BGRA2BGR)
-                            if seg.shape[:2] == img.shape[:2]:
-                                img = cv2.addWeighted(img, 1.0, seg, 0.85, 0)
-                        elif len(seg.shape) == 2 and seg.shape[:2] == img.shape[:2]:
-                            from analysis.imageUtils.plot import overlay_seg_mask
-                            colors = {
-                                1: (0, 0, 255),
-                                2: (0, 255, 0),
-                                3: (255, 0, 0),
-                                4: (0, 255, 255),
-                            }
-                            img = overlay_seg_mask(img, seg, colors)
+                        img = plant_viewer._overlay_label_segmentation(img, seg)
 
                 rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 if not rgb.flags['C_CONTIGUOUS']:
@@ -1578,6 +1565,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         try:
             import calibration_helper
             self.calibration_window = calibration_helper.CalibrationHelper(self.videoField.text())
+            self.calibration_window.distance_measured.connect(
+                lambda pixels: self.pixelDistanceField.setText(str(pixels))
+            )
             self.calibration_window.show()
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "Error", f"Failed to launch calibration helper:\n{e}")

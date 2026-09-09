@@ -4,6 +4,7 @@ import math
 import os
 
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
 
 from .stats_utils import (
@@ -21,7 +22,11 @@ from .utils.report_paths import (
     comparison_plot_path,
     metric_dir,
 )
-from .time_windows import draw_clock_ticks
+from .plot_time_axis import (
+    decorate_elapsed_time_axes,
+    draw_snapshot_day_axis_on,
+    place_elapsed_time_suptitle,
+)
 from .utils.report_style import (
     apply_factor_axis_labels,
     axis_label_for_column,
@@ -32,6 +37,7 @@ from .utils.report_style import (
 plt.switch_backend('agg')
 
 RELATIVE_TITLE_SUFFIX = 'relative to initial stage'
+COUNT_N_OFFSET = 0.08
 
 
 def subplot_grid(n):
@@ -49,6 +55,24 @@ def relative_title(title, conf=None):
     if RELATIVE_TITLE_SUFFIX.lower() in text.lower():
         return text
     return f'{text} — {RELATIVE_TITLE_SUFFIX}'
+
+
+def _decorate_temporal_grid(g, data, conf, x_col, title=None):
+    if x_col not in ('ElapsedTime (h)', 'Time'):
+        if title:
+            g.fig.suptitle(title, y=1.02)
+        return
+    hour_col = x_col if x_col in getattr(data, 'columns', []) else 'ElapsedTime (h)'
+    decorate_elapsed_time_axes(g.axes.flat, data, conf, hour_col=hour_col)
+    place_elapsed_time_suptitle(g.fig, title)
+
+
+def _decorate_snapshot_grid(plot_obj, x_col, title=None):
+    if x_col == 'ElapsedTime (h)':
+        draw_snapshot_day_axis_on(plot_obj)
+    fig = plot_obj.fig if hasattr(plot_obj, 'fig') else getattr(plot_obj, 'figure', None)
+    if title and fig is not None:
+        place_elapsed_time_suptitle(fig, title)
 
 
 def _plot_title(metric_label, spec, conf=None):
@@ -138,6 +162,8 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
         'data': data, 'x': x, 'y': y, 'hue': hue, 'col': col,
         'kind': kind, 'height': 4, 'aspect': 1.2,
     }
+    if kind == 'violin':
+        kwargs['inner'] = None
     kwargs.update(_palette_kwargs(data, hue, conf))
     if col in data.columns:
         n = int(data[col].nunique(dropna=True))
@@ -146,10 +172,45 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
     return kwargs
 
 
+def _violin_with_swarm(ax, data, x_col, y_col, hue_col, conf):
+    palette = _palette_kwargs(data, hue_col, conf)
+    sns.violinplot(
+        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
+        inner=None, zorder=1, **palette,
+    )
+    sns.swarmplot(
+        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
+        dodge=True, size=3, zorder=3, legend=False, **palette,
+    )
+
+
+def _overlay_swarm(g, x_col, y_col, hue_col, conf):
+    palette = _palette_kwargs(g.data, hue_col, conf)
+    g.map_dataframe(
+        sns.swarmplot, x=x_col, y=y_col, hue=hue_col,
+        dodge=True, size=3, zorder=3, legend=False, **palette,
+    )
+
+
+def aggregate_count_lines(data, x_col, hue_col, metric, facet_col=None):
+    """Sum plant N per time/hue, then add a tiny y-offset so overlapping lines separate."""
+    frame = data.copy()
+    frame['_n'] = frame[metric].notna().astype(int)
+    keys = []
+    for col in (x_col, hue_col, facet_col):
+        if col and col in frame.columns and col not in keys:
+            keys.append(col)
+    grouped = frame.groupby(keys, as_index=False)['_n'].sum()
+    levels = sorted(grouped[hue_col].astype(str).unique(), key=str)
+    mapping = {level: i * COUNT_N_OFFSET for i, level in enumerate(levels)}
+    grouped['_n'] = pd.to_numeric(grouped['_n'], errors='coerce') + grouped[hue_col].astype(str).map(mapping).fillna(0)
+    return grouped
+
+
 def _count_lineplot_kwargs(x_col, hue_col, facet_col=None, data=None, conf=None):
     kwargs = _lineplot_kwargs(x_col, '_n', hue_col, facet_col=facet_col, data=data, conf=conf)
     kwargs['errorbar'] = None
-    kwargs['estimator'] = 'sum'
+    kwargs['estimator'] = 'mean'
     return kwargs
 
 
@@ -162,8 +223,10 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
     """Companion N-over-time figure in the same folder as the mean plot."""
     if metric not in data.columns:
         return
-    count_data = data.copy()
-    count_data['_n'] = count_data[metric].notna().astype(int)
+    axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
+    if not hue_col:
+        return
+    count_data = aggregate_count_lines(data, x_col, hue_col, metric, facet_col)
     title = relative_title(f'{metric_label} — number of plants', conf)
     count_path = _count_plot_path(output_path)
     try:
@@ -208,13 +271,9 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
             )
         else:
             return
-        axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
-        if x_col in ('ElapsedTime (h)', 'Time'):
-            for ax in g.axes.flat:
-                draw_clock_ticks(ax, count_data, conf, twin_axis=False)
+        _decorate_temporal_grid(g, count_data, conf, x_col, title=title)
         g.set_ylabels('Number of plants')
-        g.fig.suptitle(title, y=1.02)
         g.savefig(count_path, dpi=300, bbox_inches='tight')
     except Exception:
         pass
@@ -266,10 +325,7 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
 
         axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
-        if x_col in ('ElapsedTime (h)', 'Time'):
-            for ax in g.axes.flat:
-                draw_clock_ticks(ax, plot_data, conf, twin_axis=False)
-        g.fig.suptitle(title, y=1.02)
+        _decorate_temporal_grid(g, plot_data, conf, x_col, title=title)
         g.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close('all')
         _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
@@ -364,56 +420,56 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
 
     try:
         if mode == 'by_genotype':
-            fig, ax = plt.subplots(figsize=(8, 6))
-            exp_palette = _palette_kwargs(data, 'Experiment', conf)
-            sns.violinplot(data=data, x=x_col, y=metric, hue='Experiment', ax=ax, inner=None, **exp_palette)
-            sns.swarmplot(data=data, x=x_col, y=metric, hue='Experiment', ax=ax, dodge=True, size=3, **exp_palette)
+            fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+            _violin_with_swarm(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
         elif mode == 'genotype_by_plate':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'PlateCondition', conf, 'violin'))
+            _overlay_swarm(g, x_col, metric, 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='PlateCondition')
-            g.fig.suptitle(title, y=1.02)
+            _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'genotype_by_extra':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'ExtraVariable', conf, 'violin'))
+            _overlay_swarm(g, x_col, metric, 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='ExtraVariable')
-            g.fig.suptitle(title, y=1.02)
+            _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'by_plate_condition':
-            fig, ax = plt.subplots(figsize=(8, 6))
-            sns.violinplot(data=data, x=x_col, y=metric, hue='PlateCondition', ax=ax,
-                           **_palette_kwargs(data, 'PlateCondition', conf))
+            fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+            _violin_with_swarm(ax, data, x_col, metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='PlateCondition')
         elif mode == 'by_extra_variable':
-            fig, ax = plt.subplots(figsize=(8, 6))
-            sns.violinplot(data=data, x=x_col, y=metric, hue='ExtraVariable', ax=ax,
-                           **_palette_kwargs(data, 'ExtraVariable', conf))
+            fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+            _violin_with_swarm(ax, data, x_col, metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='ExtraVariable')
         elif mode == 'plate_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'PlateCondition', 'Experiment', conf, 'violin'))
+            _overlay_swarm(g, x_col, metric, 'PlateCondition', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='PlateCondition', facet_col='Experiment')
-            g.fig.suptitle(title, y=1.02)
+            _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'extra_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'ExtraVariable', 'Experiment', conf, 'violin'))
+            _overlay_swarm(g, x_col, metric, 'ExtraVariable', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='ExtraVariable', facet_col='Experiment')
-            g.fig.suptitle(title, y=1.02)
+            _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         else:
             return False
 
-        plt.tight_layout()
+        _decorate_snapshot_grid(ax, x_col)
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close('all')
         return True

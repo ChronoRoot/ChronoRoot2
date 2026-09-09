@@ -21,6 +21,7 @@ from PyQt5.QtGui import QColor, QPixmap, QIntValidator, QDoubleValidator
 import ui_errors
 import interface_config
 import chrono_root_backend  # noqa: F401
+from analysis.utils.fileUtilities import getImages
 from analysis.time_windows import (
     PERIOD_GATE_MESSAGE,
     analysis_period_is_current,
@@ -678,10 +679,9 @@ class AnalysisTab(QWidget):
             return 15.0
 
     def _validate_video_dataset(self):
-        import plant_viewer
-        video_folder, segmentation_dir, images, seg_files = plant_viewer.resolve_screening_paths(
-            self.video_path_edit.text()
-        )
+        video_folder = self.video_path_edit.text()
+        conf = {'Images': video_folder, 'timeStep': self._get_time_delta()}
+        images, seg_files = getImages(conf)
         if not images:
             ui_errors.show_warning(
                 self,
@@ -697,7 +697,7 @@ class AnalysisTab(QWidget):
                 'The images may not have been properly segmented.'
             )
             return None
-        return video_folder, segmentation_dir
+        return conf, images, seg_files
 
     def browse_video_path(self):
         dir_path = QFileDialog.getExistingDirectory(self, 'Select Video Directory')
@@ -714,7 +714,9 @@ class AnalysisTab(QWidget):
         dataset = self._validate_video_dataset()
         if not dataset:
             return
-        video_folder, segmentation_dir = dataset
+        conf, images, seg_files = dataset
+        video_folder = conf['ImagePath']
+        segmentation_dir = os.path.dirname(conf['SegPath'])
 
         project_dir = self.proj_dir_edit.text()
         identifier = self.identifier_edit.text().strip()
@@ -726,14 +728,6 @@ class AnalysisTab(QWidget):
         except Exception as e:
             ui_errors.show_critical(self, "Error", f"Failed to load images plant viewer:\n{e}")
             return 
-            
-        try:
-            images, seg_files, _ = plant_viewer.load_screening_sequence(
-                video_folder, segmentation_dir, time_delta
-            )
-        except Exception as e:
-            ui_errors.show_critical(self, "Error", f"Failed to load images for ROI selection:\n{e}")
-            return
 
         roi_dialog = plant_viewer.GroupROISelectorWindow(
             images, seg_files, group_names, time_delta=time_delta, parent=self
@@ -812,8 +806,7 @@ class AnalysisTab(QWidget):
 
         self._autosave_config()
 
-        video_folder, segmentation_dir = dataset
-        time_delta = self._get_time_delta()
+        conf, images, seg_files = dataset
 
         try:
             import plant_viewer
@@ -822,9 +815,6 @@ class AnalysisTab(QWidget):
             return 
         
         try:            
-            images, seg_files, conf = plant_viewer.load_screening_sequence(
-                video_folder, segmentation_dir, time_delta
-            )
             self.preview_window = plant_viewer.ChronoViewWindow(
                 images, seg_files, None, conf, parent=None
             )

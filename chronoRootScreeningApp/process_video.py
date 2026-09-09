@@ -10,9 +10,10 @@ from datetime import datetime
 from typing import Dict, Any, Tuple, List
 import matplotlib
 import sys
-from qr import qr_detect, get_pixel_size
-from collections import defaultdict
 matplotlib.use('Agg')
+import chrono_root_backend  # noqa: F401
+from analysis.qr import qr_detect, get_pixel_size
+from collections import defaultdict
 
 from skimage.morphology import skeletonize
 from robot_ids import resolve_rpi_cam

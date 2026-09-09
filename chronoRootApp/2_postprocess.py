@@ -133,7 +133,7 @@ def process_one_plant(plant_path, pixel_size, conf, plot_label):
         processed_csv = os.path.join(target_res, "PostProcess_Hour.csv")
         if os.path.exists(processed_csv):
             data = pd.read_csv(processed_csv)
-            plot_individual_plant(target_res, data, plot_label)
+            plot_individual_plant(target_res, data, plot_label, conf)
 
         getAngles(conf, target_res)
         return plant_path, True, ""

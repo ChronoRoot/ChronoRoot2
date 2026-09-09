@@ -6,11 +6,12 @@ import numpy as np
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QSlider, QLabel, QPushButton, QGraphicsView,
                              QGraphicsScene, QGraphicsPixmapItem, QStyle,
-                             QDialog, QGraphicsRectItem, QRubberBand)
+                             QDialog, QGraphicsRectItem, QGraphicsTextItem,
+                             QRubberBand)
 from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSize, pyqtSignal, QPointF
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 
-from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker, overlay_seg_mask
+from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
 
 
 # --- UTILS ---
@@ -157,6 +158,34 @@ def _cv2_to_qpixmap(img):
     return QPixmap.fromImage(qImg)
 
 
+def _overlay_label_segmentation(img, seg, colors=None):
+    """Paint class colors onto labeled pixels only (no alpha blend)."""
+    if colors is None:
+        colors = {
+            1: (0, 0, 255),
+            2: (0, 255, 0),
+            3: (255, 0, 0),
+            4: (0, 255, 255),
+            5: (255, 255, 0),
+            6: (255, 0, 255),
+        }
+    if seg is None:
+        return img
+    if len(seg.shape) == 3 and seg.shape[2] == 4:
+        seg = cv2.cvtColor(seg, cv2.COLOR_BGRA2BGR)
+    if seg.shape[:2] != img.shape[:2]:
+        return img
+    out = img.copy()
+    if len(seg.shape) == 3:
+        labeled = np.any(seg > 0, axis=-1)
+        if np.any(labeled):
+            out[labeled] = seg[labeled]
+        return out
+    for val, color in colors.items():
+        out[seg == val] = color
+    return out
+
+
 # --- MAIN WINDOW CLASS ---
 class ChronoViewWindow(QMainWindow):
     def __init__(self, images, segFiles, bbox, conf, parent=None):
@@ -225,13 +254,6 @@ class ChronoViewWindow(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.next_frame)
 
-        self.colors = {
-            1: (0, 0, 255),
-            2: (0, 255, 0),
-            3: (255, 0, 0),
-            4: (0, 255, 255),
-        }
-
         self.update_display()
 
     def showEvent(self, event):
@@ -262,12 +284,7 @@ class ChronoViewWindow(QMainWindow):
         if self.use_seg and self.segFiles and self.idx < len(self.segFiles):
             seg = cv2.imread(self.segFiles[self.idx], cv2.IMREAD_UNCHANGED)
             if seg is not None:
-                if len(seg.shape) == 3:
-                    if seg.shape[2] == 4:
-                        seg = cv2.cvtColor(seg, cv2.COLOR_BGRA2BGR)
-                    img = cv2.addWeighted(img, 1.0, seg, 0.85, 0)
-                elif len(seg.shape) == 2:
-                    img = overlay_seg_mask(img, seg, self.colors)
+                img = _overlay_label_segmentation(img, seg)
 
         self.pixmap_item.setPixmap(self.cv2_to_qpixmap(img))
         self.lbl_frame.setText(
@@ -420,9 +437,8 @@ class PlantROISelectorWindow(QDialog):
 
         if self.use_seg and self.seg_files and self.idx < len(self.seg_files):
             seg = cv2.imread(self.seg_files[self.idx], cv2.IMREAD_UNCHANGED)
-            if seg is not None and len(seg.shape) == 2:
-                colors = {1: (0, 0, 255), 2: (0, 255, 0), 3: (255, 0, 0), 4: (0, 255, 255)}
-                img = overlay_seg_mask(img, seg, colors)
+            if seg is not None:
+                img = _overlay_label_segmentation(img, seg)
 
         return img
 
@@ -595,11 +611,11 @@ class SeedSelectorWindow(QDialog):
         img = img[y1:y2, x1:x2].copy()
 
         if self.use_seg and self.seg_files and self.idx < len(self.seg_files):
-            seg = cv2.imread(self.seg_files[self.idx], 0)
+            seg = cv2.imread(self.seg_files[self.idx], cv2.IMREAD_UNCHANGED)
             if seg is not None:
-                seg_crop = seg[y1:y2, x1:x2]
-                colors = {1: (0, 0, 255), 2: (0, 255, 0), 3: (255, 0, 0), 4: (0, 255, 255)}
-                img = overlay_seg_mask(img, seg_crop, colors)
+                if len(seg.shape) >= 2:
+                    seg = seg[y1:y2, x1:x2]
+                img = _overlay_label_segmentation(img, seg)
 
         if self.seed_pos is not None:
             draw_seed_marker(img, int(self.seed_pos[0]), int(self.seed_pos[1]))
@@ -651,3 +667,363 @@ class SeedSelectorWindow(QDialog):
     def _confirm(self):
         if self.seed_pos is not None:
             self.accept()
+
+
+ROI_GROUP_COLORS = [
+    QColor(255, 80, 80),
+    QColor(80, 180, 80),
+    QColor(80, 120, 255),
+    QColor(255, 200, 60),
+    QColor(200, 80, 255),
+    QColor(80, 220, 220),
+]
+
+ROI_BOX_PEN_WIDTH = 6
+ROI_PENDING_PEN_WIDTH = 6
+
+
+class GroupROISelectorWindow(QDialog):
+    """Modal ROI selector built on the plant viewer controls."""
+
+    def __init__(self, images, seg_files, group_names, time_delta=15, parent=None):
+        super().__init__(parent)
+        self.images = images
+        self.seg_files = seg_files
+        self.group_names = group_names
+        self.time_delta = time_delta
+        self.confirmed_groups = {}
+        self.current_group_index = 0
+        self.pending_roi = None
+        self.roi_overlays = []
+        self.image_width = 0
+        self.image_height = 0
+
+        self.setWindowTitle("Select Group Regions")
+        self.resize(950, 850)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        layout = QVBoxLayout(self)
+
+        self.lbl_group = QLabel()
+        self.lbl_group.setAlignment(Qt.AlignCenter)
+        self.lbl_group.setStyleSheet("font-size: 14pt; font-weight: bold; color: #003366;")
+        layout.addWidget(self.lbl_group)
+
+        self.lbl_info = QLabel()
+        self.lbl_info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_info)
+
+        self.scene = QGraphicsScene()
+        self.view = ZoomableGraphicsView(enable_roi=True)
+        self.view.setScene(self.scene)
+        self.view.roi_selected.connect(self._on_roi_selected)
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.scene.addItem(self.pixmap_item)
+        layout.addWidget(self.view)
+
+        self.slider = ClickJumpSlider(Qt.Horizontal)
+        self.slider.valueChanged.connect(self._set_frame)
+        layout.addWidget(self.slider)
+
+        nav_layout = QHBoxLayout()
+        self.btn_seg = QPushButton("Toggle Segmentation")
+        self.btn_seg.clicked.connect(self._toggle_seg)
+        nav_layout.addWidget(self.btn_seg)
+        nav_layout.addStretch()
+        layout.addLayout(nav_layout)
+
+        action_layout = QHBoxLayout()
+        self.btn_previous = QPushButton("Previous")
+        self.btn_next = QPushButton("Next")
+        self.btn_confirm = QPushButton("Confirm Selection")
+        self.btn_cancel = QPushButton("Cancel Analysis")
+        self.btn_previous.clicked.connect(self._go_previous)
+        self.btn_next.clicked.connect(self._go_next)
+        self.btn_confirm.clicked.connect(self._confirm_current)
+        self.btn_cancel.clicked.connect(self.reject)
+        for btn in [self.btn_previous, self.btn_next, self.btn_confirm, self.btn_cancel]:
+            action_layout.addWidget(btn)
+        layout.addLayout(action_layout)
+
+        self.use_seg = False
+        self.idx = len(self.images) - 1 if self.images else 0
+        self._update_group_label()
+        self._update_display()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._confirm_current()
+            event.accept()
+            return
+        if key == Qt.Key_Escape:
+            self._clear_pending_overlay()
+            self._update_confirm_button()
+            event.accept()
+            return
+        if key == Qt.Key_Left and self.btn_previous.isEnabled():
+            self._go_previous()
+            event.accept()
+            return
+        if key == Qt.Key_Right and self.btn_next.isEnabled():
+            self._go_next()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def get_group_rois(self):
+        if self.result() == QDialog.Accepted:
+            return self.confirmed_groups
+        return None
+
+    def _all_groups_confirmed(self):
+        return len(self.confirmed_groups) == len(self.group_names)
+
+    def _current_group_name(self):
+        return self.group_names[self.current_group_index]
+
+    def _update_group_label(self):
+        if self.current_group_index >= len(self.group_names):
+            return
+        name = self._current_group_name()
+        pos = f"({self.current_group_index + 1} of {len(self.group_names)})"
+        if name in self.confirmed_groups:
+            self.lbl_group.setText(f"Update ROI for: {name}  {pos}")
+        else:
+            self.lbl_group.setText(f"Select ROI for: {name}  {pos}")
+        self._update_confirm_button()
+        self._update_nav_buttons()
+
+    def _update_confirm_button(self):
+        if self._all_groups_confirmed() and not self.pending_roi:
+            self.btn_confirm.setText("Finish")
+            self.btn_confirm.setEnabled(True)
+        elif self.pending_roi:
+            self.btn_confirm.setText("Confirm Selection")
+            self.btn_confirm.setEnabled(True)
+        else:
+            self.btn_confirm.setText("Confirm Selection")
+            self.btn_confirm.setEnabled(False)
+
+    def _update_nav_buttons(self):
+        self.btn_previous.setEnabled(self.current_group_index > 0)
+        current_name = self._current_group_name()
+        self.btn_next.setEnabled(
+            current_name in self.confirmed_groups
+            and self.current_group_index < len(self.group_names) - 1
+        )
+
+    def _go_previous(self):
+        if self.current_group_index == 0:
+            return
+        self._clear_pending_overlay()
+        self.current_group_index -= 1
+        self._redraw_confirmed_overlays()
+        self._update_group_label()
+        self._refresh_info_line()
+
+    def _go_next(self):
+        current_name = self._current_group_name()
+        if current_name not in self.confirmed_groups:
+            return
+        if self.current_group_index >= len(self.group_names) - 1:
+            return
+        self._clear_pending_overlay()
+        self.current_group_index += 1
+        self._redraw_confirmed_overlays()
+        self._update_group_label()
+        self._refresh_info_line()
+
+    def _set_frame(self, val):
+        if val != self.idx:
+            self._clear_pending_overlay()
+            self._update_confirm_button()
+        self.idx = val
+        self._update_display()
+
+    def _toggle_seg(self):
+        self.use_seg = not self.use_seg
+        self._update_display()
+
+    def _load_current_image(self):
+        if not self.images:
+            return None
+        img = cv2.imread(self.images[self.idx])
+        if img is None:
+            return None
+
+        self.image_height, self.image_width = img.shape[:2]
+
+        if self.use_seg and self.seg_files and self.idx < len(self.seg_files):
+            seg = cv2.imread(self.seg_files[self.idx], cv2.IMREAD_UNCHANGED)
+            if seg is not None:
+                img = _overlay_label_segmentation(img, seg)
+        return img
+
+    def _clear_roi_overlays(self):
+        for overlay in self.roi_overlays:
+            for key in ('rect', 'bg', 'label'):
+                item = overlay.get(key)
+                if item is not None:
+                    self.scene.removeItem(item)
+        self.roi_overlays = []
+
+    def _add_roi_overlay(self, group_name, x1, y1, x2, y2, color):
+        w = x2 - x1
+        h = y2 - y1
+        rect_item = QGraphicsRectItem(QRectF(x1, y1, w, h))
+        rect_item.setPen(QPen(color, ROI_BOX_PEN_WIDTH))
+        self.scene.addItem(rect_item)
+
+        label = QGraphicsTextItem(group_name)
+        font = QFont()
+        font.setBold(True)
+        point_size = min(32, max(24, int(min(w, h) / 6)))
+        font.setPointSize(point_size)
+        label.setFont(font)
+        label.setDefaultTextColor(QColor(255, 255, 255))
+
+        text_rect = label.boundingRect()
+        while text_rect.width() > w * 0.9 and font.pointSize() > 10:
+            font.setPointSize(font.pointSize() - 1)
+            label.setFont(font)
+            text_rect = label.boundingRect()
+
+        tx = x1 + (w - text_rect.width()) / 2
+        ty = y1 + (h - text_rect.height()) / 2
+
+        bg = QGraphicsRectItem(text_rect.adjusted(-4, -2, 4, 2))
+        bg.setBrush(QBrush(QColor(0, 0, 0, 160)))
+        bg.setPen(QPen(Qt.NoPen))
+        bg.setPos(tx - 4, ty - 2)
+        label.setPos(tx, ty)
+
+        self.scene.addItem(bg)
+        self.scene.addItem(label)
+
+        return {'rect': rect_item, 'bg': bg, 'label': label}
+
+    def _redraw_confirmed_overlays(self):
+        self._clear_roi_overlays()
+        for idx, group_name in enumerate(self.group_names):
+            if group_name not in self.confirmed_groups:
+                continue
+            x1, y1, x2, y2 = self.confirmed_groups[group_name]
+            color = ROI_GROUP_COLORS[idx % len(ROI_GROUP_COLORS)]
+            self.roi_overlays.append(
+                self._add_roi_overlay(group_name, x1, y1, x2, y2, color)
+            )
+
+    def _frame_info_suffix(self):
+        if self.pending_roi:
+            return "Press Enter or Confirm to apply this selection."
+        if self._all_groups_confirmed():
+            return "All regions set — press Enter or Finish to complete"
+        if self._current_group_name() in self.confirmed_groups:
+            return (
+                "Region already set — draw a new rectangle to update it, "
+                "or press Next to continue."
+            )
+        return "Drag a rectangle on the image. Use the slider to change frame. Press Enter to confirm."
+
+    def _refresh_info_line(self):
+        if not self.images:
+            return
+        minutes = (self.idx * self.time_delta) % 60
+        hours = int((self.idx * self.time_delta / 60) % 24)
+        days = int(self.idx * self.time_delta // 1440)
+        self.lbl_info.setText(
+            f"Frame {self.idx + 1}/{len(self.images)}  |  "
+            f"Day {days}  Time {hours:02d}:{int(minutes):02d}  |  "
+            f"{self._frame_info_suffix()}"
+        )
+
+    def _update_display(self):
+        if not self.images:
+            self.lbl_info.setText("No images available")
+            return
+
+        img = self._load_current_image()
+        if img is None:
+            self.lbl_info.setText("Failed to load frame")
+            return
+
+        pixmap = _cv2_to_qpixmap(img)
+        self.pixmap_item.setPixmap(pixmap)
+        self.scene.setSceneRect(QRectF(pixmap.rect()))
+
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, len(self.images) - 1)
+        self.slider.setValue(self.idx)
+        self.slider.blockSignals(False)
+
+        self._redraw_confirmed_overlays()
+        self._refresh_info_line()
+        self._update_nav_buttons()
+        QTimer.singleShot(0, self._fit_image)
+
+    def _fit_image(self):
+        if self.pixmap_item.pixmap():
+            self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+
+    def _clear_pending_overlay(self):
+        if self.pending_roi is None:
+            return
+        if isinstance(self.pending_roi, tuple):
+            _, rect_item = self.pending_roi
+            self.scene.removeItem(rect_item)
+        elif isinstance(self.pending_roi, QGraphicsRectItem):
+            self.scene.removeItem(self.pending_roi)
+        self.pending_roi = None
+
+    def _on_roi_selected(self, scene_rect):
+        self._clear_pending_overlay()
+        if scene_rect.width() < 1 or scene_rect.height() < 1:
+            return
+
+        pen = QPen(QColor(255, 255, 255))
+        pen.setWidth(ROI_PENDING_PEN_WIDTH)
+        rect_item = QGraphicsRectItem(scene_rect)
+        rect_item.setPen(pen)
+        self.scene.addItem(rect_item)
+        self.pending_roi = (scene_rect, rect_item)
+        self._update_confirm_button()
+        self._refresh_info_line()
+
+    def _confirm_current(self):
+        if self._all_groups_confirmed() and not self.pending_roi:
+            self.accept()
+            return
+        if not self.pending_roi:
+            return
+
+        scene_rect, rect_item = self.pending_roi
+        x1 = int(max(0, min(scene_rect.left(), self.image_width - 1)))
+        y1 = int(max(0, min(scene_rect.top(), self.image_height - 1)))
+        x2 = int(max(0, min(scene_rect.right(), self.image_width)))
+        y2 = int(max(0, min(scene_rect.bottom(), self.image_height)))
+        if x2 <= x1 or y2 <= y1:
+            self.lbl_info.setText("Invalid selection. Please draw a larger rectangle.")
+            return
+
+        group_name = self._current_group_name()
+        is_update = group_name in self.confirmed_groups
+        self.confirmed_groups[group_name] = (x1, y1, x2, y2)
+
+        self.scene.removeItem(rect_item)
+        self.pending_roi = None
+
+        self._redraw_confirmed_overlays()
+
+        if is_update:
+            self._update_group_label()
+            self._refresh_info_line()
+            return
+
+        if self._all_groups_confirmed():
+            self.accept()
+            return
+
+        self.current_group_index += 1
+        self._update_group_label()
+        self._refresh_info_line()

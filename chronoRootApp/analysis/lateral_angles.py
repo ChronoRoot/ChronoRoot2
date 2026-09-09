@@ -43,6 +43,7 @@ from .time_windows import (
     resolved_time_groups,
     snapshot_hours as conf_snapshot_hours,
 )
+from .plot_time_axis import draw_snapshot_day_axis
 from .utils.report_paths import (
     MODULE_ANGLES,
     angle_overlays_dir,
@@ -503,16 +504,22 @@ def getFirstLateralRoots(conf, df):
     its tip angle over a 72-hour window. Data is synchronized so that
     time=0 corresponds to first LR emergence for each plant.
     """
-    plants = df['Plant_id'].unique()
+    columns = ['Time', 'First LR tip', 'Experiment', 'Plant_id', 'Real']
+    empty = pd.DataFrame(columns=columns)
+    output_path = data_file(conf, 'Synchronized_FirstLR.csv')
+    if df is None or df.empty or 'First LR tip' not in df.columns or 'Plant_id' not in df.columns:
+        empty.to_csv(output_path, index=False)
+        return empty
+
     df = df.copy()
     df['Real'] = 1
+    plant_key = df['Plant_id'].astype(str)
 
     max_hours = 72
-    track_cols = ['First LR tip', 'Experiment', 'Plant_id', 'Real']
-    synchronized_data = pd.DataFrame(columns=['Time', 'First LR tip', 'Experiment', 'Plant_id', 'Real'])
+    synchronized_data = empty.copy()
 
-    for plant in plants:
-        plant_data = df[df['Plant_id'] == str(plant)].copy()
+    for plant in df['Plant_id'].unique():
+        plant_data = df.loc[plant_key == str(plant)].copy()
         plant_data = plant_data.loc[plant_data['First LR tip'] > 0]
         num_rows = plant_data.shape[0]
 
@@ -528,10 +535,12 @@ def getFirstLateralRoots(conf, df):
 
             plant_data = plant_data.reset_index(drop=True)
             plant_data['Time'] = plant_data.index
-            plant_data = plant_data[track_cols]
+            if 'Experiment' not in plant_data.columns:
+                plant_data['Experiment'] = ''
+            plant_data = plant_data[columns]
             synchronized_data = pd.concat([synchronized_data, plant_data], ignore_index=True)
 
-    synchronized_data.to_csv(data_file(conf, 'Synchronized_FirstLR.csv'), index=False)
+    synchronized_data.to_csv(output_path, index=False)
     return synchronized_data
 
 
@@ -650,17 +659,17 @@ def makeLateralAnglesPlots(conf):
             geno_palette = genotype_palette_for_data(frame)
             geno_label = get_genotype_axis_label(conf)
 
-            plt.figure(figsize=(8, 9), dpi=200)
-
-            ax = plt.subplots()
-
-            sns.violinplot(x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
-                          hue='Experiment', inner=None, zorder=2, legend=False,
-                          palette=geno_palette)
-            ax = sns.swarmplot(x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
-                              hue='Experiment', dodge=True, size=4,
-                              palette=geno_palette, edgecolor='black',
-                              linewidth=0.5, zorder=1, s=2)
+            fig, ax = plt.subplots(figsize=(8, 9), dpi=200, constrained_layout=True)
+            sns.violinplot(
+                x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
+                hue='Experiment', inner=None, zorder=1, legend=False,
+                palette=geno_palette, ax=ax,
+            )
+            sns.swarmplot(
+                x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
+                hue='Experiment', dodge=True, size=4, palette=geno_palette,
+                edgecolor='black', linewidth=0.5, zorder=3, ax=ax,
+            )
             ax.set_ylim(-20, 120)
             
             # Fix legend to only show experiments once
@@ -668,6 +677,7 @@ def makeLateralAnglesPlots(conf):
             ax.legend(handles[0:n_exp], labels[0:n_exp], loc=4, title=geno_label)
 
             ax.set_title('Mean emergence angle — by genotype')
+            draw_snapshot_day_axis(ax)
 
             plt.savefig(plot_file(conf, MODULE_ANGLES, emergence_slug, f'{emergence_slug}_violin.png'),
                        dpi=300, bbox_inches='tight')

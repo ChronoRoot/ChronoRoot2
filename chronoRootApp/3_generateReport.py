@@ -148,13 +148,9 @@ if __name__ == "__main__":
                     plot_filename = f"{exp_dir_name}_{plant_id}.png"
                     iplot_cache = os.path.join(res_folder, plot_filename)
                     report_dest = os.path.join(iplots_exp_folder, plot_filename)
-
-                    if not os.path.exists(iplot_cache):
-                        plot_individual_plant(iplots_exp_folder, data, plot_filename)
-                        if os.path.exists(report_dest):
-                            shutil.copy(report_dest, iplot_cache)
-                    else:
-                        shutil.copy(iplot_cache, report_dest)
+                    plot_individual_plant(iplots_exp_folder, data, plot_filename, conf)
+                    if os.path.exists(report_dest):
+                        shutil.copy(report_dest, iplot_cache)
 
     all_data = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     if not all_data.empty:

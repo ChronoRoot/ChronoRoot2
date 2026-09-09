@@ -523,7 +523,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.duration_edit.setRange(1, 24 * 60)
         self.duration_edit.setValue(40)
         self.duration_edit.setSuffix(" h")
-        self.show_ticks_check = QtWidgets.QCheckBox("Show clock times on figures")
+        self.show_ticks_check = QtWidgets.QCheckBox("Mark clock times on figures (dashed lines)")
         self.show_ticks_check.setChecked(True)
         self.ticks_edit = QtWidgets.QLineEdit("00:00")
         self.ticks_edit.setPlaceholderText("HH:MM")

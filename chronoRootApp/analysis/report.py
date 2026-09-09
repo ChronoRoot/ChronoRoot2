@@ -49,8 +49,14 @@ from .stats_utils import (
     ensure_factor_columns,
     iter_replica_runs,
 )
-from .report_plots import emit_temporal_comparison_plots, relative_title, subplot_grid
-from .time_windows import draw_clock_ticks, elapsed_hour_windows
+from .report_plots import (
+    aggregate_count_lines,
+    emit_temporal_comparison_plots,
+    relative_title,
+    subplot_grid,
+)
+from .plot_time_axis import decorate_elapsed_time_axis, decorate_elapsed_time_axes
+from .time_windows import elapsed_hour_windows
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 
 
@@ -97,12 +103,16 @@ def _include_lateral_root_plots(conf):
     return conf.get('includeLateralRootPlots', True)
 
 
-def _add_day_axis(ax, dataframe, day_tick_size=12, conf=None):
-    return draw_clock_ticks(ax, dataframe, conf, twin_axis=True)
+def _add_day_axis(ax, dataframe, day_tick_size=12, conf=None, *, annotate=True):
+    return decorate_elapsed_time_axis(
+        ax, dataframe, conf, day_axis=True, annotate=annotate,
+        day_tick_size=day_tick_size,
+    )
 
 
 def plot_individual_plant(savepath, dataframe, name, conf=None):
     plt.ioff()
+    os.makedirs(savepath, exist_ok=True)
     
     # Define font sizes for consistency across subplots
     LABEL_SIZE = 18
@@ -114,9 +124,14 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
     include_laterals = _include_lateral_root_plots(conf)
 
     if include_laterals:
-        fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(9, 10), dpi=150, sharex=True)
+        fig, (ax1, ax2) = plt.subplots(
+            nrows=2, ncols=1, figsize=(9, 10), dpi=150, sharex=True,
+            constrained_layout=True,
+        )
     else:
-        fig, ax1 = plt.subplots(nrows=1, ncols=1, figsize=(9, 6), dpi=150)
+        fig, ax1 = plt.subplots(
+            nrows=1, ncols=1, figsize=(9, 6), dpi=150, constrained_layout=True,
+        )
         ax2 = None
 
     dataframe.plot(x='ElapsedTime (h)', y='MainRootLength (mm)', ax=ax1, color='g', label='Main Root Length')
@@ -124,7 +139,7 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
         dataframe.plot(x='ElapsedTime (h)', y='LateralRootsLength (mm)', ax=ax1, color='b', label='Lateral Roots Length')
     dataframe.plot(x='ElapsedTime (h)', y='HypocotylLength (mm)', ax=ax1, color='r', label='Hypocotyl Length')
     
-    ax1.set_title('%s' % convertFromPathSafe(name), pad=40, fontsize=TITLE_SIZE)
+    ax1.set_title('%s' % convertFromPathSafe(name), fontsize=TITLE_SIZE)
     ax1.set_ylabel('Length (mm)', fontsize=LABEL_SIZE)
     ax1.tick_params(axis='y', which='major', labelsize=TICK_SIZE)
     ax1.legend(fontsize=LEGEND_SIZE, loc='upper left')
@@ -138,9 +153,11 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
     else:
         ax1.set_xlabel('Elapsed Time (h)', fontsize=LABEL_SIZE)
 
-    _add_day_axis(ax1, dataframe, DAY_TICK_SIZE, conf=conf)
-
-    plt.tight_layout()
+    _add_day_axis(ax1, dataframe, DAY_TICK_SIZE, conf=conf, annotate=(ax2 is None))
+    if ax2 is not None:
+        decorate_elapsed_time_axis(
+            ax2, dataframe, conf, day_axis=False, annotate=True,
+        )
 
     fig.savefig(os.path.join(savepath, name), dpi=150, bbox_inches='tight')
         
@@ -351,7 +368,6 @@ def plot_info_all(conf, dataframe):
             x='ElapsedTime (h)', y=y_col, data=plot_df, hue='Experiment',
             errorbar='se', ax=ax, palette=geno_palette,
         )
-        draw_clock_ticks(ax, plot_df, conf, twin_axis=False)
         ax.set_title(title, fontsize=16)
         ax.legend(loc='best', title=geno_label)
 
@@ -365,6 +381,7 @@ def plot_info_all(conf, dataframe):
         _plot_metric(ax, col, relative_title(title, conf))
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
         ax.set_ylabel(_overview_ylabel(col), fontsize=12)
+    decorate_elapsed_time_axes(axes, dataframe, conf)
 
     plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_subplots.png'), dpi=300, bbox_inches='tight')
 
@@ -376,17 +393,16 @@ def plot_info_all(conf, dataframe):
     gs_n = fig_n.add_gridspec(nrows, ncols)
     axes_n = [fig_n.add_subplot(gs_n[i // ncols, i % ncols]) for i in range(n)]
     for ax, (col, title) in zip(axes_n, metrics):
-        n_df = dataframe.copy()
-        n_df['_n'] = n_df[col].notna().astype(int)
+        n_df = aggregate_count_lines(dataframe, 'ElapsedTime (h)', 'Experiment', col)
         sns.lineplot(
             x='ElapsedTime (h)', y='_n', data=n_df, hue='Experiment',
-            errorbar=None, estimator='sum', ax=ax, palette=geno_palette,
+            errorbar=None, ax=ax, palette=geno_palette,
         )
-        draw_clock_ticks(ax, n_df, conf, twin_axis=False)
         ax.set_title(relative_title(title, conf), fontsize=16)
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
         ax.set_ylabel('Number of plants', fontsize=12)
         ax.legend(loc='best', title=geno_label)
+    decorate_elapsed_time_axes(axes_n, dataframe, conf)
     plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_n.png'), dpi=300, bbox_inches='tight')
 
     plt.cla()

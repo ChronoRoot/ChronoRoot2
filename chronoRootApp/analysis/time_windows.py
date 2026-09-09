@@ -699,28 +699,43 @@ def clock_tick_label(data, elapsed_hour):
     return ts.strftime('%H:%M')
 
 
-def draw_clock_ticks(ax, data, conf, *, twin_axis=True):
-    """Draw axvline markers (and optional top labels) at real-clock ticks."""
-    ticks = elapsed_clock_ticks(data, conf)
-    if not ticks:
-        return ticks
-    for hour in ticks:
-        ax.axvline(hour, color='0.55', linestyle='--', linewidth=0.9, zorder=0)
-    if twin_axis:
-        ax2 = ax.twiny()
-        ax2.set_xlim(ax.get_xlim())
-        ax2.set_xticks(ticks)
-        ax2.set_xticklabels(
-            [clock_tick_label(data, hour) for hour in ticks],
-            rotation=45, ha='left', fontsize=9,
-        )
-        ax2.tick_params(axis='x', which='major', length=6, width=1, color='black')
-    return ticks
+def day_ticks_for_limits(x_min, x_max):
+    """Day N at N * 24 h. Skip Day 0 (same as the original report guide)."""
+    if x_min is None or x_max is None:
+        return [], []
+    try:
+        x_min = float(x_min)
+        x_max = float(x_max)
+    except (TypeError, ValueError):
+        return [], []
+    if not np.isfinite(x_min) or not np.isfinite(x_max):
+        return [], []
+    if x_max < x_min:
+        x_min, x_max = x_max, x_min
+    first = int(np.ceil(x_min / 24.0))
+    last = int(np.floor(x_max / 24.0))
+    ticks = []
+    labels = []
+    for day in range(first, last + 1):
+        if day == 0:
+            continue
+        ticks.append(day * 24)
+        labels.append(f'Day {day}')
+    return ticks, labels
 
 
-def draw_clock_ticks_on_axes(axes, data, conf):
-    for ax in axes:
-        draw_clock_ticks(ax, data, conf, twin_axis=True)
+def format_days_elapsed(hours):
+    """Compact hour/24 label: 24 -> '1', 36 -> '1.5'."""
+    try:
+        days = float(hours) / 24.0
+    except (TypeError, ValueError):
+        return ''
+    if not np.isfinite(days):
+        return ''
+    rounded = round(days)
+    if abs(days - rounded) < 1e-9:
+        return str(int(rounded))
+    return f'{days:.2f}'.rstrip('0').rstrip('.')
 
 
 def hourly_files_exist(main_folder):

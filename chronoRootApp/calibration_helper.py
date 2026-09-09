@@ -185,9 +185,12 @@ class ZoomableImage(QLabel):
 
 
 class CalibrationHelper(QMainWindow):
+    distance_measured = pyqtSignal(int)
+
     def __init__(self, video_dir):
         super().__init__()
-        self.video_dir = video_dir
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.video_dir = os.path.abspath(video_dir)
         self.initUI()
         self.load_first_frame()
         
@@ -228,7 +231,25 @@ class CalibrationHelper(QMainWindow):
         layout.addLayout(button_layout)
         
         self.statusBar().showMessage('Select two points to measure distance')
-        
+
+    def _pixel_distance(self):
+        points = self.frame_widget.points
+        if len(points) != 2:
+            return None
+        return float(np.sqrt((points[1][0] - points[0][0])**2 +
+                             (points[1][1] - points[0][1])**2))
+
+    def _rounded_pixels(self):
+        distance = self._pixel_distance()
+        if distance is None:
+            return 0
+        return max(1, int(round(distance)))
+
+    def _emit_distance(self):
+        pixels = self._rounded_pixels()
+        if pixels:
+            self.distance_measured.emit(pixels)
+
     def load_first_frame(self):
         """Load the first frame of the first video in the directory"""
         if not os.path.exists(self.video_dir):
@@ -252,19 +273,18 @@ class CalibrationHelper(QMainWindow):
         if len(points) == 1:
             self.statusBar().showMessage(f'First point selected at {point}')
         elif len(points) == 2:
-            distance = np.sqrt((points[1][0] - points[0][0])**2 + 
-                             (points[1][1] - points[0][1])**2)
+            distance = self._pixel_distance()
             self.statusBar().showMessage(
                 f'Distance: {distance:.1f} pixels | Point 1: {points[0]} | Point 2: {points[1]}'
             )
-            
+            self._emit_distance()
+
     def copy_distance(self):
-        points = self.frame_widget.points
-        if len(points) == 2:
-            distance = np.sqrt((points[1][0] - points[0][0])**2 + 
-                             (points[1][1] - points[0][1])**2)
-            QApplication.clipboard().setText(f"{distance:.1f}")
-            self.statusBar().showMessage(f'Distance {distance:.1f} pixels copied to clipboard')
+        pixels = self._rounded_pixels()
+        if pixels:
+            QApplication.clipboard().setText(str(pixels))
+            self.statusBar().showMessage(f'Distance {pixels} pixels copied to clipboard')
+            self._emit_distance()
         else:
             self.statusBar().showMessage('Please select two points first')
 

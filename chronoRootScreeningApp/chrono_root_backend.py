@@ -11,8 +11,8 @@ SCREENING_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CHRONOROOT_APP_DIR = os.path.abspath(
     os.path.join(SCREENING_APP_DIR, '..', 'chronoRootApp')
 )
-# Screening must stay first so plant_viewer / qr / calibration_helper
-# resolve here, not to the same names under chronoRootApp.
+# Screening stays first for screening-only modules (sort, robot_ids, ui_errors).
+# plant_viewer, calibration_helper, and analysis.qr come from chronoRootApp.
 for _path in (SCREENING_APP_DIR, CHRONOROOT_APP_DIR):
     if _path in sys.path:
         sys.path.remove(_path)
