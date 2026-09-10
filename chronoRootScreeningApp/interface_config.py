@@ -54,7 +54,11 @@ def _looks_like_group_rois(data: Any) -> bool:
 
 
 def _looks_like_metadata(data: Any) -> bool:
-    return isinstance(data, dict) and 'status' in data and 'start_time' in data
+    if not isinstance(data, dict):
+        return False
+    if data.get('kind') == 'screening_job':
+        return True
+    return 'status' in data and 'start_time' in data
 
 
 def validate_setup_config(data: Any, path: str) -> Tuple[bool, str]:
@@ -105,12 +109,12 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         'analysis_id': analysis_tab.identifier_edit.text().strip(),
         'PlateCondition': analysis_tab.plateConditionName.text(),
         'ExtraVariable': analysis_tab.extraField.text(),
-        'time_delta': analysis_tab.time_delta_edit.text(),
+        'timeStep': analysis_tab.time_delta_edit.text(),
         'add_time': analysis_tab.add_time_edit.text(),
         'germination_time_cut': analysis_tab.germination_time_edit.text(),
-        'has_qr': analysis_tab.qr_checkbox.isChecked(),
-        'known_distance': analysis_tab.known_dist_edit.text(),
-        'pixel_distance': analysis_tab.pixel_dist_edit.text(),
+        'videoHasQR': analysis_tab.qr_checkbox.isChecked(),
+        'knownDistance': analysis_tab.known_dist_edit.text(),
+        'pixelDistance': analysis_tab.pixel_dist_edit.text(),
         'germination_analysis': analysis_tab.germination_checkbox.isChecked(),
         'plant_growth_analysis': analysis_tab.plant_growth_checkbox.isChecked(),
         'show_tracking': analysis_tab.show_tracking_checkbox.isChecked(),
@@ -220,16 +224,21 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
             analysis_tab.plateConditionName.setText(str(plate or ''))
             analysis_tab.extraField.setText(str(extra or ''))
 
-        for widget, key, default in (
-            (analysis_tab.time_delta_edit, 'time_delta', ''),
-            (analysis_tab.add_time_edit, 'add_time', ''),
-            (analysis_tab.known_dist_edit, 'known_distance', ''),
-            (analysis_tab.pixel_dist_edit, 'pixel_distance', ''),
-            (analysis_tab.fpca_components_edit, 'fpca_components', '2'),
+        for widget, keys, default in (
+            (analysis_tab.time_delta_edit, ('timeStep', 'time_delta'), ''),
+            (analysis_tab.add_time_edit, ('add_time',), ''),
+            (analysis_tab.known_dist_edit, ('knownDistance', 'known_distance'), ''),
+            (analysis_tab.pixel_dist_edit, ('pixelDistance', 'pixel_distance'), ''),
+            (analysis_tab.fpca_components_edit, ('fpca_components',), '2'),
         ):
-            if key in data and data[key] is not None:
-                widget.setText(str(data[key]))
-            elif key not in data and default:
+            value = None
+            for key in keys:
+                if key in data and data[key] is not None:
+                    value = data[key]
+                    break
+            if value is not None:
+                widget.setText(str(value))
+            elif keys[0] not in data and default:
                 widget.setText(str(default))
 
         if 'germination_time_cut' in data or 'germination_time' in data:
@@ -237,7 +246,7 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
             if germ_time is not None:
                 analysis_tab.germination_time_edit.setText(str(germ_time))
 
-        _set_checkbox_from_keys(analysis_tab.qr_checkbox, data, ('has_qr',))
+        _set_checkbox_from_keys(analysis_tab.qr_checkbox, data, ('videoHasQR', 'has_qr'))
         _set_checkbox_from_keys(analysis_tab.germination_checkbox, data, ('germination_analysis', 'do_germination'))
         _set_checkbox_from_keys(analysis_tab.plant_growth_checkbox, data, ('plant_growth_analysis', 'do_plant_growth'))
         _set_checkbox_from_keys(analysis_tab.show_tracking_checkbox, data, ('show_tracking',))

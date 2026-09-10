@@ -1,7 +1,6 @@
 """Turn screening tracking tables into chronoRootApp plant files via dataWork."""
 
 import os
-import json
 import re
 from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -19,6 +18,9 @@ from chrono_root_backend import (
     normalize_factor_value,
     plot_individual_plant,
     apply_time_windows,
+    SOURCE_SCREENING,
+    build_plant_record,
+    dump_json,
 )
 
 MAX_PLANT_WORKERS = 4
@@ -75,22 +77,24 @@ def _write_results_raw(plant_rows, result_dir):
     return raw_path
 
 
-def _write_metadata(plant_rows, result_dir, pixel_size, time_step):
+def _write_metadata(plant_rows, result_dir, pixel_size, time_step, plant_index):
     first = plant_rows.iloc[0]
-    metadata = {
+    time_value = int(time_step) if float(time_step) == int(float(time_step)) else float(time_step)
+    conf = {
         'Experiment': str(first['Experiment']),
         'PlateCondition': normalize_factor_value(first.get('PlateCondition', '')),
         'ExtraVariable': normalize_factor_value(first.get('ExtraVariable', '')),
         'Plant_id': str(first['Plant_id']),
         'pixel_size': float(pixel_size),
-        'timeStep': int(time_step) if float(time_step) == int(float(time_step)) else float(time_step),
+        'timeStep': time_value,
         'Video': str(first.get('Video', '')),
+        'Images': str(first.get('Images', '') or ''),
         'rpi': str(first.get('rpi', '')),
         'cam': str(first.get('cam', '')),
+        'plant': plant_index,
     }
-    path = os.path.join(result_dir, 'metadata.json')
-    with open(path, 'w') as handle:
-        json.dump(metadata, handle, indent=4)
+    metadata = build_plant_record(conf, source=SOURCE_SCREENING)
+    dump_json(os.path.join(result_dir, 'metadata.json'), metadata)
     return metadata
 
 
@@ -328,7 +332,7 @@ def postprocess_tracking(merged_seeds, conf):
         os.makedirs(result_dir, exist_ok=True)
 
         raw_path = _write_results_raw(plant_rows, result_dir)
-        metadata = _write_metadata(plant_rows, result_dir, pixel_size, time_step)
+        metadata = _write_metadata(plant_rows, result_dir, pixel_size, time_step, plant_index)
 
         jobs.append({
             'result_dir': result_dir,

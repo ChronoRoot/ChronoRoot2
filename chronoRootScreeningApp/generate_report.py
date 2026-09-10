@@ -28,6 +28,8 @@ from chrono_root_backend import (
     purge_disabled_comparison_outputs,
     report_root,
     temporal_metric_slug,
+    apply_load_aliases,
+    video_image_dir,
 )
 from analysis.time_windows import (
     analysis_period_is_current,
@@ -156,8 +158,8 @@ def merge_analysis_files(project_dir, name_mapping_file=None):
             if os.path.exists(tracking_meta_path):
                 try:
                     with open(tracking_meta_path, 'r') as handle:
-                        tracking_meta = json.load(handle)
-                    video_dir = tracking_meta.get('video_directory') or tracking_meta.get('video_dir') or ''
+                        tracking_meta = apply_load_aliases(json.load(handle))
+                    video_dir = video_image_dir(tracking_meta) or tracking_meta.get('video_dir') or ''
                     if not rpi_val:
                         rpi_val = tracking_meta.get('rpi', '')
                     if not cam_val:
@@ -172,6 +174,7 @@ def merge_analysis_files(project_dir, name_mapping_file=None):
             )
             df['rpi'] = rpi
             df['cam'] = cam
+            df['Images'] = video_dir
             if 'SeedCount' not in df.columns:
                 df['SeedCount'] = 0
             else:
@@ -451,7 +454,7 @@ def main():
     )
     args = parser.parse_args()
 
-    conf = json.load(open(args.config, 'r'))
+    conf = apply_load_aliases(json.load(open(args.config, 'r')))
     if args.postprocess_only:
         combined, all_data = run_postprocess(conf)
         print('Postprocess finished.')

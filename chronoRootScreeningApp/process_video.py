@@ -13,6 +13,13 @@ import sys
 matplotlib.use('Agg')
 import chrono_root_backend  # noqa: F401
 from analysis.qr import qr_detect, get_pixel_size
+from analysis.utils.metadata_schema import (
+    SCREENING_JOB_KIND,
+    apply_load_aliases,
+    dump_json,
+    load_json,
+    video_has_qr,
+)
 from collections import defaultdict
 
 from skimage.morphology import skeletonize
@@ -141,8 +148,7 @@ def record_acquisition_span(analysis_dir, image_files):
     metadata = {}
     if os.path.isfile(metadata_path):
         try:
-            with open(metadata_path, 'r') as handle:
-                metadata = json.load(handle) or {}
+            metadata = load_json(metadata_path) or {}
         except Exception:
             metadata = {}
     metadata['first_image'] = first_image
@@ -151,8 +157,7 @@ def record_acquisition_span(analysis_dir, image_files):
         metadata['first_datetime'] = first_dt.strftime('%Y-%m-%dT%H:%M:%S')
     if last_dt is not None:
         metadata['last_datetime'] = last_dt.strftime('%Y-%m-%dT%H:%M:%S')
-    with open(metadata_path, 'w') as handle:
-        json.dump(metadata, handle, indent=4)
+    dump_json(metadata_path, metadata)
 
 
 def get_group_for_position(x: int, y: int, groups: Dict[str, Tuple[int, int, int, int]]) -> str:
@@ -177,12 +182,13 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
     if start_time:
         # Create new metadata file
         metadata = {
+            'kind': SCREENING_JOB_KIND,
             'analysis_id': params['analysis_id'],
             'group_names': params['group_names'],
             'num_groups': len(params['group_names']),
             'PlateCondition': params.get('PlateCondition', '') or '',
             'ExtraVariable': params.get('ExtraVariable', '') or '',
-            'video_directory': params['video_dir'],
+            'Images': params['video_dir'],
             'segmentation_directory': params['segmentation_dir'],
             'rpi': params.get('rpi', ''),
             'cam': params.get('cam', ''),
@@ -191,9 +197,7 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
             'status': 'In Progress'
         }
     else:
-        # Update existing metadata
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
+        metadata = load_json(metadata_path)
         
         if completion_time:
             metadata['completion_time'] = completion_time
@@ -201,29 +205,27 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
         if error is not None:
             metadata['error'] = error
     
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=4)
+    dump_json(metadata_path, metadata)
 
 
 def mark_analysis_failed(analysis_dir: str, params: Dict[str, Any], error: str) -> None:
     metadata_path = os.path.join(analysis_dir, 'metadata.json')
     if os.path.exists(metadata_path):
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
+        metadata = load_json(metadata_path)
     else:
         metadata = {
+            'kind': SCREENING_JOB_KIND,
             'analysis_id': params.get('analysis_id'),
             'group_names': params.get('group_names', []),
             'num_groups': len(params.get('group_names', [])),
-            'video_directory': params.get('video_dir'),
+            'Images': params.get('video_dir'),
             'segmentation_directory': params.get('segmentation_dir'),
             'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     metadata['completion_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     metadata['status'] = 'Failed'
     metadata['error'] = error
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=4)
+    dump_json(metadata_path, metadata)
 
 
 def load_group_rois(group_rois: Any, group_names: List[str]) -> Dict[str, Tuple[int, int, int, int]]:
@@ -320,13 +322,12 @@ def process_video(params: Dict[str, Any]):
         'seed_counts': params['seed_counts'],
         'PlateCondition': params.get('PlateCondition', '') or '',
         'ExtraVariable': params.get('ExtraVariable', '') or '',
-        'time_delta': params.get('time_delta'),
+        'timeStep': params.get('timeStep', params.get('time_delta')),
         'rpi': params.get('rpi', ''),
         'cam': params.get('cam', ''),
     }
 
-    with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
-        json.dump(group_info, f, indent=4)
+    dump_json(os.path.join(analysis_dir, 'group_info.json'), group_info)
 
     image_files = [f for f in os.listdir(params['video_dir'])
                   if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp'))]
@@ -405,8 +406,7 @@ def process_video(params: Dict[str, Any]):
         print(f"Error in pixel size calculation: {str(e)}, using default value {pixel_size:.6f} mm/pixel")
 
     group_info['pixel_size'] = pixel_size
-    with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
-        json.dump(group_info, f, indent=4)
+    dump_json(os.path.join(analysis_dir, 'group_info.json'), group_info)
 
     seg_subdir = params.get('segmentation_subdir') or 'Ensemble'
 
@@ -669,12 +669,11 @@ def attach_rpi_cam(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_params_from_config(config_path: str) -> Dict[str, Any]:
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    config = apply_load_aliases(load_json(config_path))
 
     required = [
         'video_dir', 'segmentation_dir', 'project_dir', 'analysis_id',
-        'group_names', 'seed_counts', 'time_delta', 'has_qr', 'show_tracking'
+        'group_names', 'seed_counts', 'timeStep', 'show_tracking'
     ]
     missing = [key for key in required if key not in config]
     if missing:
@@ -685,8 +684,9 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
         'segmentation_dir': config['segmentation_dir'],
         'project_dir': config['project_dir'],
         'analysis_id': config['analysis_id'],
-        'time_delta': config['time_delta'],
-        'has_qr': bool(config['has_qr']),
+        'time_delta': config['timeStep'],
+        'timeStep': config['timeStep'],
+        'has_qr': video_has_qr(config),
         'show_tracking': bool(config['show_tracking']),
         'group_names': config['group_names'],
         'seed_counts': config['seed_counts'],
@@ -704,10 +704,12 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
     elif params['has_qr']:
         pass
     else:
-        if config.get('known_distance') is None or config.get('pixel_distance') is None:
-            raise ValueError("Manual calibration requires known_distance and pixel_distance in config")
-        params['known_distance'] = float(config['known_distance'])
-        params['pixel_distance'] = int(config['pixel_distance'])
+        if config.get('knownDistance') in (None, '') or config.get('pixelDistance') is None:
+            raise ValueError("Manual calibration requires knownDistance and pixelDistance in config")
+        params['known_distance'] = float(config['knownDistance'])
+        params['pixel_distance'] = int(config['pixelDistance'])
+        params['knownDistance'] = params['known_distance']
+        params['pixelDistance'] = params['pixel_distance']
 
     if 'group_rois' in config and config['group_rois']:
         params['group_rois'] = config['group_rois']

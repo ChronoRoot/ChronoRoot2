@@ -32,6 +32,17 @@ from analysis.utils.fileUtilities import (
     plant_slot_has_finished_analysis,
     processing_limit_frame_count,
 )
+from analysis.utils.metadata_schema import (
+    SOURCE_SINGLE_PLANT,
+    apply_load_aliases,
+    build_plant_record,
+    dump_json,
+    get_bounding_box,
+    hydrate_run_config,
+    load_json,
+    pending_analysis_path,
+    video_image_dir,
+)
 from analysis.utils.report_utils import natural_key as natural_keys
 from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
 from gui import pipeline_runner
@@ -715,9 +726,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if not os.path.exists(os.path.join(self.selected_plant, "log.txt")):
             return None, None, None, None
         
-        metadata = json.load(open(os.path.join(self.selected_plant, "metadata.json"), 'r'))
-        bbox = metadata["bounding box"]
-        overlayPath = metadata["folders"]["images"] + "/SegMulti/"
+        metadata = load_result_metadata(self.selected_plant)
+        bbox = get_bounding_box(metadata)
+        overlayPath = os.path.join(self.selected_plant, "Images", "SegMulti")
         
         experiment = self.selected_plant.split(os.path.sep)[-5]
         rpi = self.selected_plant.split(os.path.sep)[-4]
@@ -740,7 +751,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return "Image not found", image2_path, overlayPath, None
         
         overlay = image_files[-1]
-        image1_path = metadata["ImagePath"] + '/' + overlay.split(os.path.sep)[-1]
+        image1_path = os.path.join(video_image_dir(metadata), overlay.split(os.path.sep)[-1])
 
         return image1_path, image2_path, overlay, bbox
 
@@ -944,9 +955,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         config_path = os.path.join(self.projectField.text(), PROJECT_CONFIG_NAME)
         try:
-            with open(config_path, 'r') as f:
-                conf = json.load(f)
-            conf['Experiment'] = conf.get('plantIdentifier', conf.get('Experiment', ''))
+            conf = apply_load_aliases(load_json(config_path))
+            conf['Experiment'] = conf.get('Experiment', '')
             conf['MainFolder'] = self.projectField.text()
             conf['rpi'] = self.rpiField.text()
             conf['cam'] = self.cameraField.text()
@@ -994,14 +1004,16 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if seed is None:
             return
 
-        with open(config_path, 'r') as f:
-            conf = json.load(f)
-        conf['bounding box'] = bbox
+        try:
+            conf = apply_load_aliases(load_json(config_path))
+        except (OSError, json.JSONDecodeError):
+            conf = {}
+        conf['MainFolder'] = self.projectField.text()
+        conf['bounding_box'] = bbox
         conf['seed'] = seed
-        with open(config_path, 'w') as f:
-            json.dump(conf, f)
+        dump_json(pending_analysis_path(self.projectField.text()), conf)
 
-        pipeline_runner.run_analysis(self.projectField.text())
+        pipeline_runner.run_pending_analysis(self.projectField.text())
         
     def redoAnalysis(self):
         select_roi_and_seed = self._import_roi_selection()
@@ -1014,18 +1026,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         try:
-            with open(metadata_path, 'r') as f:
-                conf = json.load(f)
+            conf = hydrate_run_config(load_json(metadata_path), metadata_path)
         except (OSError, json.JSONDecodeError) as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load metadata:\n{e}')
             return
 
         own_previous_roi = None
-        old_bbox = conf.get('bounding box')
+        old_bbox = get_bounding_box(conf)
         if old_bbox and len(old_bbox) == 4:
             y1, y2, x1, x2 = old_bbox
             own_previous_roi = (x1, y1, x2, y2)
 
+        conf.pop('bounding_box', None)
         conf.pop('bounding box', None)
         conf.pop('seed', None)
 
@@ -1041,10 +1053,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if seed is None:
             return
 
-        conf['bounding box'] = bbox
+        conf['bounding_box'] = bbox
         conf['seed'] = seed
-        with open(metadata_path, 'w') as f:
-            json.dump(conf, f)
+        dump_json(metadata_path, build_plant_record(conf, source=SOURCE_SINGLE_PLANT))
 
         pipeline_runner.run_analysis_config(metadata_path)
 
@@ -1096,8 +1107,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         # 3. Load Config
         config_path = os.path.join(self.projectField.text(), "project_config.json")
         try:
-            with open(config_path, 'r') as f:
-                conf = json.load(f)
+            conf = apply_load_aliases(load_json(config_path))
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load config:\n{e}')
             return
@@ -1191,6 +1201,14 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.reportProcessingLimitField.setText(processingLimit)
         elif self.central_widget.sender() == self.reportProcessingLimitField:
             self.processingLimitField.setText(processingLimit2)
+
+    def syncEmergenceDistanceField(self):
+        analysis_value = self.analysisEmergenceDistanceField.text()
+        report_value = self.reportEmergenceDistanceField.text()
+        if self.central_widget.sender() == self.analysisEmergenceDistanceField:
+            self.reportEmergenceDistanceField.setText(analysis_value)
+        elif self.central_widget.sender() == self.reportEmergenceDistanceField:
+            self.analysisEmergenceDistanceField.setText(report_value)
                     
     def setupUi(self, chrono_root_analysis):
         chrono_root_analysis.setObjectName("ChronoRootAnalysis")
@@ -1461,6 +1479,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.analysisEmergenceDistanceField = QtWidgets.QLineEdit(self.tab1)
         self.analysisEmergenceDistanceField.setGeometry(QtCore.QRect(190, 560, 51, 31))
         self.analysisEmergenceDistanceField.setObjectName("analysisEmergenceDistanceField")
+        self.analysisEmergenceDistanceField.textChanged.connect(self.syncEmergenceDistanceField)
 
         self.emergenceDistanceExp = QtWidgets.QLabel(self.tab1)
         self.emergenceDistanceExp.setGeometry(QtCore.QRect(260, 560, 261, 31))
@@ -1908,6 +1927,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportEmergenceDistanceField = QtWidgets.QLineEdit(self.tab4)
         self.reportEmergenceDistanceField.setGeometry(QtCore.QRect(510, 285, 51, 31))
         self.reportEmergenceDistanceField.setObjectName("emergenceDistanceField")
+        self.reportEmergenceDistanceField.textChanged.connect(self.syncEmergenceDistanceField)
 
         self.reportEmergenceDistanceHintLabel = QtWidgets.QLabel(self.tab4)
         self.reportEmergenceDistanceHintLabel.setGeometry(QtCore.QRect(570, 285, 261, 31))

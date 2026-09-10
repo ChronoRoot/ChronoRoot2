@@ -1,1 +1,8 @@
-{"processingLimitField": 12, "processingLimitField_3": 12, "captureIntervalField": 15, "saveImagesButton": false, "videoHasQRbutton": true, "knownDistance": "", "pixelDistance": ""}
+{
+    "processingLimit": 12,
+    "timeStep": 15,
+    "saveImages": false,
+    "videoHasQR": true,
+    "knownDistance": "",
+    "pixelDistance": ""
+}

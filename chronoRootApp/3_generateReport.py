@@ -6,8 +6,8 @@ Copyright (C) 2020 Nicolás Gaggion
 import shutil
 import pandas as pd
 import os
-import json
 import argparse
+from analysis.utils.metadata_schema import apply_load_aliases, load_json
 
 from analysis.utils import report_utils as utils
 from analysis import convex_hull
@@ -52,16 +52,7 @@ from analysis.utils.report_paths import (
 
 def _experiment_display_name(exp_dir):
     exp_dir_name = os.path.basename(exp_dir)
-    real_exp_name = convertFromPathSafe(exp_dir_name)
-    first_meta = utils.load_paths(exp_dir, '*/*/*/metadata.json')
-    if first_meta:
-        try:
-            with open(first_meta[0], 'r') as f:
-                meta_data = json.load(f)
-                real_exp_name = meta_data.get('Experiment', real_exp_name)
-        except Exception:
-            pass
-    return exp_dir_name, real_exp_name
+    return exp_dir_name, convertFromPathSafe(exp_dir_name)
 
 
 def _normalize_temporal_dataframe(all_data):
@@ -78,7 +69,7 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, help='Path to the configuration file (default: config.json)')
 
     args = parser.parse_args()
-    conf = json.load(open(args.config, 'r'))
+    conf = apply_load_aliases(load_json(args.config))
 
     analysis_folder = os.path.join(conf['MainFolder'], 'Analysis')
     experiments = utils.load_paths(analysis_folder, '*')

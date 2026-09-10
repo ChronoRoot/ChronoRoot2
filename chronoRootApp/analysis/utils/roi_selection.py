@@ -13,6 +13,7 @@ from analysis.utils.fileUtilities import (
     load_result_metadata,
     convertFromPathSafe,
 )
+from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
 
 
 def _ensure_qapplication():
@@ -111,7 +112,7 @@ def _pending_slot_parts(conf):
     """Return (slot, video, cam_path, experiment, rpi, cam, plant_folder) or None."""
     try:
         current_slot = os.path.abspath(plant_slot_path(conf))
-        video_src = conf.get('ImagePath') or conf.get('Images')
+        video_src = video_image_dir(conf) or conf.get('Images')
         if not video_src:
             return None
         current_video = os.path.abspath(video_src)
@@ -161,7 +162,7 @@ def collect_previous_rois_and_warnings(conf, include_pending=False):
     """Scan Analysis tree for prior ROIs on the same video and path warnings."""
     analysis_root = os.path.join(conf['MainFolder'], 'Analysis')
     current_slot = os.path.abspath(plant_slot_path(conf))
-    current_video = os.path.abspath(conf.get('ImagePath') or conf['Images'])
+    current_video = os.path.abspath(video_image_dir(conf) or conf['Images'])
 
     previous_rois = []
     cam_plants = defaultdict(list)
@@ -184,7 +185,7 @@ def collect_previous_rois_and_warnings(conf, include_pending=False):
             result_dir = get_latest_result_dir(slot_str)
             meta = load_result_metadata(result_dir) if result_dir else {}
 
-            video = meta.get('ImagePath') or meta.get('Images')
+            video = video_image_dir(meta)
             if video:
                 video_abs = os.path.abspath(video)
                 cam_plants[cam_path].append((plant_folder, video_abs))
@@ -192,14 +193,14 @@ def collect_previous_rois_and_warnings(conf, include_pending=False):
 
             if os.path.abspath(slot_str) == current_slot:
                 continue
-            if not result_dir or 'bounding box' not in meta:
+            if not result_dir or get_bounding_box(meta) is None:
                 continue
 
-            meta_video = meta.get('ImagePath') or meta.get('Images')
+            meta_video = video_image_dir(meta)
             if not meta_video or os.path.abspath(meta_video) != current_video:
                 continue
 
-            y1, y2, x1, x2 = meta['bounding box']
+            y1, y2, x1, x2 = get_bounding_box(meta)
             plant_num = meta.get('plant', plant_folder.replace('plant_', ''))
             label = f"{experiment}\nplant_{plant_num}"
             previous_rois.append((label, x1, y1, x2, y2))

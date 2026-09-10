@@ -34,6 +34,7 @@ from .utils.fileUtilities import (
     attach_plant_metadata_columns,
     build_plant_id,
 )
+from .utils.metadata_schema import get_bounding_box, video_image_dir
 from .time_windows import (
     collect_hourly_data,
     default_duration_hours,
@@ -371,9 +372,7 @@ def getAngles(conf, path):
     
     filepath = os.path.join(path, 'LateralRootsData.csv')
 
-    meta_path = os.path.join(path, 'metadata.json')
-    with open(meta_path) as f:
-        metadata = json.load(f)
+    metadata = load_result_metadata(path)
     pixel_size = metadata['pixel_size']
     
     with open(filepath, 'w+') as f:
@@ -884,7 +883,7 @@ def estimateAngles(path, ax, img, i=-1, tip=False):
     with open(os.path.join(path, 'metadata.json')) as f:
         metadata = json.load(f)
 
-    y1, y2, x1, x2 = metadata['bounding box']
+    y1, y2, x1, x2 = get_bounding_box(metadata)
     h = y2 - y1
     w = x2 - x1
 
@@ -967,8 +966,7 @@ def plotLateralAnglesOnTop(conf):
                         continue
                     
                     if os.path.exists(results_path):
-                        metadata_path = results_path + "/metadata.json"
-                        metadata = json.load(open(metadata_path))
+                        metadata = load_result_metadata(results_path)
                         
                         i = -1
 
@@ -983,14 +981,11 @@ def plotLateralAnglesOnTop(conf):
                         images = [image for image in images 
                                  if image.split('/')[-1].replace('.png', '.rsml') in rsml_files]
                         
-                        try:
-                            images = [os.path.join(metadata["ImagePath"], image) for image in images]
-                        except:
-                            # Fallback for retrocompatibility
-                            images = [os.path.join(metadata["folder"], image) for image in images]
+                        video_dir = video_image_dir(metadata) or metadata.get("folder")
+                        images = [os.path.join(video_dir, image) for image in images]
 
                         # Load and crop the image
-                        bbox = metadata["bounding box"]
+                        bbox = get_bounding_box(metadata)
                         crop = cv2.imread(images[i])[bbox[0]:bbox[1], bbox[2]:bbox[3]]
                         
                         # Save cropped image

@@ -749,7 +749,7 @@ class AnalysisTab(QWidget):
             'segmentation_dir': segmentation_dir,
             'project_dir': project_dir,
             'analysis_id': identifier,
-            'time_delta': time_delta,
+            'timeStep': time_delta,
             'group_names': group_names,
             'seed_counts': [count if count is not None else 0 for count in seed_counts],
             'group_rois': {name: list(coords) for name, coords in group_rois.items()},
@@ -759,9 +759,9 @@ class AnalysisTab(QWidget):
             'cam': cam,
         })
 
-        if not config['has_qr']:
-            config['known_distance'] = float(self.known_dist_edit.text())
-            config['pixel_distance'] = int(self.pixel_dist_edit.text())
+        if not config.get('videoHasQR', True):
+            config['knownDistance'] = float(self.known_dist_edit.text())
+            config['pixelDistance'] = int(self.pixel_dist_edit.text())
 
         analysis_dir = os.path.join(project_dir, 'analysis', identifier)
         os.makedirs(analysis_dir, exist_ok=True)

@@ -8,19 +8,26 @@ Video and segmentation directories stay the same. Only the mask subfolder
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import chrono_root_backend  # noqa: F401
+from analysis.utils.metadata_schema import (
+    apply_load_aliases,
+    canonicalize_persisted,
+    dump_json,
+    load_json,
+    video_image_dir,
+)
 
 SEG_CHOICES = ('Ensemble', 'Fold_0')
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _load_json(path):
-    with open(path, 'r') as handle:
-        return json.load(handle)
+    return load_json(path)
 
 
 def _analysis_config(analysis_dir, dest_project, seg_subdir):
@@ -31,20 +38,20 @@ def _analysis_config(analysis_dir, dest_project, seg_subdir):
     meta_path = os.path.join(analysis_dir, 'metadata.json')
 
     if os.path.isfile(cfg_path):
-        config = _load_json(cfg_path)
+        config = canonicalize_persisted(_load_json(cfg_path))
     else:
         if not os.path.isfile(meta_path):
             return None, 'missing process_config.json and metadata.json'
-        meta = _load_json(meta_path)
-        info = _load_json(info_path) if os.path.isfile(info_path) else {}
+        meta = apply_load_aliases(_load_json(meta_path))
+        info = apply_load_aliases(_load_json(info_path)) if os.path.isfile(info_path) else {}
         config = {
-            'video_dir': meta.get('video_directory') or meta.get('video_dir'),
+            'video_dir': meta.get('video_dir') or video_image_dir(meta),
             'segmentation_dir': meta.get('segmentation_directory') or meta.get('segmentation_dir'),
             'analysis_id': meta.get('analysis_id') or os.path.basename(analysis_dir),
             'group_names': info.get('group_names') or meta.get('group_names') or [],
             'seed_counts': info.get('seed_counts') or [0] * len(info.get('group_names') or []),
-            'time_delta': info.get('time_delta', 15),
-            'has_qr': True,
+            'timeStep': info.get('timeStep', 15),
+            'videoHasQR': True,
             'show_tracking': False,
             'PlateCondition': info.get('PlateCondition', '') or '',
             'ExtraVariable': info.get('ExtraVariable', '') or '',
@@ -90,8 +97,7 @@ def clone_and_reprocess(source_project, dest_project, segmentation_subdir='Ensem
         out_dir = os.path.join(dest_project, 'analysis', config['analysis_id'])
         os.makedirs(out_dir, exist_ok=True)
         config_path = os.path.join(out_dir, 'process_config.json')
-        with open(config_path, 'w') as handle:
-            json.dump(config, handle, indent=4)
+        dump_json(config_path, config)
         jobs.append((config['analysis_id'], config_path))
 
     if not jobs:

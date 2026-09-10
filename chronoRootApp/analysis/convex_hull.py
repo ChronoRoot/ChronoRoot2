@@ -142,12 +142,6 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
     exp_dir_name = os.path.basename(save_path)
     
     real_exp_name = convertFromPathSafe(exp_dir_name)
-    sample_meta = utils.load_paths(save_path, '*/*/*/metadata.json')
-    if sample_meta:
-        try:
-            with open(sample_meta[0], 'r') as f:
-                real_exp_name = json.load(f).get('Experiment', real_exp_name)
-        except: pass
     
     # Initialize Accumulators
     atlas_hull_mask = np.zeros(canvas_shape, dtype='uint8')

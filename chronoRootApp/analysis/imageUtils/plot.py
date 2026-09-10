@@ -20,6 +20,8 @@ import cv2
 import os
 import numpy as np
 
+from analysis.utils.metadata_schema import get_bounding_box
+
 
 def overlay_seg_mask(img, seg, colors, alpha=0.5):
     """Blend integer class mask colors onto a BGR image."""
@@ -147,7 +149,7 @@ def saveImages(conf, images, frame_idx, segmentation_mask, graph=None, skeleton_
     """
     output_folder = conf['folders']['images']
     image_name = getImgName(images[frame_idx], conf)
-    roi_bounds = conf['bounding box']
+    roi_bounds = get_bounding_box(conf)
     
     # Only save if enabled in config
     if conf['saveImages']:

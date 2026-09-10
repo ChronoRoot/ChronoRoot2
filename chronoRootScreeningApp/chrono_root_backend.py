@@ -48,6 +48,17 @@ from analysis.utils.fileUtilities import (  # noqa: E402
     normalize_factor_value,
     UNSPECIFIED_FACTOR,
 )
+from analysis.utils.metadata_schema import (  # noqa: E402
+    SCREENING_JOB_KIND,
+    SOURCE_SCREENING,
+    apply_load_aliases,
+    build_plant_record,
+    canonicalize_persisted,
+    dump_json,
+    load_json,
+    video_has_qr,
+    video_image_dir,
+)
 from analysis.utils.report_paths import (  # noqa: E402
     MODULE_TEMPORAL,
     data_file,

@@ -16,10 +16,18 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import json
 import pathlib
 import re
 import os
 import shutil
+
+from .metadata_schema import (
+    SOURCE_SINGLE_PLANT,
+    apply_load_aliases,
+    build_plant_record,
+    dump_json,
+)
 
 def natural_key(string_):
     """See http://www.codinghorror.com/blog/archives/001018.html"""
@@ -170,7 +178,7 @@ def createSaveFolder(conf):
     multiPath = os.path.join(imagePath, 'SegMulti')
     os.makedirs(multiPath, exist_ok=True)
     
-    if conf['saveImages']:
+    if conf.get('saveImages'):
         inPath = os.path.join(imagePath, 'Input')
         os.makedirs(inPath, exist_ok=True)
 
@@ -213,7 +221,6 @@ def getImages(conf):
         
     return images, segFiles
 
-import json
 
 UNSPECIFIED_FACTOR = "unspecified"
 
@@ -231,7 +238,7 @@ def load_result_metadata(res_folder):
         return {}
     try:
         with open(meta_path, 'r') as f:
-            return json.load(f)
+            return apply_load_aliases(json.load(f))
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -239,7 +246,10 @@ def load_result_metadata(res_folder):
 def attach_plant_metadata_columns(data, meta, rpi_name=None, cam_name=None, plant_name=None,
                                   experiment_fallback=None):
     """Attach experiment and grouping columns from per-plant metadata."""
-    experiment = meta.get('Experiment', experiment_fallback)
+    if experiment_fallback is not None:
+        experiment = experiment_fallback
+    else:
+        experiment = meta.get('Experiment')
     if experiment is not None:
         data['Experiment'] = experiment
     data['PlateCondition'] = normalize_factor_value(meta.get('PlateCondition', ''))
@@ -259,20 +269,9 @@ def build_plant_id(rpi_name, cam_name, plant_name, extra_variable=None):
 
 
 def saveMetadata(bbox, seed, conf):
-    metadata = {}
-    metadata['bounding box'] = bbox
-    metadata['seed'] = seed
-
-    # combine metadata and conf
-    metadata.update(conf)
-
-    metapath = os.path.join(metadata['folders']['result'], 'metadata.json')
-
-    with open(metapath, 'w') as fp:
-        json.dump(metadata, fp)
-
-    metapath = os.path.join(metadata['MainFolder'], 'lastAnalysis.json')
-    with open(metapath, 'w') as fp:
-        json.dump(metadata, fp)
-
-    return metadata
+    """Write slim plant metadata; return conf so the running job keeps in-memory paths."""
+    conf['bounding_box'] = bbox
+    conf['seed'] = seed
+    record = build_plant_record(conf, source=SOURCE_SINGLE_PLANT)
+    dump_json(os.path.join(conf['folders']['result'], 'metadata.json'), record)
+    return conf

@@ -17,21 +17,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 from analysis.plantAnalysis import plantAnalysis
 import argparse
-import json
 from analysis.utils.fileUtilities import loadPath
+from analysis.utils.metadata_schema import hydrate_run_config, is_plant_metadata_path, load_json
 import os
 from multiprocessing import Pool
 
 
 def analyze_experiment(exp):
-    # Load the configuration for each experiment
-    conf = json.load(open(exp))
+    conf = load_json(exp)
+    if is_plant_metadata_path(exp):
+        conf = hydrate_run_config(conf, exp)
 
     # New main folder for rerun analysis
     conf['MainFolder'] = "/DATA/tomatest_2"
     os.makedirs(conf['MainFolder'], exist_ok=True)
-    conf['fileKey'] = conf['identifier']
-    conf['sequenceLabel'] = str(conf['identifier']) + '/' + str(conf['rpi']) + '/' + str(conf['cam']) + '/' + str(conf['plant'])
+    conf['fileKey'] = conf.get('identifier') or conf.get('Experiment')
+    conf['Experiment'] = conf.get('Experiment') or conf.get('identifier')
+    conf['sequenceLabel'] = str(conf.get('identifier') or conf.get('Experiment')) + '/' + str(conf['rpi']) + '/' + str(conf['cam']) + '/' + str(conf['plant'])
     conf['Plant'] = 'Tomato'
 
     conf["processingLimit"] = 6

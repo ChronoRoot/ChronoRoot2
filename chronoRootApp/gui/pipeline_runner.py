@@ -3,6 +3,8 @@
 import os
 import subprocess
 
+from analysis.utils.metadata_schema import pending_analysis_path
+
 PROJECT_CONFIG_NAME = "project_config.json"
 
 
@@ -21,6 +23,13 @@ def run_analysis_config(config_path):
   subprocess.Popen([
       "python", "1_analysis.py",
       "--config", config_path,
+  ])
+
+
+def run_pending_analysis(project_dir):
+  subprocess.Popen([
+      "python", "1_analysis.py",
+      "--config", pending_analysis_path(project_dir),
   ])
 
 

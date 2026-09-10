@@ -20,7 +20,18 @@ from analysis.dataWork import dataWork
 from analysis.qr import qr_detect, get_pixel_size, load_path
 from analysis.report import plot_individual_plant
 from analysis.lateral_angles import getAngles
-from analysis.utils.fileUtilities import convertFromPathSafe, get_latest_result_dir
+from analysis.utils.fileUtilities import (
+    convertFromPathSafe,
+    get_latest_result_dir,
+    processing_limit_frame_count,
+)
+from analysis.utils.metadata_schema import (
+    apply_load_aliases,
+    dump_json,
+    load_json,
+    video_has_qr,
+    video_image_dir,
+)
 import json
 import os
 import pathlib
@@ -42,7 +53,7 @@ def _load_latest_metadata(plant_path):
         return result_dir, None
     try:
         with open(meta_path, "r") as f:
-            return result_dir, json.load(f)
+            return result_dir, apply_load_aliases(json.load(f))
     except (OSError, json.JSONDecodeError):
         return result_dir, None
 
@@ -53,8 +64,8 @@ def plate_key_from_meta(meta, plant_path):
 
     Same ImagePath + rpi + cam share calibration even across Experiments.
     """
-    if meta and meta.get("ImagePath"):
-        image_path = os.path.abspath(os.path.expanduser(str(meta["ImagePath"])))
+    image_path = video_image_dir(meta)
+    if meta and image_path:
         rpi = str(meta.get("rpi", ""))
         cam = str(meta.get("cam", ""))
         if not cam:
@@ -62,7 +73,7 @@ def plate_key_from_meta(meta, plant_path):
             cam = os.path.basename(os.path.dirname(plant_path))
         if not rpi:
             rpi = os.path.basename(os.path.dirname(os.path.dirname(plant_path)))
-        return (image_path, rpi, cam)
+        return (os.path.abspath(os.path.expanduser(str(image_path))), rpi, cam)
     # No ImagePath: isolate by camera folder on disk
     cam_dir = os.path.dirname(plant_path)
     return (os.path.abspath(cam_dir),)
@@ -88,10 +99,10 @@ def resolve_plate_pixel_size(conf, plants):
     if sample_meta is None:
         return 0.04
 
-    if not conf.get("videoHasQRbutton", True):
+    if not video_has_qr(conf):
         return float(conf["knownDistance"]) / float(conf["pixelDistance"])
 
-    image_path = sample_meta.get("ImagePath")
+    image_path = video_image_dir(sample_meta)
     if not image_path:
         return 0.04
 
@@ -121,13 +132,11 @@ def process_one_plant(plant_path, pixel_size, conf, plot_label):
             return plant_path, False, "missing Results_raw.csv"
 
         meta_file = os.path.join(target_res, "metadata.json")
-        with open(meta_file, "r") as f:
-            plant_metadata = json.load(f)
+        plant_metadata = apply_load_aliases(load_json(meta_file))
         plant_metadata["pixel_size"] = pixel_size
-        with open(meta_file, "w") as f:
-            json.dump(plant_metadata, f)
+        dump_json(meta_file, plant_metadata)
 
-        n_limit = conf["Limit"] if conf.get("Limit", 0) != 0 else None
+        n_limit = processing_limit_frame_count(conf)
         dataWork(conf, pfile, target_res, N_exp=n_limit)
 
         processed_csv = os.path.join(target_res, "PostProcess_Hour.csv")
@@ -170,13 +179,7 @@ def collect_plate_groups(analysis_root):
             continue
         exp_folder, rpi, cam, plant = parts[0], parts[1], parts[2], parts[3]
         plot_label = f"{exp_folder}_{rpi}_{cam}_{plant}"
-        experiment_name = ""
-        if meta:
-            experiment_name = convertFromPathSafe(
-                str(meta.get("Experiment", exp_folder))
-            )
-        else:
-            experiment_name = convertFromPathSafe(exp_folder)
+        experiment_name = convertFromPathSafe(exp_folder)
 
         key = plate_key_from_meta(meta, plant_path)
         groups[key].append((plant_path, plot_label, experiment_name))
@@ -200,7 +203,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ChronoRoot Post-processing")
     parser.add_argument("--config", type=str, help="Path to the configuration file")
 
-    conf = json.load(open(parser.parse_args().config, "r"))
+    conf = apply_load_aliases(load_json(parser.parse_args().config))
     analysis = os.path.join(conf["MainFolder"], "Analysis")
 
     experiment_dirs = load_path(analysis, "*")

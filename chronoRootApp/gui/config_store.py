@@ -1,15 +1,21 @@
 """Project and global configuration persistence for the ChronoRoot GUI."""
 
-import json
 import os
 
 from analysis.time_windows import parse_hour_list
+from analysis.utils.metadata_schema import (
+    dump_json,
+    load_json,
+    strip_roi_keys,
+    widget_value,
+)
 
 APP_NAME = "chronoroot"
 PROJECT_CONFIG_NAME = "project_config.json"
 GLOBAL_CONFIG_DIR = os.path.expanduser(f"~/.config/{APP_NAME}")
 GLOBAL_CONFIG_FILE = os.path.join(GLOBAL_CONFIG_DIR, "mainInterfaceConfig.json")
 
+# Old widget names still accepted on load. Never written.
 LEGACY_CONFIG_ALIASES = {
     "projectField_2": "reportProjectField",
     "processingLimitField_3": "reportProcessingLimitField",
@@ -38,156 +44,108 @@ def _apply_snapshot_hours_field(field, data, specific_key, legacy_days_key):
         field.setText(','.join(str(h) for h in hours) if hours else str(data.get(legacy_days_key)))
 
 
+def _numeric_or_text(text):
+    if text == "":
+        return ""
+    if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+        return int(text)
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
 class ConfigStore:
   def config_value(self, data, key, default=None):
-    if key in data:
-      return data[key]
+    value = widget_value(data, key, None)
+    if value is not None:
+      return value
     for legacy_key, new_key in LEGACY_CONFIG_ALIASES.items():
       if new_key == key and legacy_key in data:
         return data[legacy_key]
     return default
 
   def build_payload(self, host):
-    data = {}
-
-    for field in [
-        host.processingLimitField,
-        host.reportProcessingLimitField,
-        host.reportEmergenceDistanceField,
-        host.captureIntervalField,
-        host.everyXhourField,
-        host.everyXhourFieldFourier,
-        host.everyXhourFieldAngles,
-        host.numComponentsFPCAField,
-    ]:
-      if field.text().isdigit():
-        data[field.objectName()] = int(field.text())
-      if field.text() == "":
-        data[field.objectName()] = ""
-
-    data.update({
-        field.objectName(): field.text()
-        for field in [
-            host.plantIdentifier,
-            host.videoField,
-            host.projectField,
-            host.plateConditionName,
-            host.extraField,
-            host.everyXhourField,
-            host.everyXhourFieldFourier,
-            host.everyXhourFieldAngles,
-            host.numComponentsFPCAField,
-            host.reportGenotypeAxisLabelField,
-            host.reportPlateConditionAxisLabelField,
-            host.reportExtraVariableAxisLabelField,
-        ]
-    })
-    data.update({
-        field.objectName(): field.isChecked()
-        for field in [
-            host.saveImagesButton,
-            host.videoHasQRbutton,
-            host.saveImagesConvex,
-            host.doConvex,
-            host.doFourier,
-            host.doLateralAngles,
-            host.doFPCA,
-            host.normFPCA,
-            host.averagePerPlantStats,
-            host.measureRelativeToInitial,
-            host.statsByGenotype,
-            host.statsGenotypeByPlate,
-            host.statsGenotypeByExtra,
-            host.statsByPlateCondition,
-            host.statsByExtraVariable,
-            host.statsPlateWithinGenotype,
-            host.statsExtraWithinGenotype,
-        ]
-    })
+    data = {
+        "Experiment": host.plantIdentifier.text(),
+        "MainFolder": host.projectField.text(),
+        "Images": host.videoField.text(),
+        "rpi": host.rpiField.text(),
+        "cam": host.cameraField.text(),
+        "plant": host.plantField.text(),
+        "PlateCondition": host.plateConditionName.text(),
+        "ExtraVariable": host.extraField.text(),
+        "processingLimit": _numeric_or_text(host.processingLimitField.text()),
+        "timeStep": _numeric_or_text(host.captureIntervalField.text()),
+        "saveImages": host.saveImagesButton.isChecked(),
+        "videoHasQR": host.videoHasQRbutton.isChecked(),
+        "knownDistance": host.knownDistanceField.text(),
+        "pixelDistance": host.pixelDistanceField.text(),
+        "emergenceDistance": _numeric_or_text(host.analysisEmergenceDistanceField.text()
+                                                or host.reportEmergenceDistanceField.text()),
+        "saveImagesConvex": host.saveImagesConvex.isChecked(),
+        "doConvex": host.doConvex.isChecked(),
+        "doFourier": host.doFourier.isChecked(),
+        "doLateralAngles": host.doLateralAngles.isChecked(),
+        "doFPCA": host.doFPCA.isChecked(),
+        "normFPCA": host.normFPCA.isChecked(),
+        "averagePerPlantStats": host.averagePerPlantStats.isChecked(),
+        "measureRelativeToInitial": host.measureRelativeToInitial.isChecked(),
+        "statsByGenotype": host.statsByGenotype.isChecked(),
+        "statsGenotypeByPlate": host.statsGenotypeByPlate.isChecked(),
+        "statsGenotypeByExtra": host.statsGenotypeByExtra.isChecked(),
+        "statsByPlateCondition": host.statsByPlateCondition.isChecked(),
+        "statsByExtraVariable": host.statsByExtraVariable.isChecked(),
+        "statsPlateWithinGenotype": host.statsPlateWithinGenotype.isChecked(),
+        "statsExtraWithinGenotype": host.statsExtraWithinGenotype.isChecked(),
+        "everyXhourField": _numeric_or_text(host.everyXhourField.text()),
+        "everyXhourFieldFourier": _numeric_or_text(host.everyXhourFieldFourier.text()),
+        "everyXhourFieldAngles": _numeric_or_text(host.everyXhourFieldAngles.text()),
+        "numComponentsFPCAField": _numeric_or_text(host.numComponentsFPCAField.text()),
+        "genotypeAxisLabel": host.reportGenotypeAxisLabelField.text(),
+        "plateConditionAxisLabel": host.reportPlateConditionAxisLabelField.text(),
+        "extraVariableLabel": host.reportExtraVariableAxisLabelField.text(),
+        "snapshotHoursConvex": parse_hour_list(host.daysConvexField.text()),
+        "snapshotHoursAngles": parse_hour_list(host.daysAnglesField.text()),
+    }
     if getattr(host, 'advanced_group', None) is not None:
         data['advancedComparisonModes'] = host.advanced_group.isChecked()
-
-    data["daysConvexHull"] = host.daysConvexField.text()
-    data["daysAngles"] = host.daysAnglesField.text()
-    data["snapshotHoursConvex"] = parse_hour_list(host.daysConvexField.text())
-    data["snapshotHoursAngles"] = parse_hour_list(host.daysAnglesField.text())
     for key in (
         'timeSyncMode', 'timeDurationHours', 'reportFolderName',
         'figureClockTicks', 'showFigureClockTicks', 'timeGroups', 'timePeriodSources',
     ):
       if hasattr(host, key):
         data[key] = getattr(host, key)
-
-    data["rpi"] = host.rpiField.text()
-    data["rpiField"] = host.rpiField.text()
-    data["cam"] = host.cameraField.text()
-    data["cameraField"] = host.cameraField.text()
-    data["plant"] = host.plantField.text()
-    data["plantField"] = host.plantField.text()
-    data["Experiment"] = data["plantIdentifier"]
-    data["PlateCondition"] = data["plateConditionName"]
-    data["ExtraVariable"] = data["extraField"]
-    data["genotypeAxisLabel"] = data.get("reportGenotypeAxisLabelField", "Genotype")
-    data["plateConditionAxisLabel"] = data.get("reportPlateConditionAxisLabelField", "Plate condition")
-    data["extraVariableLabel"] = data.get("reportExtraVariableAxisLabelField", "Run")
-    data["Images"] = data["videoField"]
-    data["processingLimit"] = data["processingLimitField"]
-    data["timeStep"] = data["captureIntervalField"]
-    data["MainFolder"] = data["projectField"]
-    data["saveImages"] = data["saveImagesButton"]
-    data["videoHasQR"] = data["videoHasQRbutton"]
-    data["emergenceDistance"] = data["emergenceDistanceField"]
-
-    for legacy_key, new_key in LEGACY_CONFIG_ALIASES.items():
-      if new_key in data:
-        data[legacy_key] = data[new_key]
-
-    if data["processingLimit"] != "":
-      data["Limit"] = int(data["processingLimit"] * 24 * 60 / int(data["timeStep"]))
-    else:
-      data["Limit"] = 0
-
-    data["knownDistance"] = host.knownDistanceField.text()
-    data["pixelDistance"] = host.pixelDistanceField.text()
-    return data
+    return strip_roi_keys(data)
 
   def apply_payload(self, host, data):
-    for field in [
-        host.rpiField,
-        host.cameraField,
-        host.plantField,
-        host.processingLimitField,
-        host.plateConditionName,
-        host.extraField,
-        host.reportProjectField,
-        host.reportProcessingLimitField,
-        host.reportEmergenceDistanceField,
-        host.captureIntervalField,
-        host.reportCaptureIntervalField,
-        host.everyXhourField,
-        host.everyXhourFieldFourier,
-        host.everyXhourFieldAngles,
-        host.numComponentsFPCAField,
-        host.reportGenotypeAxisLabelField,
-        host.reportPlateConditionAxisLabelField,
-        host.reportExtraVariableAxisLabelField,
-    ]:
-      val = self.config_value(data, field.objectName())
-      if val is not None:
-        field.setText(str(val))
-      elif field.objectName() == 'reportGenotypeAxisLabelField' and 'genotypeAxisLabel' in data:
-        field.setText(str(data['genotypeAxisLabel']))
-      elif field.objectName() == 'reportPlateConditionAxisLabelField' and 'plateConditionAxisLabel' in data:
-        field.setText(str(data['plateConditionAxisLabel']))
-      elif field.objectName() == 'reportExtraVariableAxisLabelField' and 'extraVariableLabel' in data:
-        field.setText(str(data['extraVariableLabel']))
-
-    for field in [
-        host.plantIdentifier,
-        host.videoField,
-        host.projectField
-    ]:
-      val = self.config_value(data, field.objectName())
+    data = data or {}
+    text_fields = [
+        (host.rpiField, 'rpiField'),
+        (host.cameraField, 'cameraField'),
+        (host.plantField, 'plantField'),
+        (host.processingLimitField, 'processingLimitField'),
+        (host.plateConditionName, 'plateConditionName'),
+        (host.extraField, 'extraField'),
+        (host.reportProjectField, 'reportProjectField'),
+        (host.reportProcessingLimitField, 'reportProcessingLimitField'),
+        (host.reportEmergenceDistanceField, 'emergenceDistanceField'),
+        (host.analysisEmergenceDistanceField, 'analysisEmergenceDistanceField'),
+        (host.captureIntervalField, 'captureIntervalField'),
+        (host.reportCaptureIntervalField, 'reportCaptureIntervalField'),
+        (host.everyXhourField, 'everyXhourField'),
+        (host.everyXhourFieldFourier, 'everyXhourFieldFourier'),
+        (host.everyXhourFieldAngles, 'everyXhourFieldAngles'),
+        (host.numComponentsFPCAField, 'numComponentsFPCAField'),
+        (host.reportGenotypeAxisLabelField, 'reportGenotypeAxisLabelField'),
+        (host.reportPlateConditionAxisLabelField, 'reportPlateConditionAxisLabelField'),
+        (host.reportExtraVariableAxisLabelField, 'reportExtraVariableAxisLabelField'),
+        (host.plantIdentifier, 'plantIdentifier'),
+        (host.videoField, 'videoField'),
+        (host.projectField, 'projectField'),
+    ]
+    for field, object_name in text_fields:
+      val = self.config_value(data, object_name)
       if val is not None:
         field.setText(str(val))
 
@@ -210,16 +168,21 @@ class ConfigStore:
         host.statsPlateWithinGenotype,
         host.statsExtraWithinGenotype,
     ]:
-      if field.objectName() in data:
-        field.setChecked(data[field.objectName()])
+      val = self.config_value(data, field.objectName())
+      if val is not None:
+        field.setChecked(bool(val))
 
-    if getattr(host, 'advanced_group', None) is not None and 'advancedComparisonModes' in data:
-      host.advanced_group.setChecked(bool(data['advancedComparisonModes']))
+    if getattr(host, 'advanced_group', None) is not None:
+      val = self.config_value(data, 'advancedComparisonModes')
+      if val is not None:
+        host.advanced_group.setChecked(bool(val))
 
-    if "knownDistance" in data:
-      host.knownDistanceField.setText(str(data["knownDistance"]))
-    if "pixelDistance" in data:
-      host.pixelDistanceField.setText(str(data["pixelDistance"]))
+    known = self.config_value(data, 'knownDistance')
+    if known is not None:
+      host.knownDistanceField.setText(str(known))
+    pixel = self.config_value(data, 'pixelDistance')
+    if pixel is not None:
+      host.pixelDistanceField.setText(str(pixel))
     _apply_snapshot_hours_field(
         host.daysConvexField, data,
         'snapshotHoursConvex', 'daysConvexHull',
@@ -263,17 +226,14 @@ class ConfigStore:
   def save(self, host):
     data = self.build_payload(host)
     try:
-      with open(GLOBAL_CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+      dump_json(GLOBAL_CONFIG_FILE, data)
     except Exception as e:
       print(f"Error saving global config: {e}")
 
     project_path = host.projectField.text()
     if project_path and os.path.isdir(project_path):
       try:
-        proj_cfg_path = os.path.join(project_path, PROJECT_CONFIG_NAME)
-        with open(proj_cfg_path, "w") as f:
-          json.dump(data, f, indent=4)
+        dump_json(os.path.join(project_path, PROJECT_CONFIG_NAME), data)
       except Exception as e:
         print(f"Error saving project config: {e}")
 
@@ -282,13 +242,9 @@ class ConfigStore:
     if not json_path:
       return
     try:
-      with open(json_path, "r") as f:
-        data = json.load(f)
-      self.apply_payload(host, data)
+      self.apply_payload(host, load_json(json_path))
     except Exception as e:
       print(f"Error loading config: {e}")
 
   def apply_file(self, host, json_path):
-    with open(json_path, "r") as f:
-      data = json.load(f)
-    self.apply_payload(host, data)
+    self.apply_payload(host, load_json(json_path))

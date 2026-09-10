@@ -8,11 +8,11 @@ Public API
 - RemapError
 """
 
-import json
 import os
 import shutil
 
 from .fileUtilities import convertFromPathSafe, convertToPathSafe, list_result_dirs
+from .metadata_schema import dump_json, load_json
 
 
 class RemapError(Exception):
@@ -221,15 +221,12 @@ def update_metadata_identifiers(exp_dir, new_name, old_name=None):
             if not os.path.isfile(meta_path):
                 continue
             try:
-                with open(meta_path, "r") as f:
-                    meta = json.load(f)
-            except (json.JSONDecodeError, OSError):
+                meta = load_json(meta_path)
+            except (OSError, ValueError):
                 continue
 
             patch_metadata_dict(meta, new_name, old_name, old_safe, new_safe)
-
-            with open(meta_path, "w") as f:
-                json.dump(meta, f)
+            dump_json(meta_path, meta)
 
 
 def patch_metadata_dict(meta, new_name, old_name, old_safe, new_safe):

@@ -24,6 +24,7 @@ from .utils.fileUtilities import (
     plant_slot_path,
     processing_limit_frame_count,
 )
+from .utils.metadata_schema import get_bounding_box, get_seed
 from .imageUtils.seg import extract_root_segmentation, extract_skeleton
 from .imageUtils.plot import saveImages
 from .graphUtils.save import saveGraph, saveProps
@@ -63,16 +64,13 @@ def setupPlantAnalysis(conf, replicate):
         image_paths = image_paths[:limit_frames]
         segmentation_paths = segmentation_paths[:limit_frames]
 
+    roi_bounds = get_bounding_box(conf)
+    seed_position = get_seed(conf)
     if replicate:
-        if 'bounding box' not in conf or 'seed' not in conf:
+        if roi_bounds is None or seed_position is None:
             print('Missing saved ROI/seed in config.')
             return None, None, None, None, None
-        roi_bounds = conf['bounding box']
-        seed_position = conf['seed']
-    elif 'bounding box' in conf and 'seed' in conf:
-        roi_bounds = conf['bounding box']
-        seed_position = conf['seed']
-    else:
+    elif roi_bounds is None or seed_position is None:
         from .utils.roi_selection import try_select_roi_and_seed
         roi_bounds, seed_position = try_select_roi_and_seed(conf, image_paths, segmentation_paths)
         if seed_position is None:
@@ -81,7 +79,7 @@ def setupPlantAnalysis(conf, replicate):
                 'Use Analyze Plant or Redo Analysis in the GUI, or check your display/Qt setup.'
             )
             return None, None, None, None, None
-        conf['bounding box'] = roi_bounds
+        conf['bounding_box'] = roi_bounds
         conf['seed'] = seed_position
 
     fixed_seed_position = seed_position.copy()

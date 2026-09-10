@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSize, pyqtSignal, QPointF
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 
 from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
+from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
 
 
 # --- UTILS ---
@@ -31,9 +32,9 @@ def load_plant_data(plant_path):
     with open(json_path, 'r') as f:
         conf = json.load(f)
 
-    bbox = conf.get('bounding box')
+    bbox = get_bounding_box(conf)
 
-    imagePath = conf.get('ImagePath')
+    imagePath = video_image_dir(conf)
     segPath = os.path.join(plant_path, "Images", "SegMulti")
 
     images = loadPath(imagePath, ext="*.png") if imagePath and os.path.exists(imagePath) else []
