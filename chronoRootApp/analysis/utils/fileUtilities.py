@@ -171,13 +171,7 @@ def createSaveFolder(conf):
     
     imagePath = os.path.join(result_path, 'Images')
     os.makedirs(imagePath, exist_ok=True)
-    
-    outSegPath = os.path.join(imagePath, 'Seg')
-    os.makedirs(outSegPath, exist_ok=True)
-        
-    multiPath = os.path.join(imagePath, 'SegMulti')
-    os.makedirs(multiPath, exist_ok=True)
-    
+
     if conf.get('saveImages'):
         inPath = os.path.join(imagePath, 'Input')
         os.makedirs(inPath, exist_ok=True)
@@ -190,23 +184,40 @@ def createSaveFolder(conf):
 
     return paths
 
-def getImages(conf):
-    # Get the list of images    
-    images = loadPath(conf['Images'], ext = "*.png") 
+def list_video_pngs(conf):
+    """Camera PNG paths, including segmentation_metadata.json input_path fallback."""
+    folders = []
+    for key in ("ImagePath", "Images"):
+        folder = (conf or {}).get(key) or ""
+        if folder and folder not in folders:
+            folders.append(folder)
+    images = []
+    image_path = folders[0] if folders else ""
+    for folder in folders:
+        if os.path.isdir(folder):
+            found = loadPath(folder, ext="*.png")
+            if found:
+                return found, folder
+    for folder in folders:
+        metadata_path = os.path.join(folder, "Segmentation", "segmentation_metadata.json")
+        if not os.path.isfile(metadata_path):
+            continue
+        try:
+            with open(metadata_path, "r") as handle:
+                metadata = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            continue
+        images_path = metadata.get("input_path")
+        if images_path and os.path.isdir(images_path):
+            found = loadPath(images_path, ext="*.png")
+            if found:
+                return found, images_path
+    return images, image_path
 
-    conf['ImagePath'] = conf['Images']
-                
-    # Check if there is no images, then look for a file called "segmentation_metadata.json"
-    if len(images) == 0:
-        metadata_path = os.path.join(conf['Images'], 'Segmentation', 'segmentation_metadata.json')
-        #print("No images found in the specified folder. Looking for segmentation metadata file at: ", metadata_path)
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            images_path = metadata.get('input_path', None)
-            if images_path and os.path.exists(images_path):
-                images = loadPath(images_path, ext="*.png")
-                conf['ImagePath'] = images_path
+
+def getImages(conf):
+    images, image_path = list_video_pngs(conf)
+    conf["ImagePath"] = image_path or conf.get("Images") or ""
     
     # Get the list of segmentation images
     SegPath = os.path.join(conf['Images'], 'Segmentation', 'Ensemble')

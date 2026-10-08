@@ -21,6 +21,7 @@ import os
 import numpy as np
 
 from analysis.utils.metadata_schema import get_bounding_box
+from analysis.utils.tiff_stack import PlantMaskStacks
 
 
 def overlay_seg_mask(img, seg, colors, alpha=0.5):
@@ -164,27 +165,14 @@ def saveImages(conf, images, frame_idx, segmentation_mask, graph=None, skeleton_
         input_path = os.path.join(input_folder, image_name)
         cv2.imwrite(input_path, original_image)
     
-    # ----------------------------------------------------------------
-    # Save 2: Binary segmentation mask
-    # ----------------------------------------------------------------
-    seg_folder = os.path.join(output_folder, "Seg")
-    seg_path = os.path.join(seg_folder, image_name)
-    cv2.imwrite(seg_path, segmentation_mask)
-    
-    # ----------------------------------------------------------------
-    # Save 3: Color-coded root visualization
-    # ----------------------------------------------------------------
     if graph is None or graph is False or skeleton_overlay is None:
-        # No valid graph - save black image
         colored_image = np.zeros_like(segmentation_mask).astype('uint8')
-        # Convert to 3-channel for consistency
         colored_image = np.stack([colored_image] * 3, axis=-1)
     else:
-        # Create color visualization from graph
         colored_image = plot_segmentation_overlay(graph, skeleton_overlay, hypocotyl_skeleton)
-    
-    segmulti_folder = os.path.join(output_folder, "SegMulti")
-    segmulti_path = os.path.join(segmulti_folder, image_name)
-    cv2.imwrite(segmulti_path, colored_image)
-    
-    return
+
+    stacks = (conf.get('folders') or {}).get('mask_stacks')
+    if not isinstance(stacks, PlantMaskStacks):
+        raise RuntimeError("Plant mask TIFF writers are not open")
+    stacks.seg.append(segmentation_mask)
+    stacks.multi.append(colored_image)

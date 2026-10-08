@@ -953,9 +953,13 @@ PERIOD_GATE_MESSAGE = (
 )
 
 
-def time_period_sources(main_folder):
-    """Fingerprint of the acquisition set used to set the analysis period."""
-    spans = collect_acquisition_spans(main_folder)
+def time_period_sources(main_folder, spans=None):
+    """Fingerprint of the acquisition set used to set the analysis period.
+
+    Pass spans already loaded by the caller to avoid walking the project twice.
+    """
+    if spans is None:
+        spans = collect_acquisition_spans(main_folder)
     if spans is None or spans.empty:
         return []
     analysis_root = os.path.join(main_folder, 'analysis') if main_folder else ''
@@ -976,12 +980,41 @@ def time_period_sources(main_folder):
 
 
 def analysis_period_is_current(conf, main_folder):
+    """True when the saved period was built for the videos in this folder.
+
+    The fingerprint is the plant list. The same names are reused from project
+    to project, so a matching list is not enough on its own: the saved
+    acquisition spans also have to overlap the dates on disk. A previous
+    project's windows then stop counting as the period for the new folder.
+    """
     groups = list((conf or {}).get('timeGroups') or [])
     saved = [str(s) for s in list((conf or {}).get('timePeriodSources') or [])]
-    current = [str(s) for s in time_period_sources(main_folder)]
-    if not groups or not saved or not current:
+    spans = collect_acquisition_spans(main_folder)
+    current = [str(s) for s in time_period_sources(main_folder, spans=spans)]
+    if not groups or not saved or not current or saved != current:
         return False
-    return saved == current
+    if spans is None or spans.empty or 'date_min' not in getattr(spans, 'columns', []):
+        return False
+    data_start = None
+    data_end = None
+    for value in spans['date_min']:
+        parsed = parse_datetime(value)
+        if parsed is not None and (data_start is None or parsed < data_start):
+            data_start = parsed
+    for value in spans['date_max']:
+        parsed = parse_datetime(value)
+        if parsed is not None and (data_end is None or parsed > data_end):
+            data_end = parsed
+    if data_start is None or data_end is None:
+        return False
+    for group in groups:
+        span_start = parse_datetime(group.get('spanStart')) or parse_datetime(group.get('start'))
+        span_end = parse_datetime(group.get('spanEnd')) or span_start
+        if span_start is None or span_end is None:
+            continue
+        if span_start <= data_end and data_start <= span_end:
+            return True
+    return False
 
 
 def groups_to_config(groups):

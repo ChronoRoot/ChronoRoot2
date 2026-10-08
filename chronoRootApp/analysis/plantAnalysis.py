@@ -27,6 +27,7 @@ from .utils.fileUtilities import (
 from .utils.metadata_schema import get_bounding_box, get_seed
 from .imageUtils.seg import extract_root_segmentation, extract_skeleton
 from .imageUtils.plot import saveImages
+from .utils.tiff_stack import PlantMaskStacks
 from .graphUtils.save import saveGraph, saveProps
 from .graphUtils.graph import createGraph
 from .graphUtils.graphTrim import trimGraph
@@ -99,6 +100,8 @@ def plantAnalysis(conf, replicate=False):
     output_folders = createSaveFolder(conf)
     conf['folders'] = output_folders
     conf = saveMetadata(roi_bounds, current_root_base, conf)
+    mask_stacks = PlantMaskStacks(output_folders['images'])
+    conf['folders']['mask_stacks'] = mask_stacks
     
     total_frames = len(images)
     print(f'Number of frames: {total_frames}')
@@ -109,305 +112,310 @@ def plantAnalysis(conf, replicate=False):
     # Initialize logging
     analysis_log = []
     frame_errors = []  # 0 = success, 1 = error for each frame
-    
-    with open(measurements_file, 'w+') as csv_file:
-        csv_writer = csv.writer(csv_file)
-        header = ['FileName', 'Frame', 'MainRootLength', 'LateralRootsLength', 'NumberOfLateralRoots', 'TotalLength', 'HypocotylLength']
-        csv_writer.writerow(header)
-        
-        # ====================================================================
-        # PHASE 1: Find first frame with valid root structure
-        # ====================================================================
-        print('Searching for initial valid segmentation...')
-        
-        first_valid_frame = None
-        initial_root_mask = None
-        initial_skeleton_overlay = None
-        initial_graph = None
-        initial_rsml = None
-        initial_lateral_count = None
-        initial_hypocotyl_length = None
-        initial_hypocotyl_skeleton = None
-        
-        for frame_idx in range(total_frames):
-            print(f'Checking frame {frame_idx + 1} of {total_frames}', end='\r')
-            
-            # Try to extract root segmentation
-            try:
-                # Pass None for previous_bbox during initialization
-                root_mask, hypocotyl_skeleton, hypocotyl_length, found_root, mc_filtered_mask, current_bbox = extract_root_segmentation(
-                    segmentation_paths[frame_idx], 
-                    roi_bounds, 
-                    current_root_base,
-                    fixed_seed_position,
-                    previous_bbox=None
-                )
-                
-                if not found_root:
-                    frame_name = getImgName(images[frame_idx], conf)
-                    saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
-                    saveImages(conf, images, frame_idx, root_mask, None, None, None)
-                    frame_errors.append(0)
-                    continue
-                
-                # Try to extract skeleton structure
-                skeleton, branch_points, end_points, is_valid_skeleton = extract_skeleton(root_mask)
-                                
-                if not is_valid_skeleton:
-                    frame_name = getImgName(images[frame_idx], conf)
-                    saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
-                    saveImages(conf, images, frame_idx, root_mask, None, None, None)
-                    frame_errors.append(0)
-                    continue
-            except Exception as e:
-                frame_name = getImgName(images[frame_idx], conf)
-                saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
-                saveImages(conf, images, frame_idx, root_mask, None, None, None)
-                frame_errors.append(0)
-                continue
-            
-            skeleton_color = skeleton.copy() * mc_filtered_mask.copy()  # Color skeleton by multiclass mask
-            
-            # Try to create graph structure
-            graph, updated_root_base, skeleton_overlay = createGraph(
-                skeleton_color.copy(), 
-                current_root_base, 
-                end_points, 
-                branch_points
-            )
 
-            try:
-                graph = graphInit(graph)
-                rsml_tree, lateral_root_count = createTree(conf, frame_idx, images, graph, skeleton, skeleton_overlay)
-            except Exception as e:
-                frame_name = getImgName(images[frame_idx], conf)
-                saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
-                saveImages(conf, images, frame_idx, root_mask, None, None, None)
-                frame_errors.append(0)
-                continue
+    try:
+        with open(measurements_file, 'w+') as csv_file:
+            csv_writer = csv.writer(csv_file)
+            header = ['FileName', 'Frame', 'MainRootLength', 'LateralRootsLength', 'NumberOfLateralRoots', 'TotalLength', 'HypocotylLength']
+            csv_writer.writerow(header)
+        
+            # ====================================================================
+            # PHASE 1: Find first frame with valid root structure
+            # ====================================================================
+            print('Searching for initial valid segmentation...')
+        
+            first_valid_frame = None
+            initial_root_mask = None
+            initial_skeleton_overlay = None
+            initial_graph = None
+            initial_rsml = None
+            initial_lateral_count = None
+            initial_hypocotyl_length = None
+            initial_hypocotyl_skeleton = None
+        
+            for frame_idx in range(total_frames):
+                print(f'Checking frame {frame_idx + 1} of {total_frames}', end='\r')
             
-            # Success! Store the initial valid frame
-            first_valid_frame = frame_idx
-            initial_root_mask = root_mask
-            initial_skeleton_overlay = skeleton_overlay
-            initial_graph = graph
-            initial_rsml = rsml_tree
-            initial_hypocotyl_skeleton = hypocotyl_skeleton
-            initial_hypocotyl_length = hypocotyl_length
-            initial_lateral_count = lateral_root_count
-            current_root_base = updated_root_base
+                # Try to extract root segmentation
+                try:
+                    # Pass None for previous_bbox during initialization
+                    root_mask, hypocotyl_skeleton, hypocotyl_length, found_root, mc_filtered_mask, current_bbox = extract_root_segmentation(
+                        segmentation_paths[frame_idx], 
+                        roi_bounds, 
+                        current_root_base,
+                        fixed_seed_position,
+                        previous_bbox=None
+                    )
+                
+                    if not found_root:
+                        frame_name = getImgName(images[frame_idx], conf)
+                        saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
+                        saveImages(conf, images, frame_idx, root_mask, None, None, None)
+                        frame_errors.append(0)
+                        continue
+                
+                    # Try to extract skeleton structure
+                    skeleton, branch_points, end_points, is_valid_skeleton = extract_skeleton(root_mask)
+                                
+                    if not is_valid_skeleton:
+                        frame_name = getImgName(images[frame_idx], conf)
+                        saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
+                        saveImages(conf, images, frame_idx, root_mask, None, None, None)
+                        frame_errors.append(0)
+                        continue
+                except Exception as e:
+                    frame_name = getImgName(images[frame_idx], conf)
+                    saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
+                    saveImages(conf, images, frame_idx, root_mask, None, None, None)
+                    frame_errors.append(0)
+                    continue
             
-            print(f'\nFound initial valid structure at frame {frame_idx}')
-            break
+                skeleton_color = skeleton.copy() * mc_filtered_mask.copy()  # Color skeleton by multiclass mask
+            
+                # Try to create graph structure
+                graph, updated_root_base, skeleton_overlay = createGraph(
+                    skeleton_color.copy(), 
+                    current_root_base, 
+                    end_points, 
+                    branch_points
+                )
+
+                try:
+                    graph = graphInit(graph)
+                    rsml_tree, lateral_root_count = createTree(conf, frame_idx, images, graph, skeleton, skeleton_overlay)
+                except Exception as e:
+                    frame_name = getImgName(images[frame_idx], conf)
+                    saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
+                    saveImages(conf, images, frame_idx, root_mask, None, None, None)
+                    frame_errors.append(0)
+                    continue
+            
+                # Success! Store the initial valid frame
+                first_valid_frame = frame_idx
+                initial_root_mask = root_mask
+                initial_skeleton_overlay = skeleton_overlay
+                initial_graph = graph
+                initial_rsml = rsml_tree
+                initial_hypocotyl_skeleton = hypocotyl_skeleton
+                initial_hypocotyl_length = hypocotyl_length
+                initial_lateral_count = lateral_root_count
+                current_root_base = updated_root_base
+            
+                print(f'\nFound initial valid structure at frame {frame_idx}')
+                break
                 
             
-        # Check if we found any valid frame
-        if first_valid_frame is None:
-            print('\nERROR: No valid segmentation found in entire sequence')
+            # Check if we found any valid frame
+            if first_valid_frame is None:
+                print('\nERROR: No valid segmentation found in entire sequence')
+                mask_stacks.close()
+                log_path = os.path.join(output_folders['result'], "log.txt")
+                with open(log_path, 'w+') as log_file:
+                    log_file.write('No valid segmentation found in entire sequence\n')
+                    log_file.write(f'Checked all {total_frames} frames\n')
+                    log_file.write(f'Error Rate: 1.0')
+                return
+        
+            # Save the first valid frame
+            growth_start_frame = first_valid_frame
+            print(f'Growth begins at frame {growth_start_frame}')
+            analysis_log.append(f'Frame {growth_start_frame}: Growth begins\n')
+        
+            frame_name = getImgName(images[growth_start_frame], conf)
+            saveImages(conf, images, growth_start_frame, initial_root_mask, initial_graph, initial_skeleton_overlay, initial_hypocotyl_skeleton)
+            saveGraph(initial_graph, conf, frame_name)
+            saveRSML(initial_rsml, conf, frame_name)
+            saveProps(frame_name, growth_start_frame, initial_graph, csv_writer, initial_lateral_count, initial_hypocotyl_length)
+        
+            # ====================================================================
+            # PHASE 2: Track growth over time
+            # ====================================================================
+            print('Tracking growth...')
+        
+            # Current state (will be updated each frame)
+            current_root_mask = initial_root_mask
+            current_skeleton_overlay = initial_skeleton_overlay
+            current_graph = initial_graph
+            current_rsml = initial_rsml
+            current_lateral_count = initial_lateral_count
+            current_hypocotyl_length = initial_hypocotyl_length
+            current_hypocotyl_skeleton = initial_hypocotyl_skeleton
+        
+            error_count = 0
+            consecutive_errors = 0
+            tracking_lost = False
+        
+            for frame_idx in range(growth_start_frame + 1, total_frames):
+                print(f'Processing frame {frame_idx + 1} of {total_frames}', end='\r')
+            
+                frame_failed = False
+                seg_exception = None
+            
+                try:
+                    new_root_mask, new_hypocotyl_skeleton, new_hypocotyl_length, found_root, mc_filtered_mask, new_bbox = extract_root_segmentation(
+                        segmentation_paths[frame_idx],
+                        roi_bounds,
+                        current_root_base,
+                        fixed_seed_position,
+                        previous_bbox=current_bbox
+                    )
+                except Exception as e:
+                    found_root = False
+                    seg_exception = e
+            
+                if not found_root:
+                    frame_failed = True
+                    if seg_exception is not None:
+                        analysis_log.append(f'Frame {frame_idx}: Error in segmentation - {str(seg_exception)}\n')
+                    else:
+                        analysis_log.append(f'Frame {frame_idx}: Error in segmentation\n')
+                
+                    consecutive_errors += 1
+                    if consecutive_errors >= 20:
+                        current_bbox = None
+                        current_root_base = fixed_seed_position.copy()
+                        tracking_lost = True
+                        consecutive_errors = 0
+                        print(f'\n\nWARNING: 20 consecutive segmentation errors at frame {frame_idx}')
+                        print('Dropping tracking memory and reinitializing from seed')
+                        analysis_log.append(f'Frame {frame_idx}: 20 consecutive segmentation errors, dropped tracking memory\n')
+                else:
+                    consecutive_errors = 0
+            
+                if not frame_failed:
+                    new_skeleton, branch_points, end_points, is_valid_skeleton = extract_skeleton(new_root_mask)
+                
+                    if not is_valid_skeleton:
+                        frame_failed = True
+                        analysis_log.append(f'Frame {frame_idx}: Error in skeletonization\n')
+            
+                if not frame_failed:
+                    new_skeleton_color = new_skeleton.copy() * mc_filtered_mask.copy()  # Color skeleton by multiclass mask
+                
+                    try:
+                        new_graph, updated_root_base, new_skeleton_overlay = createGraph(
+                            new_skeleton_color.copy(),
+                            current_root_base,
+                            end_points,
+                            branch_points
+                        )
+                    except Exception as e:
+                        frame_failed = True
+                        analysis_log.append(f'Frame {frame_idx}: Error in graph creation - {str(e)}\n')
+            
+                if not frame_failed:
+                    try:
+                        new_graph = trimGraph(
+                            new_graph
+                        )
+                    except Exception as e:
+                        frame_failed = True
+                        analysis_log.append(f'Frame {frame_idx}: Error in graph trimming - {str(e)}\n')
+            
+                if not frame_failed:
+                    try:
+                        if tracking_lost:
+                            print(f'\nFrame {frame_idx}: Tracking memory lost, reinitializing graph')
+                            new_graph = graphInit(new_graph)
+                            analysis_log.append(f'Frame {frame_idx}: Tracking memory lost, reinitialized graph\n')
+                        else:
+                            new_graph = matchGraphs(current_graph, new_graph)
+                    except Exception as e:
+                        # Matching failed - decide whether to reinitialize or fail
+                        frames_since_start = frame_idx - growth_start_frame
+                    
+                        if tracking_lost or frames_since_start < 300:
+                            # Early in tracking, or bbox memory was dropped - try reinitializing
+                            try:
+                                print(f'\nFrame {frame_idx}: Matching failed, reinitializing graph')
+                                new_graph = graphInit(new_graph)
+                                analysis_log.append(f'Frame {frame_idx}: Tracking failed, reinitialized graph\n')
+                            except Exception as e2:
+                                frame_failed = True
+                                analysis_log.append(f'Frame {frame_idx}: Error in tracking and reinitialization - {str(e2)}\n')
+                        else:
+                            # Later in tracking - this is a real error
+                            frame_failed = True
+                            analysis_log.append(f'Frame {frame_idx}: Error in tracking - {str(e)}\n')
+
+                if not frame_failed:
+                    try:
+                        new_rsml, new_lateral_count = createTree(
+                            conf,
+                            frame_idx,
+                            images,
+                            new_graph,
+                            new_skeleton.copy(),
+                            new_skeleton_overlay.copy()
+                        )
+                    except Exception as e:
+                        # RSML creation failed - graph is still good, just can't export
+                        # Don't fail the frame, just log it
+                        analysis_log.append(f'Frame {frame_idx}: Warning in RSML creation - {str(e)}\n')
+                        new_rsml = current_rsml  # Use previous RSML
+                        new_lateral_count = current_lateral_count
+            
+                if frame_failed:
+                    # Frame failed - keep previous state (mask/graph still last-good)
+                    if frame_idx - growth_start_frame >= 50:
+                        error_count += 1
+                
+                    frame_errors.append(1)
+                else:
+                    # Frame succeeded - update state
+                    current_root_mask = new_root_mask
+                    current_skeleton_overlay = new_skeleton_overlay
+                    current_graph = new_graph
+                    current_rsml = new_rsml
+                    current_lateral_count = new_lateral_count
+                    current_hypocotyl_length = new_hypocotyl_length
+                    current_hypocotyl_skeleton = new_hypocotyl_skeleton
+                    current_root_base = updated_root_base
+                    current_bbox = new_bbox
+                    tracking_lost = False
+                
+                    frame_errors.append(0)
+            
+                frame_name = getImgName(images[frame_idx], conf)
+                saveImages(conf, images, frame_idx, current_root_mask, current_graph, current_skeleton_overlay, current_hypocotyl_skeleton)
+                saveGraph(current_graph, conf, frame_name)
+                saveRSML(current_rsml, conf, frame_name)
+                saveProps(frame_name, frame_idx, current_graph, csv_writer, current_lateral_count, current_hypocotyl_length)
+        
+            print('\n\nGrowth tracking complete')
+            print('Saving outputs...')
+            mask_stacks.close()
             log_path = os.path.join(output_folders['result'], "log.txt")
             with open(log_path, 'w+') as log_file:
-                log_file.write('No valid segmentation found in entire sequence\n')
-                log_file.write(f'Checked all {total_frames} frames\n')
-                log_file.write(f'Error Rate: 1.0')
-            return
-        
-        # Save the first valid frame
-        growth_start_frame = first_valid_frame
-        print(f'Growth begins at frame {growth_start_frame}')
-        analysis_log.append(f'Frame {growth_start_frame}: Growth begins\n')
-        
-        frame_name = getImgName(images[growth_start_frame], conf)
-        saveImages(conf, images, growth_start_frame, initial_root_mask, initial_graph, initial_skeleton_overlay, initial_hypocotyl_skeleton)
-        saveGraph(initial_graph, conf, frame_name)
-        saveRSML(initial_rsml, conf, frame_name)
-        saveProps(frame_name, growth_start_frame, initial_graph, csv_writer, initial_lateral_count, initial_hypocotyl_length)
-        
-        # ====================================================================
-        # PHASE 2: Track growth over time
-        # ====================================================================
-        print('Tracking growth...')
-        
-        # Current state (will be updated each frame)
-        current_root_mask = initial_root_mask
-        current_skeleton_overlay = initial_skeleton_overlay
-        current_graph = initial_graph
-        current_rsml = initial_rsml
-        current_lateral_count = initial_lateral_count
-        current_hypocotyl_length = initial_hypocotyl_length
-        current_hypocotyl_skeleton = initial_hypocotyl_skeleton
-        
-        error_count = 0
-        consecutive_errors = 0
-        tracking_lost = False
-        
-        for frame_idx in range(growth_start_frame + 1, total_frames):
-            print(f'Processing frame {frame_idx + 1} of {total_frames}', end='\r')
+                log_file.write("Analysis completed: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
+                log_file.write(f"Growth start frame: {growth_start_frame}\n")
+                log_file.write(f"Total frames analyzed: {total_frames}\n")
+                log_file.write(f"Growth frames tracked: {total_frames - growth_start_frame}\n")
             
-            frame_failed = False
-            seg_exception = None
-            
-            try:
-                new_root_mask, new_hypocotyl_skeleton, new_hypocotyl_length, found_root, mc_filtered_mask, new_bbox = extract_root_segmentation(
-                    segmentation_paths[frame_idx],
-                    roi_bounds,
-                    current_root_base,
-                    fixed_seed_position,
-                    previous_bbox=current_bbox
-                )
-            except Exception as e:
-                found_root = False
-                seg_exception = e
-            
-            if not found_root:
-                frame_failed = True
-                if seg_exception is not None:
-                    analysis_log.append(f'Frame {frame_idx}: Error in segmentation - {str(seg_exception)}\n')
+                # Calculate error statistics (only for frames after initialization)
+                growth_frames = total_frames - growth_start_frame
+                if growth_frames > 0:
+                    error_rate = round(error_count / growth_frames, 3)
+                    log_file.write(f"Total errors: {error_count}\n")
+                    log_file.write(f"Error rate: {error_rate}")
                 else:
-                    analysis_log.append(f'Frame {frame_idx}: Error in segmentation\n')
-                
-                consecutive_errors += 1
-                if consecutive_errors >= 20:
-                    current_bbox = None
-                    current_root_base = fixed_seed_position.copy()
-                    tracking_lost = True
-                    consecutive_errors = 0
-                    print(f'\n\nWARNING: 20 consecutive segmentation errors at frame {frame_idx}')
-                    print('Dropping tracking memory and reinitializing from seed')
-                    analysis_log.append(f'Frame {frame_idx}: 20 consecutive segmentation errors, dropped tracking memory\n')
-            else:
-                consecutive_errors = 0
-            
-            if not frame_failed:
-                new_skeleton, branch_points, end_points, is_valid_skeleton = extract_skeleton(new_root_mask)
-                
-                if not is_valid_skeleton:
-                    frame_failed = True
-                    analysis_log.append(f'Frame {frame_idx}: Error in skeletonization\n')
-            
-            if not frame_failed:
-                new_skeleton_color = new_skeleton.copy() * mc_filtered_mask.copy()  # Color skeleton by multiclass mask
-                
-                try:
-                    new_graph, updated_root_base, new_skeleton_overlay = createGraph(
-                        new_skeleton_color.copy(),
-                        current_root_base,
-                        end_points,
-                        branch_points
-                    )
-                except Exception as e:
-                    frame_failed = True
-                    analysis_log.append(f'Frame {frame_idx}: Error in graph creation - {str(e)}\n')
-            
-            if not frame_failed:
-                try:
-                    new_graph = trimGraph(
-                        new_graph
-                    )
-                except Exception as e:
-                    frame_failed = True
-                    analysis_log.append(f'Frame {frame_idx}: Error in graph trimming - {str(e)}\n')
-            
-            if not frame_failed:
-                try:
-                    if tracking_lost:
-                        print(f'\nFrame {frame_idx}: Tracking memory lost, reinitializing graph')
-                        new_graph = graphInit(new_graph)
-                        analysis_log.append(f'Frame {frame_idx}: Tracking memory lost, reinitialized graph\n')
-                    else:
-                        new_graph = matchGraphs(current_graph, new_graph)
-                except Exception as e:
-                    # Matching failed - decide whether to reinitialize or fail
-                    frames_since_start = frame_idx - growth_start_frame
-                    
-                    if tracking_lost or frames_since_start < 300:
-                        # Early in tracking, or bbox memory was dropped - try reinitializing
-                        try:
-                            print(f'\nFrame {frame_idx}: Matching failed, reinitializing graph')
-                            new_graph = graphInit(new_graph)
-                            analysis_log.append(f'Frame {frame_idx}: Tracking failed, reinitialized graph\n')
-                        except Exception as e2:
-                            frame_failed = True
-                            analysis_log.append(f'Frame {frame_idx}: Error in tracking and reinitialization - {str(e2)}\n')
-                    else:
-                        # Later in tracking - this is a real error
-                        frame_failed = True
-                        analysis_log.append(f'Frame {frame_idx}: Error in tracking - {str(e)}\n')
+                    log_file.write("Total errors: 0\n")
+                    log_file.write("Error rate: 1.0")
+                log_file.write("\n")
+        
+            detailed_log_path = os.path.join(output_folders['result'], "detailed_log.txt")
+            with open(detailed_log_path, 'w+') as log_file:
+                # Write detailed log
+                log_file.write("Detailed log:\n")
+                for log_entry in analysis_log:
+                    log_file.write(log_entry)
+        
+            print(f'Results saved to {output_folders["result"]}')
+            if error_count > 0:
+                print(f'Warning: {error_count} errors occurred during tracking (see log.txt)')
 
-            if not frame_failed:
-                try:
-                    new_rsml, new_lateral_count = createTree(
-                        conf,
-                        frame_idx,
-                        images,
-                        new_graph,
-                        new_skeleton.copy(),
-                        new_skeleton_overlay.copy()
-                    )
-                except Exception as e:
-                    # RSML creation failed - graph is still good, just can't export
-                    # Don't fail the frame, just log it
-                    analysis_log.append(f'Frame {frame_idx}: Warning in RSML creation - {str(e)}\n')
-                    new_rsml = current_rsml  # Use previous RSML
-                    new_lateral_count = current_lateral_count
-            
-            if frame_failed:
-                # Frame failed - keep previous state (mask/graph still last-good)
-                if frame_idx - growth_start_frame >= 50:
-                    error_count += 1
-                
-                frame_errors.append(1)
-            else:
-                # Frame succeeded - update state
-                current_root_mask = new_root_mask
-                current_skeleton_overlay = new_skeleton_overlay
-                current_graph = new_graph
-                current_rsml = new_rsml
-                current_lateral_count = new_lateral_count
-                current_hypocotyl_length = new_hypocotyl_length
-                current_hypocotyl_skeleton = new_hypocotyl_skeleton
-                current_root_base = updated_root_base
-                current_bbox = new_bbox
-                tracking_lost = False
-                
-                frame_errors.append(0)
-            
-            frame_name = getImgName(images[frame_idx], conf)
-            saveImages(conf, images, frame_idx, current_root_mask, current_graph, current_skeleton_overlay, current_hypocotyl_skeleton)
-            saveGraph(current_graph, conf, frame_name)
-            saveRSML(current_rsml, conf, frame_name)
-            saveProps(frame_name, frame_idx, current_graph, csv_writer, current_lateral_count, current_hypocotyl_length)
-        
-        print('\n\nGrowth tracking complete')
-        print('Saving outputs...')
-        log_path = os.path.join(output_folders['result'], "log.txt")
-        with open(log_path, 'w+') as log_file:
-            log_file.write("Analysis completed: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
-            log_file.write(f"Growth start frame: {growth_start_frame}\n")
-            log_file.write(f"Total frames analyzed: {total_frames}\n")
-            log_file.write(f"Growth frames tracked: {total_frames - growth_start_frame}\n")
-            
-            # Calculate error statistics (only for frames after initialization)
-            growth_frames = total_frames - growth_start_frame
-            if growth_frames > 0:
-                error_rate = round(error_count / growth_frames, 3)
-                log_file.write(f"Total errors: {error_count}\n")
-                log_file.write(f"Error rate: {error_rate}")
-            else:
-                log_file.write("Total errors: 0\n")
-                log_file.write("Error rate: 1.0")
-            log_file.write("\n")
-        
-        detailed_log_path = os.path.join(output_folders['result'], "detailed_log.txt")
-        with open(detailed_log_path, 'w+') as log_file:
-            # Write detailed log
-            log_file.write("Detailed log:\n")
-            for log_entry in analysis_log:
-                log_file.write(log_entry)
-        
-        print(f'Results saved to {output_folders["result"]}')
-        if error_count > 0:
-            print(f'Warning: {error_count} errors occurred during tracking (see log.txt)')
-
-        cleanup_superseded_results(plant_slot_path(conf), output_folders['result'])
+            cleanup_superseded_results(plant_slot_path(conf), output_folders['result'])
     
+    finally:
+        mask_stacks.close()
     return

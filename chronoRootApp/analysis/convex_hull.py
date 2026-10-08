@@ -13,6 +13,13 @@ from typing import Tuple, List
 # Import shared utilities
 from analysis.utils import report_utils as utils
 from analysis.utils.fileUtilities import convertFromPathSafe, normalize_factor_value
+from analysis.utils.tiff_stack import (
+    graph_path_for_name,
+    mask_stack_paths,
+    read_tiff_page,
+    result_frame_names,
+    tiff_n_frames,
+)
 from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 from analysis.time_windows import (
     closest_timed_path,
@@ -37,6 +44,78 @@ plt.switch_backend('agg')
 PADDING_X = 200 # Pixel padding used for alignment
 PIXEL_SIZE_MM = 0.04 # Conversion factor
 
+
+def _hour_frame_index(n_frames, timestep, hour):
+    imgs_per_day = int(24 * (60 / max(int(timestep or 15), 1)))
+    img_idx = int(hour * imgs_per_day / 24) if hour is not None and hour >= 0 else 0
+    if n_frames <= 0:
+        return 0
+    if img_idx >= n_frames:
+        return n_frames - 1
+    return max(0, img_idx)
+
+
+def _legacy_seg_pngs(seg_folder):
+    return utils.load_paths(seg_folder, "*.png")
+
+
+def load_plant_seg_and_graph(r_path, target=None, timestep=15, hour=None, use_last=False):
+    """Load one binary Seg frame and the matching graph path (TIFF or legacy PNG)."""
+    layout = mask_stack_paths(r_path)
+    graph_folder = os.path.join(r_path, "Graphs")
+    names = result_frame_names(r_path)
+
+    if layout["kind"] == "tiff" and os.path.isfile(layout["seg"]):
+        n_pages = tiff_n_frames(layout["seg"])
+        if n_pages <= 0:
+            return None, None
+        if use_last:
+            idx = n_pages - 1
+        elif target is not None and names:
+            chosen = closest_timed_path(names, target)
+            idx = names.index(chosen) if chosen is not None else _hour_frame_index(n_pages, timestep, hour)
+        else:
+            idx = _hour_frame_index(n_pages, timestep, hour)
+        idx = max(0, min(idx, n_pages - 1))
+        img = read_tiff_page(layout["seg"], idx)
+        if img is None:
+            return None, None
+        graph_file = graph_path_for_name(graph_folder, names[idx]) if idx < len(names) else None
+        return img, graph_file
+
+    seg_files = _legacy_seg_pngs(layout["seg"])
+    if not seg_files:
+        return None, None
+    if use_last:
+        current_seg_file = seg_files[-1]
+    else:
+        current_seg_file = closest_timed_path(seg_files, target) if target is not None else None
+        if current_seg_file is None:
+            current_seg_file = seg_files[_hour_frame_index(len(seg_files), timestep, hour)]
+    img = cv2.imread(current_seg_file, 0)
+    if img is None:
+        return None, None
+    graph_file = os.path.join(
+        graph_folder,
+        os.path.basename(current_seg_file).replace("png", "xml.gz"),
+    )
+    return img, graph_file
+
+
+def _read_graph(graph_file, graph_folder):
+    if graph_file:
+        try:
+            return nx.read_graphml(graph_file)
+        except Exception:
+            pass
+    fallback_graphs = utils.load_paths(graph_folder, "*.xml.gz")
+    if not fallback_graphs:
+        return None
+    try:
+        return nx.read_graphml(fallback_graphs[-1])
+    except Exception:
+        return None
+
 def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Scans all experiments to determine the maximum biological bounding box relative to the seed.
@@ -54,26 +133,14 @@ def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, in
         result_paths = utils.load_paths(exp_path, '*/*/*/Results*')
         
         for r_path in result_paths:            
-            # 1. Load Last Segmentation Image
-            seg_folder = os.path.join(r_path, 'Images/Seg/')
-            seg_files = utils.load_paths(seg_folder, "*.png")
-            if not seg_files: continue
-            
-            # Read image
-            img = cv2.imread(seg_files[-1], 0)
-            
-            # Apply standard padding for alignment
+            img, graph_path = load_plant_seg_and_graph(r_path, use_last=True)
+            if img is None:
+                continue
+
             img = np.pad(img, ((0,0), (PADDING_X, 0)))
-            
-            # 2. Load Graph to find tips for rotation
-            graph_folder = os.path.join(r_path, 'Graphs/')
-            # Try to find corresponding graph file
-            graph_filename = os.path.basename(seg_files[-1]).replace('png', 'xml.gz')
-            graph_path = os.path.join(graph_folder, graph_filename)
-            
-            try: 
-                g = nx.read_graphml(graph_path)
-            except: 
+
+            g = _read_graph(graph_path, os.path.join(r_path, 'Graphs/'))
+            if g is None:
                 continue
 
             # Find root endpoints (Start and Tip)
@@ -195,11 +262,6 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
             if not csv_files: continue
             df_temporal = pd.read_csv(csv_files[0])
 
-            seg_path = os.path.join(r_path, 'Images/Seg/')
-            seg_files = utils.load_paths(seg_path, "*.png")
-            if not seg_files:
-                continue
-
             t0 = None
             if 'Date' in df_temporal.columns:
                 dates = pd.to_datetime(df_temporal['Date'], errors='coerce').dropna()
@@ -207,28 +269,15 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
                     group = match_time_group(groups, dates.min(), dates.max()) if groups else None
                     t0 = parse_datetime(group.get('t0')) if group else parse_datetime(dates.min())
             target = (t0 + pd.Timedelta(hours=hour)) if t0 is not None else None
-            current_seg_file = closest_timed_path(seg_files, target) if target is not None else None
-            if current_seg_file is None:
-                imgs_per_day = int(24 * (60 / max(int(timestep or 15), 1)))
-                img_idx = int(hour * imgs_per_day / 24) if hour >= 0 else 0
-                if img_idx >= len(seg_files):
-                    current_seg_file = seg_files[-1]
-                else:
-                    current_seg_file = seg_files[img_idx]
-            
-            img = cv2.imread(current_seg_file, 0)
-            
-            # Load Graph
-            graph_folder = os.path.join(r_path, 'Graphs/')
-            graph_file = current_seg_file.replace(seg_path, graph_folder).replace('png', 'xml.gz')
-            
-            try: 
-                g = nx.read_graphml(graph_file)
-            except: 
-                # Fallback to last available graph
-                fallback_graphs = utils.load_paths(graph_folder, "*.xml.gz")
-                if not fallback_graphs: continue
-                g = nx.read_graphml(fallback_graphs[-1])
+            img, graph_file = load_plant_seg_and_graph(
+                r_path, target=target, timestep=timestep, hour=hour
+            )
+            if img is None:
+                continue
+
+            g = _read_graph(graph_file, os.path.join(r_path, 'Graphs/'))
+            if g is None:
+                continue
 
             # --- Pre-processing (Padding) ---
             img = np.pad(img, ((0,0), (PADDING_X, 0)))

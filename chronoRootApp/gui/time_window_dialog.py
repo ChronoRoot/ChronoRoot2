@@ -51,7 +51,14 @@ def _format_display_datetime(value):
 
 
 def _overlay_saved_groups(saved, detected):
-    """Keep user start/t0 on detected groups matched by id."""
+    """Keep a saved window start and anchor when they still belong to this acquisition.
+
+    Groups are matched by id. The saved start and anchor are copied only when
+    the saved acquisition span still overlaps the span just detected for that
+    id. The same group numbers show up in every project; without the overlap
+    check, the previous project's clock times are painted onto the new one.
+    Returns the merged rows and how many saved groups were actually reused.
+    """
     saved_by_id = {}
     for group in saved or []:
         try:
@@ -59,6 +66,7 @@ def _overlay_saved_groups(saved, detected):
         except (TypeError, ValueError):
             continue
     merged = []
+    kept = 0
     for det in detected or []:
         row = dict(det)
         try:
@@ -67,12 +75,23 @@ def _overlay_saved_groups(saved, detected):
             gid = 0
         old = saved_by_id.get(gid)
         if old is not None:
-            if old.get('start'):
-                row['start'] = old['start']
-            if old.get('t0'):
-                row['t0'] = old['t0']
+            old_start = parse_datetime(old.get('spanStart'))
+            old_end = parse_datetime(old.get('spanEnd'))
+            new_start = parse_datetime(det.get('spanStart'))
+            new_end = parse_datetime(det.get('spanEnd'))
+            spans_overlap = (
+                None not in (old_start, old_end, new_start, new_end)
+                and old_start <= new_end
+                and new_start <= old_end
+            )
+            if spans_overlap:
+                kept += 1
+                if old.get('start'):
+                    row['start'] = old['start']
+                if old.get('t0'):
+                    row['t0'] = old['t0']
         merged.append(row)
-    return merged
+    return merged, kept
 
 
 def _draw_axis_end_labels(painter, width, height, left_text, right_text, left=8):
@@ -485,7 +504,7 @@ class TimeGroupDetectWorker(QtCore.QObject):
                 return
             groups = detect_time_groups(data)
             duration = default_duration_hours(groups, data)
-            sources = time_period_sources(self.main_folder)
+            sources = time_period_sources(self.main_folder, spans=data)
             self.finished.emit({
                 'groups': groups_to_config(groups),
                 'duration': int(duration) if duration is not None else None,
@@ -508,6 +527,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.main_folder = ''
         self._saved_groups = []
         self._saved_sources = []
+        self._detected_sources = []
         self._duration_from_conf = False
         self._detect_generation = 0
         self._detect_thread = None
@@ -671,18 +691,24 @@ class TimeWindowDialog(QtWidgets.QDialog):
             self.show_ticks_check.setChecked(bool(conf.get('showFigureClockTicks')))
         else:
             self.show_ticks_check.setChecked(mode != 'anchor')
-        groups = conf.get('timeGroups') or []
-        self._saved_groups = list(groups)
+        groups = list(conf.get('timeGroups') or [])
+        self._saved_groups = groups
         self._saved_sources = [str(s) for s in list(conf.get('timePeriodSources') or [])]
+        self._detected_sources = []
         self._updating = False
-        if groups:
-            self._set_groups(groups)
         self._sync_ticks_enabled()
         self._update_legend()
         self._sync_anchor_fields()
+        # Do not paint the saved groups yet. They may belong to the project
+        # that was open before this folder was selected. Detection fills the
+        # table, and the saved start/anchor is reused only when it still
+        # matches the videos in main_folder.
         if self.main_folder:
             self._start_detect()
-        elif not groups:
+        elif groups:
+            self._set_groups(groups)
+        else:
+            self._set_groups([])
             self.timeline.set_empty_text("Select a project to detect time groups")
 
     def _set_detecting(self, detecting):
@@ -691,8 +717,6 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.preview_btn.setEnabled(not detecting)
         if detecting:
             self.timeline.set_empty_text("Detecting groups…")
-        else:
-            self.timeline.set_empty_text("No groups to show on the timeline")
 
     def _stop_detect_thread(self):
         self._detect_generation += 1
@@ -710,6 +734,12 @@ class TimeWindowDialog(QtWidgets.QDialog):
             return
         self._stop_detect_thread()
         generation = self._detect_generation
+        # Drop rows already on screen before the scan finishes. A previous
+        # project's groups used to stay visible for the whole scan, which is
+        # what the dialog showed after a folder change.
+        self._detected_sources = []
+        self.timeline.set_empty_text("Detecting groups…")
+        self._set_groups([])
         self._set_detecting(True)
         worker = TimeGroupDetectWorker(self.main_folder)
         thread = QtCore.QThread(self)
@@ -733,6 +763,11 @@ class TimeWindowDialog(QtWidgets.QDialog):
         if generation != self._detect_generation:
             return
         self._set_detecting(False)
+        # Leave the table empty and block OK. Accepting here would save an
+        # empty period over the one stored for this project.
+        if self._ok_button is not None:
+            self._ok_button.setEnabled(False)
+        self.timeline.set_empty_text("Could not detect time groups")
         QtWidgets.QMessageBox.warning(
             self, "Analysis period", f"Failed to detect time groups:\n{message}",
         )
@@ -743,30 +778,40 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self._set_detecting(False)
         payload = payload or {}
         detected = list(payload.get('groups') or [])
-        if payload.get('empty') or not detected:
-            if not self._group_rows:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "No acquisitions found",
-                    "No processed videos or image timestamps were found. "
-                    "Process a video first (or finish plant analysis so Results_raw files exist).",
-                )
-            return
         sources = [str(s) for s in list(payload.get('sources') or [])]
-        sources_match = bool(
+        self._detected_sources = sources
+        if payload.get('empty') or not detected:
+            self.timeline.set_empty_text(
+                "No processed videos or image timestamps were found"
+            )
+            self._set_groups([])
+            QtWidgets.QMessageBox.information(
+                self,
+                "No acquisitions found",
+                "No processed videos or image timestamps were found. "
+                "Process a video first (or finish plant analysis so Results_raw files exist).",
+            )
+            return
+
+        # The saved period is reused only when it was built for this same set
+        # of videos and its clock spans still overlap what we just found.
+        # Otherwise the table shows the new project's own acquisitions, and
+        # the duration follows those acquisitions instead of the previous project.
+        same_acquisitions = bool(
             self._saved_groups
             and self._saved_sources
             and sources
             and self._saved_sources == sources
         )
-        if sources_match:
-            groups = _overlay_saved_groups(self._saved_groups, detected)
+        if same_acquisitions:
+            groups, kept_saved_windows = _overlay_saved_groups(self._saved_groups, detected)
         else:
             groups = detected
-            if not self._duration_from_conf:
-                duration = payload.get('duration')
-                if duration not in (None, ''):
-                    self.duration_edit.setValue(max(1, int(duration)))
+            kept_saved_windows = 0
+        if not kept_saved_windows or not self._duration_from_conf:
+            duration = payload.get('duration')
+            if duration not in (None, ''):
+                self.duration_edit.setValue(max(1, int(duration)))
         self._set_groups(groups)
 
     def reject(self):
@@ -953,5 +998,8 @@ class TimeWindowDialog(QtWidgets.QDialog):
             'showFigureClockTicks': show_ticks,
             'figureClockTicks': ticks,
             'timeGroups': groups_to_config(self._groups_from_rows()),
-            'timePeriodSources': time_period_sources(self.main_folder),
+            # Fingerprint from the scan that filled this dialog. Re-walking the
+            # project here would stamp a different set than the one on screen
+            # if files changed mid-edit, and it would also freeze the UI.
+            'timePeriodSources': list(self._detected_sources) if self.main_folder else list(self._saved_sources),
         }

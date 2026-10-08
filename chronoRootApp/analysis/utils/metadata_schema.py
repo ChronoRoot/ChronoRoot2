@@ -183,7 +183,8 @@ def result_paths(result_dir):
         "graphs": os.path.join(result_dir, "Graphs"),
         "images": images,
         "rsml": os.path.join(result_dir, "RSML"),
-        "seg_multi": os.path.join(images, "SegMulti"),
+        "seg": os.path.join(images, "Seg.tif"),
+        "seg_multi": os.path.join(images, "SegMulti.tif"),
     }
 
 

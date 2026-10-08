@@ -12,7 +12,13 @@ from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSize, pyqtSignal, QPointF
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 
 from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
+from analysis.utils.fileUtilities import list_video_pngs
 from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
+from analysis.utils.tiff_stack import (
+    TiffStackReader,
+    load_seg_frame,
+    mask_stack_paths,
+)
 
 
 # --- UTILS ---
@@ -34,11 +40,9 @@ def load_plant_data(plant_path):
 
     bbox = get_bounding_box(conf)
 
-    imagePath = video_image_dir(conf)
-    segPath = os.path.join(plant_path, "Images", "SegMulti")
-
-    images = loadPath(imagePath, ext="*.png") if imagePath and os.path.exists(imagePath) else []
-    segs = loadPath(segPath, ext="*.png")
+    images, image_path = list_video_pngs(conf)
+    if image_path:
+        conf["ImagePath"] = image_path
 
     if not images:
         local_img_path = os.path.join(plant_path, "Images")
@@ -46,7 +50,13 @@ def load_plant_data(plant_path):
             images = loadPath(local_img_path, ext="*.png")
 
     if not images:
-        raise FileNotFoundError(f"No images found. Checked: {imagePath}")
+        raise FileNotFoundError(f"No images found. Checked: {video_image_dir(conf)}")
+
+    layout = mask_stack_paths(plant_path)
+    if layout["kind"] == "tiff" and os.path.isfile(layout["seg_multi"]):
+        segs = TiffStackReader(layout["seg_multi"], bgr=True)
+    else:
+        segs = loadPath(layout["seg_multi"], ext="*.png")
 
     return images, segs, bbox, conf
 
@@ -196,7 +206,8 @@ class ChronoViewWindow(QMainWindow):
         self.bbox = bbox
         self.conf = conf
 
-        self.n = min(len(images), len(segFiles)) if segFiles else len(images)
+        n_seg = len(segFiles) if segFiles is not None else 0
+        self.n = min(len(images), n_seg) if n_seg else len(images)
         self.idx = 0
         self.playing = False
         self.use_seg = False
@@ -282,8 +293,8 @@ class ChronoViewWindow(QMainWindow):
             if 0 <= y1 < y2 <= h and 0 <= x1 < x2 <= w:
                 img = img[y1:y2, x1:x2]
 
-        if self.use_seg and self.segFiles and self.idx < len(self.segFiles):
-            seg = cv2.imread(self.segFiles[self.idx], cv2.IMREAD_UNCHANGED)
+        if self.use_seg and self.segFiles is not None:
+            seg = load_seg_frame(self.segFiles, self.idx)
             if seg is not None:
                 img = _overlay_label_segmentation(img, seg)
 
@@ -316,6 +327,11 @@ class ChronoViewWindow(QMainWindow):
     def toggle_seg(self):
         self.use_seg = not self.use_seg
         self.update_display()
+
+    def closeEvent(self, event):
+        if isinstance(self.segFiles, TiffStackReader):
+            self.segFiles.close()
+        super().closeEvent(event)
 
 
 class PlantROISelectorWindow(QDialog):

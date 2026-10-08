@@ -192,28 +192,67 @@ class ConfigStore:
         'snapshotHoursAngles', 'daysAngles',
     )
     for key, default in (
-        ('timeSyncMode', 'clock'),
-        ('timeDurationHours', None),
         ('reportFolderName', 'Report'),
-        ('figureClockTicks', ['00:00']),
-        ('showFigureClockTicks', None),
         ('snapshotHours', None),
         ('snapshotHoursConvex', None),
         ('snapshotHoursAngles', None),
-        ('timeGroups', []),
-        ('timePeriodSources', []),
     ):
       if key in data:
         setattr(host, key, data[key])
-      elif key == 'timePeriodSources':
-        setattr(host, key, [])
-      elif key == 'showFigureClockTicks':
-        mode = getattr(host, 'timeSyncMode', 'clock')
-        setattr(host, key, mode != 'anchor')
       elif not hasattr(host, key):
         setattr(host, key, default)
+    # Period keys are always replaced. Leaving them in place when a file
+    # omitted them kept the previous project's windows on the window.
+    self.apply_analysis_period(host, data)
     if hasattr(host, '_sync_snapshot_hour_fields'):
       host._sync_snapshot_hour_fields()
+
+  def apply_analysis_period(self, host, data):
+    """Copy one project's analysis period onto the window.
+
+    The period is the sync mode, duration, clock ticks, time groups, and the
+    acquisition fingerprint (timePeriodSources). It is stored on the window and
+    also inside each project's project_config.json. Callers must pass that
+    project's file, or an empty dict when the project has no saved period.
+
+    A missing key is a reset, not "keep whatever was already there". The old
+    loader only wrote these attributes the first time, so after a project
+    change the previous groups were still what Set analysis period displayed.
+    """
+    data = data if isinstance(data, dict) else {}
+
+    mode = data.get('timeSyncMode') if 'timeSyncMode' in data else 'clock'
+    if mode not in ('clock', 'anchor'):
+      mode = 'clock'
+    host.timeSyncMode = mode
+
+    duration = data.get('timeDurationHours') if 'timeDurationHours' in data else None
+    if duration == '':
+      duration = None
+    host.timeDurationHours = duration
+
+    ticks = data.get('figureClockTicks') if 'figureClockTicks' in data else ['00:00']
+    if isinstance(ticks, str):
+      ticks = [part.strip() for part in ticks.replace(';', ',').split(',') if part.strip()]
+    elif isinstance(ticks, (list, tuple)):
+      ticks = [str(part) for part in ticks]
+    else:
+      ticks = ['00:00']
+    host.figureClockTicks = ticks or ['00:00']
+
+    groups = data.get('timeGroups') if 'timeGroups' in data else []
+    host.timeGroups = list(groups) if isinstance(groups, list) else []
+
+    sources = data.get('timePeriodSources') if 'timePeriodSources' in data else []
+    if isinstance(sources, (list, tuple)):
+      host.timePeriodSources = [str(item) for item in sources]
+    else:
+      host.timePeriodSources = []
+
+    if 'showFigureClockTicks' in data and data.get('showFigureClockTicks') is not None:
+      host.showFigureClockTicks = bool(data.get('showFigureClockTicks'))
+    else:
+      host.showFigureClockTicks = mode != 'anchor'
 
   def resolve_config_path(self, host):
     project_cfg = os.path.join(host.projectField.text(), PROJECT_CONFIG_NAME)

@@ -41,7 +41,6 @@ from analysis.utils.metadata_schema import (
     hydrate_run_config,
     load_json,
     pending_analysis_path,
-    video_image_dir,
 )
 from analysis.utils.report_utils import natural_key as natural_keys
 from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
@@ -243,6 +242,35 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
         self._last_seen_project = key
         self.invalidate_plant_inventory()
+        # The analysis period belongs to a project folder. Swap it here, before
+        # any later save, or the previous project's groups stay selected.
+        self._load_analysis_period_for_current_project()
+
+    def _load_analysis_period_for_current_project(self):
+        """Replace the in-memory analysis period with the one saved for this folder.
+
+        Set analysis period reads timeGroups from the window, and opening it
+        also writes those groups into the current project_config.json. Changing
+        the folder used to leave the previous project's groups in memory, so the
+        dialog opened on the old windows and the save copied them into the new
+        project. This reads the selected folder's own config instead. A folder
+        with no config, or a config that never stored a period, clears the
+        groups so the dialog detects windows from that folder's videos.
+        """
+        folder = ''
+        if hasattr(self, 'projectField') and self.projectField is not None:
+            folder = self.projectField.text().strip()
+        data = {}
+        if folder:
+            path = os.path.join(folder, PROJECT_CONFIG_NAME)
+            if os.path.isfile(path):
+                try:
+                    loaded = load_json(path)
+                    data = loaded if isinstance(loaded, dict) else {}
+                except Exception as exc:
+                    print(f"Error reading analysis period from {path}: {exc}")
+                    data = {}
+        self.config_store.apply_analysis_period(self, data)
 
     def force_refresh_plant_inventory(self, prefer_index=None):
         """Manual Refresh: always rescan the current project."""
@@ -422,6 +450,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.stats_config_dialog.exec_()
 
     def open_time_window_dialog(self):
+        # Load this folder's period before saving. saveFieldsIntoJson writes
+        # timeGroups into the project that is selected right now; saving first
+        # used to stamp the previous project's windows into the new folder.
+        self._load_analysis_period_for_current_project()
         self.saveFieldsIntoJson()
         dialog = TimeWindowDialog(self)
         dialog.set_main_folder(self.projectField.text().strip())
@@ -728,7 +760,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         
         metadata = load_result_metadata(self.selected_plant)
         bbox = get_bounding_box(metadata)
-        overlayPath = os.path.join(self.selected_plant, "Images", "SegMulti")
         
         experiment = self.selected_plant.split(os.path.sep)[-5]
         rpi = self.selected_plant.split(os.path.sep)[-4]
@@ -741,24 +772,45 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if not os.path.exists(image2_path):
             image2_path = None
 
-        # list all images in the folder with pathlib, then sort them
+        from analysis.utils.fileUtilities import list_video_pngs
+        from analysis.utils.tiff_stack import mask_stack_paths, tiff_n_frames
+
+        layout = mask_stack_paths(self.selected_plant)
+        origs, _video_dir = list_video_pngs(metadata)
+
+        if layout["kind"] == "tiff" and os.path.isfile(layout["seg_multi"]):
+            n_pages = tiff_n_frames(layout["seg_multi"])
+            overlay = layout["seg_multi"]
+            if n_pages <= 0:
+                return None, image2_path, overlay, bbox
+            if origs:
+                image1_path = origs[min(len(origs), n_pages) - 1]
+            else:
+                image1_path = None
+            return image1_path, image2_path, overlay, bbox
+
+        overlayPath = layout["seg_multi"]
         pathlib_dir = pathlib.Path(overlayPath)
-        image_files = pathlib_dir.glob('*.png')
+        image_files = pathlib_dir.glob('*.png') if pathlib_dir.is_dir() else []
         image_files = [str(file) for file in image_files]
         image_files = sorted(image_files, key=lambda x: natural_keys(x))
 
         if len(image_files) == 0:
-            return "Image not found", image2_path, overlayPath, None
+            return None, image2_path, overlayPath, None
         
         overlay = image_files[-1]
-        image1_path = os.path.join(video_image_dir(metadata), overlay.split(os.path.sep)[-1])
+        last_name = overlay.split(os.path.sep)[-1]
+        image1_path = None
+        for candidate in reversed(origs):
+            if os.path.basename(candidate) == last_name:
+                image1_path = candidate
+                break
+        if image1_path is None and origs:
+            image1_path = origs[-1]
 
         return image1_path, image2_path, overlay, bbox
 
     def update_image_labels(self):
-        # Lazy import to avoid collisions with pyqt
-        import cv2
-        
         # Add safety check
         if not hasattr(self, 'plant_dropdown') or self.plant_dropdown is None:
             return
@@ -785,12 +837,17 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         pixmap2 = None
 
         # Check if image paths exist
-        if image1_path is None:
+        if image1_path is None and overlay is None:
             self.image_label1.clear()
             pixmap1 = QtGui.QPixmap("placeholder_figures/plant_placeholder.png")
             self.image_label1.set_pixmap(pixmap1)
             self.image_label1.show()
-        elif not os.path.exists(image1_path) or not os.path.exists(overlay):
+        elif (
+            not image1_path
+            or not os.path.exists(image1_path)
+            or not overlay
+            or not os.path.exists(overlay)
+        ):
             self.image_label1.clear()
             pixmap1 = QtGui.QPixmap("placeholder_figures/plant_placeholder_2.png")
             self.image_label1.set_pixmap(pixmap1)
@@ -799,25 +856,33 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.image_label1.clear()
 
             try:
-                import plant_viewer
+                from analysis.utils.tiff_stack import overlay_on_rgb, read_tiff_page, tiff_n_frames
 
-                img = cv2.imread(image1_path)
-                if img is None:
+                with Image.open(image1_path) as src:
+                    img = np.array(src.convert("RGB"))
+                if img is None or img.size == 0:
                     raise ValueError(f"Could not read image: {image1_path}")
 
-                y1, y2, x1, x2 = bbox
-                h, w = img.shape[:2]
-                if 0 <= y1 < y2 <= h and 0 <= x1 < x2 <= w:
-                    img = img[y1:y2, x1:x2]
+                if bbox is not None and len(bbox) == 4:
+                    y1, y2, x1, x2 = bbox
+                    h, w = img.shape[:2]
+                    if 0 <= y1 < y2 <= h and 0 <= x1 < x2 <= w:
+                        img = img[y1:y2, x1:x2]
 
                 if overlay_on and os.path.exists(overlay):
-                    seg = cv2.imread(overlay, cv2.IMREAD_UNCHANGED)
+                    if str(overlay).lower().endswith((".tif", ".tiff")):
+                        n_pages = tiff_n_frames(overlay)
+                        seg = read_tiff_page(overlay, n_pages - 1, bgr=False) if n_pages else None
+                    else:
+                        with Image.open(overlay) as ov:
+                            if ov.mode == "L":
+                                seg = np.array(ov)
+                            else:
+                                seg = np.array(ov.convert("RGB"))
                     if seg is not None:
-                        img = plant_viewer._overlay_label_segmentation(img, seg)
+                        img = overlay_on_rgb(img, seg)
 
-                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                if not rgb.flags['C_CONTIGUOUS']:
-                    rgb = np.ascontiguousarray(rgb)
+                rgb = np.ascontiguousarray(img)
                 rh, rw, _ = rgb.shape
                 qImg = QtGui.QImage(
                     rgb.data.tobytes(), rw, rh, 3 * rw, QtGui.QImage.Format_RGB888
