@@ -14,10 +14,12 @@ from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
 from analysis.utils.fileUtilities import list_video_pngs
 from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
+from analysis.time_windows import elapsed_day_clock
 from analysis.utils.tiff_stack import (
     TiffStackReader,
     load_seg_frame,
     mask_stack_paths,
+    result_frame_names,
 )
 
 
@@ -29,7 +31,11 @@ def loadPath(path, ext="*.png"):
 def load_plant_data(plant_path):
     """
     Helper function to load data from the plant directory.
-    Returns (images, segs, bbox, conf) or raises FileNotFoundError.
+    Returns (images, segs, bbox, conf, clock_names) or raises FileNotFoundError.
+
+    clock_names comes from Results_raw.csv when preprocessing has written it,
+    in frame order, so the full-sequence viewer does not re-read every image
+    name to place the clock.
     """
     json_path = os.path.join(plant_path, 'metadata.json')
     if not os.path.exists(json_path):
@@ -58,7 +64,7 @@ def load_plant_data(plant_path):
     else:
         segs = loadPath(layout["seg_multi"], ext="*.png")
 
-    return images, segs, bbox, conf
+    return images, segs, bbox, conf, result_frame_names(plant_path)
 
 
 # --- CUSTOM SLIDER FOR CLICK-TO-JUMP ---
@@ -199,7 +205,7 @@ def _overlay_label_segmentation(img, seg, colors=None):
 
 # --- MAIN WINDOW CLASS ---
 class ChronoViewWindow(QMainWindow):
-    def __init__(self, images, segFiles, bbox, conf, parent=None):
+    def __init__(self, images, segFiles, bbox, conf, parent=None, clock_names=None):
         super().__init__(parent)
         self.images = images
         self.segFiles = segFiles
@@ -219,10 +225,17 @@ class ChronoViewWindow(QMainWindow):
             max_frames = limit_days * frames_per_day
             self.n = min(self.n, max_frames)
 
-        time_arr = np.arange(0, self.n * self.timeStep, self.timeStep)
-        self.days = (time_arr // 1440).astype('int')
-        self.hours = ((time_arr / 60) % 24).astype('int')
-        self.minutes = (time_arr % 60).astype('int')
+        # View full sequence passes Results_raw names, already in frame order.
+        # Preview only has the image paths. Both carry the capture stamp, and
+        # the clock is elapsed from the first picture rather than frame index.
+        saved = list(clock_names or [])
+        if len(saved) >= self.n:
+            clock_source = saved[:self.n]
+        else:
+            clock_source = list(self.images[:self.n])
+        self.days, self.hours, self.minutes = elapsed_day_clock(
+            clock_source, self.timeStep,
+        )
 
         self.setWindowTitle("ChronoRoot Viewer")
         self.resize(900, 800)

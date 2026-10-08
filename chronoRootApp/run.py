@@ -1147,11 +1147,13 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             import plant_viewer
             
             # Load data using the helper function
-            images, segs, bbox, conf = plant_viewer.load_plant_data(path)
+            images, segs, bbox, conf, clock_names = plant_viewer.load_plant_data(path)
             
             # Create and show window
             # We attach it to 'self' so it doesn't get garbage collected
-            self.review_window = plant_viewer.ChronoViewWindow(images, segs, bbox, conf, parent=None)
+            self.review_window = plant_viewer.ChronoViewWindow(
+                images, segs, bbox, conf, parent=None, clock_names=clock_names,
+            )
             self.review_window.show()
             
         except FileNotFoundError as e:

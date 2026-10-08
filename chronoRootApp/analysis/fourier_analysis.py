@@ -43,36 +43,35 @@ def _odd_kernel(n, requested):
         k -= 1
     return k if k >= 3 else 0
 
-def _interp_interior_nans(values):
-    """Fill NaNs between the first and last finite samples; keep end pads as NaN."""
-    y = np.asarray(values, dtype=float).copy()
-    finite = np.isfinite(y)
-    if finite.sum() < 2:
-        return y
-    first = int(np.argmax(finite))
-    last = len(y) - 1 - int(np.argmax(finite[::-1]))
-    seg = y[first:last + 1]
-    fin = np.isfinite(seg)
-    if not fin.all():
-        idx = np.arange(len(seg))
-        seg = seg.copy()
-        seg[~fin] = np.interp(idx[~fin], idx[fin], seg[fin])
-        y[first:last + 1] = seg
-    return y
+def _finite_runs(values, hours=None, min_len=1):
+    """Index ranges of samples an FFT or filter may use together.
 
-
-def _fft_ready_signal(values):
-    """Drop leading/trailing NaN pads; interpolate interior gaps. None if too short."""
+    A NaN breaks the run. So does a jump of more than one hour, which is a
+    missing picture even when that empty hour was not stored as its own row.
+    The pieces are not stitched: hour 0 and hour 6 must not look adjacent.
+    """
     y = np.asarray(values, dtype=float)
-    finite = np.isfinite(y)
-    if finite.sum() < 2:
-        return None
-    first = int(np.argmax(finite))
-    last = len(y) - 1 - int(np.argmax(finite[::-1]))
-    interior = _interp_interior_nans(y)[first:last + 1]
-    if not np.isfinite(interior).all() or len(interior) < 2:
-        return None
-    return interior
+    h = None if hours is None else np.asarray(hours, dtype=float)
+    spans = []
+    start = None
+    for i in range(len(y)):
+        ok = np.isfinite(y[i])
+        if h is not None:
+            ok = ok and np.isfinite(h[i])
+        if not ok:
+            if start is not None:
+                spans.append((start, i))
+                start = None
+            continue
+        if start is None:
+            start = i
+            continue
+        if h is not None and h[i] - h[i - 1] > 1.5:
+            spans.append((start, i))
+            start = i
+    if start is not None:
+        spans.append((start, len(y)))
+    return [(a, b) for a, b in spans if b - a >= min_len]
 
 
 def _column_has_signal(df, column):
@@ -122,34 +121,32 @@ class DataProcessor:
     def __init__(self, conf: dict):
         self.conf = conf
 
-    def _prepare_signal(self, values, normalize=False, detrend=False, medfilt=False):
+    def _prepare_signal(self, values, normalize=False, detrend=False, medfilt=False, hours=None):
         m_speed = np.array(values, copy=True, dtype=float)
         valid = np.isfinite(m_speed)
         if valid.sum() < 2:
             return m_speed
-        filled = _interp_interior_nans(m_speed)
-        first = int(np.argmax(valid))
-        last = len(m_speed) - 1 - int(np.argmax(valid[::-1]))
-        work = filled[first:last + 1].copy()
-        if not np.isfinite(work).all():
-            return np.where(valid, m_speed, np.nan)
+        out = np.full(m_speed.shape, np.nan, dtype=float)
         if normalize:
             mean = np.mean(m_speed[valid])
             std = np.std(m_speed[valid])
-            work = (work - mean) / std if std != 0 else work - mean
-        if medfilt:
-            n = len(work)
-            k5 = _odd_kernel(n, 5)
-            k25 = _odd_kernel(n, 25)
-            if k5:
-                work = signal.medfilt(work, k5)
-            if k25:
-                work = work - signal.medfilt(work, k25)
-        if detrend:
-            work = signal.detrend(work)
-        out = np.full(m_speed.shape, np.nan, dtype=float)
-        out[first:last + 1] = work
-        return np.where(valid, out, np.nan)
+        # Smooth and detrend each photographed run on its own. Filling the
+        # gap first would let the missing hour change the values around it.
+        for start, end in _finite_runs(m_speed, hours, min_len=1):
+            work = m_speed[start:end].copy()
+            if normalize:
+                work = (work - mean) / std if std != 0 else work - mean
+            if medfilt:
+                k5 = _odd_kernel(len(work), 5)
+                k25 = _odd_kernel(len(work), 25)
+                if k5:
+                    work = signal.medfilt(work, k5)
+                if k25:
+                    work = work - signal.medfilt(work, k25)
+            if detrend and len(work) >= 2:
+                work = signal.detrend(work)
+            out[start:end] = work
+        return out
 
     def read_and_process_data(self, temporal_df: pd.DataFrame, root: str = 'MainRootLengthGrad (mm/h)',
                              normalize: bool = False, detrend: bool = False,
@@ -175,6 +172,7 @@ class DataProcessor:
             signal_arr = self._prepare_signal(
                 group[root].to_numpy(),
                 normalize=normalize, detrend=detrend, medfilt=medfilt,
+                hours=time_arr,
             )
             if not np.isfinite(signal_arr).any():
                 continue
@@ -212,22 +210,28 @@ class DataProcessor:
 
         combined_df = pd.concat(all_data, ignore_index=True)
         fft_data = []
-        for (exp_type, i), group in combined_df.groupby(['Type', 'i']):
-            fft_input = _fft_ready_signal(group['Signal'].values)
-            if fft_input is None:
-                continue
-            freqs = np.fft.fftfreq(len(fft_input), d=1)
-            fft_vals = np.abs(np.fft.fft(fft_input))
-            fft_df = pd.DataFrame({
-                'Freqs': freqs,
-                'FFT': fft_vals,
-                'Type': exp_type,
-                'i': i,
-                'Experiment': group['Experiment'].iloc[0],
-                'PlateCondition': group['PlateCondition'].iloc[0],
-                'ExtraVariable': group['ExtraVariable'].iloc[0],
-            })
-            fft_data.append(fft_df)
+        # Each contiguous run keeps d=1 hour. A new id per run stops two
+        # pieces of one plant from being averaged into a single spectrum.
+        fft_id = 0
+        for (_exp_type, _i), group in combined_df.groupby(['Type', 'i']):
+            group = group.sort_values('Time')
+            for start, end in _finite_runs(
+                group['Signal'].to_numpy(), group['Time'].to_numpy(), min_len=2,
+            ):
+                fft_input = group['Signal'].to_numpy()[start:end]
+                freqs = np.fft.fftfreq(len(fft_input), d=1)
+                fft_vals = np.abs(np.fft.fft(fft_input))
+                fft_df = pd.DataFrame({
+                    'Freqs': freqs,
+                    'FFT': fft_vals,
+                    'Type': group['Type'].iloc[0],
+                    'i': fft_id,
+                    'Experiment': group['Experiment'].iloc[0],
+                    'PlateCondition': group['PlateCondition'].iloc[0],
+                    'ExtraVariable': group['ExtraVariable'].iloc[0],
+                })
+                fft_data.append(fft_df)
+                fft_id += 1
         if fft_data:
             combined_df = pd.concat([combined_df, pd.concat(fft_data, ignore_index=True)], ignore_index=True)
         return combined_df

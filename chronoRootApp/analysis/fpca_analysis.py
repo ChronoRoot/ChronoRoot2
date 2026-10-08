@@ -67,19 +67,30 @@ def performFPCA(conf_path):
         print('FPCA skipped: selected metrics are not in Temporal_Data.csv')
         return
 
-    magnitudes_dict = {
-        magnitude: temporal_data_df.pivot(
-            columns='Plant_id', values=magnitude, index='ElapsedTime (h)'
-        ).dropna()
-        for magnitude in COLUMNS
-    }
+    # A plant with any missing hour is left out of FPCA. Dropping the hour
+    # instead would delete that time for every plant that was photographed.
+    # The line plot below still uses every observed hour.
+    magnitudes_dict = {}
+    for magnitude in COLUMNS:
+        wide = temporal_data_df.pivot(
+            columns='Plant_id', values=magnitude, index='ElapsedTime (h)',
+        )
+        complete = wide.dropna(axis=1)
+        if complete.shape[1] < 2 or complete.shape[0] < 2:
+            print(
+                f'FPCA skipped for {magnitude}: fewer than 2 plants are finite '
+                'at every hour',
+                flush=True,
+            )
+            continue
+        magnitudes_dict[magnitude] = complete
     get_expid = lambda plant_id: temporal_data_df.set_index('Plant_id')['Experiment'].to_dict()[plant_id]
     genotype_palette = genotype_palette_for_data(temporal_data_df)
     genotype_legend = get_genotype_axis_label(conf)
 
     plt.ioff()
 
-    for magnitude in COLUMNS:
+    for magnitude in magnitudes_dict:
         mag_slug = temporal_metric_slug(magnitude)
 
         # Phase A: original 5x2 overview figure (verbatim layout)

@@ -642,13 +642,15 @@ def makeLateralAnglesPlots(conf):
         snapshot = hours
         elapsed = pd.to_numeric(all_data['ElapsedTime (h)'], errors='coerce')
         for hour in snapshot:
-            delta = (elapsed - int(hour)).abs()
-            if delta.empty:
+            # Only plants imaged at this hour. A missing hour is not filled
+            # by the nearest other measurement.
+            aux = all_data.loc[elapsed == int(hour)].copy()
+            if 'Mean emergence angle' not in aux.columns or aux.empty:
                 continue
-            nearest_hour = elapsed.loc[delta.idxmin()]
-            aux = all_data.loc[elapsed == nearest_hour]
+            aux = aux[pd.to_numeric(aux['Mean emergence angle'], errors='coerce').notna()]
             aux = aux[aux['Mean emergence angle'] > 0]
-            frame.append(aux)
+            if not aux.empty:
+                frame.append(aux)
     
     # Generate emergence angle plots
     if len(frame) > 0:

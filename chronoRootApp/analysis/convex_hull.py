@@ -200,6 +200,38 @@ def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, in
     return (canvas_height, canvas_width), (center_y, center_x)
 
 
+def _hour_metric_row(df_temporal, target, hour):
+    """The hourly row for this snapshot, or None when that hour was not imaged.
+
+    The closest row is accepted only when it falls inside the same hour.
+    A missing length is not replaced by the plant's nearest other hour.
+    """
+    if df_temporal is None or df_temporal.empty:
+        return None
+    if 'TotalLength (mm)' not in df_temporal.columns:
+        return None
+    row = None
+    if 'Date' in df_temporal.columns and target is not None:
+        dates = pd.to_datetime(df_temporal['Date'], errors='coerce')
+        delta = (dates - target).abs()
+        if delta.notna().any():
+            idx = delta.idxmin()
+            if delta.loc[idx] <= pd.Timedelta(minutes=30):
+                row = df_temporal.loc[idx]
+    elif 'ElapsedTime (h)' in df_temporal.columns:
+        elapsed = pd.to_numeric(df_temporal['ElapsedTime (h)'], errors='coerce')
+        match = df_temporal.loc[elapsed == int(hour)]
+        if not match.empty:
+            row = match.iloc[0]
+    if row is None:
+        return None
+    total = pd.to_numeric(row.get('TotalLength (mm)'), errors='coerce')
+    lateral = pd.to_numeric(row.get('LateralRootsLength (mm)'), errors='coerce')
+    if pd.isna(total) or pd.isna(lateral):
+        return None
+    return row
+
+
 def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_shape=None, center_coords=None, rotate_root=True, conf=None, days=None):
     """
     Generates the accumulated heatmaps (atlases) and calculates convex hull metrics.
@@ -269,6 +301,12 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
                     group = match_time_group(groups, dates.min(), dates.max()) if groups else None
                     t0 = parse_datetime(group.get('t0')) if group else parse_datetime(dates.min())
             target = (t0 + pd.Timedelta(hours=hour)) if t0 is not None else None
+            # The snapshot hour must itself have a measured length. A missing
+            # hour stays out of the atlas and the metrics; a neighboring hour
+            # is not used in its place.
+            metric_row = _hour_metric_row(df_temporal, target, hour)
+            if metric_row is None:
+                continue
             img, graph_file = load_plant_seg_and_graph(
                 r_path, target=target, timestep=timestep, hour=hour
             )
@@ -351,24 +389,11 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
                 area_bbox = w * h * (PIXEL_SIZE_MM**2)
                 area_chull = cv2.contourArea(hull_big) * (PIXEL_SIZE_MM**2)
                 
-                # Match temporal data to the selected frame clock time
-                csv_idx = len(df_temporal) - 1
-                if 'Date' in df_temporal.columns and target is not None:
-                    dates = pd.to_datetime(df_temporal['Date'], errors='coerce')
-                    valid = dates.dropna()
-                    if not valid.empty:
-                        csv_idx = int((valid - target).abs().idxmin())
-                elif 'ElapsedTime (h)' in df_temporal.columns:
-                    elapsed = pd.to_numeric(df_temporal['ElapsedTime (h)'], errors='coerce')
-                    valid = elapsed.dropna()
-                    if not valid.empty:
-                        csv_idx = int((valid - hour).abs().idxmin())
-                if csv_idx >= len(df_temporal):
-                    csv_idx = len(df_temporal) - 1
-                
                 try:
-                    total_len = df_temporal['TotalLength (mm)'][csv_idx]
-                    lateral_len = df_temporal['LateralRootsLength (mm)'][csv_idx]
+                    total_len = metric_row['TotalLength (mm)']
+                    lateral_len = metric_row['LateralRootsLength (mm)']
+                    if pd.isna(total_len) or pd.isna(lateral_len):
+                        continue
                     
                     # Store Metrics
                     metrics['area_bbox'].append(area_bbox)

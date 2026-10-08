@@ -7,15 +7,78 @@ Modified version with improved time handling for irregular sampling
 
 import numpy as np
 np.seterr(divide='ignore', invalid='ignore')
-import re
 import pandas as pd
 import os
 from scipy import signal
 import json
 import warnings
 
-from .time_windows import elapsed_hours_from_t0
+from .time_windows import datetime_from_filename, elapsed_hours_from_t0
 from .utils.fileUtilities import expected_hourly_rows
+
+
+def _finite_time_spans(dates, finite, max_gap):
+    """Index ranges [start, end) of samples that can be filtered together.
+
+    A missing picture is not a sample and not a neighbor. A non-finite value
+    or a time gap wider than max_gap starts a new range, so a median filter
+    or a difference never reads across the hole.
+    """
+    dates = pd.to_datetime(pd.Series(dates)).reset_index(drop=True)
+    finite = np.asarray(finite, dtype=bool)
+    spans = []
+    start = None
+    for i, ok in enumerate(finite):
+        if not ok:
+            if start is not None:
+                spans.append((start, i))
+                start = None
+            continue
+        if start is None:
+            start = i
+            continue
+        if dates.iloc[i] - dates.iloc[i - 1] >= max_gap:
+            spans.append((start, i))
+            start = i
+    if start is not None:
+        spans.append((start, len(finite)))
+    return spans
+
+
+def _median_filter_spans(values, spans, requested):
+    """Median-filter each finite run. Short runs keep their own values."""
+    out = np.array(values, dtype=float, copy=True)
+    for start, end in spans:
+        n = end - start
+        if n < 3:
+            continue
+        limit = n if n % 2 else n - 1
+        kernel = min(int(requested), limit)
+        if kernel % 2 == 0:
+            kernel -= 1
+        if kernel >= 3:
+            out[start:end] = signal.medfilt(out[start:end], kernel)
+    return out
+
+
+def _gradient_spans(values, hours, spans):
+    """mm per hour inside each finite run, using the real hour coordinates.
+
+    The missing hour stays NaN. The slope is not taken across that hole, and
+    it is not taken as if neighboring photos were one index step apart.
+    """
+    out = np.full(len(values), np.nan, dtype=float)
+    hours = np.asarray(hours, dtype=float)
+    values = np.asarray(values, dtype=float)
+    for start, end in spans:
+        y = values[start:end]
+        x = hours[start:end]
+        if len(y) < 2 or not np.all(np.isfinite(x)) or np.any(np.diff(x) <= 0):
+            continue
+        edge = 2 if len(y) >= 3 else 1
+        out[start:end] = np.gradient(y, x, edge_order=edge)
+    return out
+
 
 def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5):
     """
@@ -37,9 +100,7 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
     # -----------------------------------------
 
     data = pd.read_csv(pfile)
-    shape = data.shape
-    N = shape[0]
-    
+
     # Check for required columns
     required_cols = ['FileName', 'MainRootLength', 'LateralRootsLength', 'NumberOfLateralRoots']
     missing_cols = [col for col in required_cols if col not in data.columns]
@@ -50,75 +111,43 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
     if 'HypocotylLength' not in data.columns:
         data['HypocotylLength'] = 0.0
     
-    # Read info from the filename
-    dates = []
-    for i in range(0,N):
-        name = data['FileName'][i]
-        nums = re.findall(r'\d+', name)
-        if len(nums) < 5:
+    # Keep photographed frames only. A filename we cannot date is not a
+    # timepoint, and a gap between photos is not filled with a copy of the
+    # previous measurement.
+    stamps = []
+    keep_idx = []
+    for i, name in enumerate(data['FileName'].tolist()):
+        ts = datetime_from_filename(name)
+        if ts is None:
             warnings.warn(f"Cannot parse date from filename: {name}")
             continue
-        date = nums[0] + '-' + nums[1] + '-' + nums[2] + '-' + nums[3] + ':' + nums[4] 
-        dates.append(date)
+        stamps.append(ts)
+        keep_idx.append(i)
+    if not keep_idx:
+        raise ValueError(f"No timestamps found in {pfile}")
+    data = data.iloc[keep_idx].copy()
+    data['Date'] = pd.to_datetime(stamps)
+    data = data.sort_values(by=['Date']).reset_index(drop=True)
 
-    data.insert(data.shape[1], 'Date', dates)
-    data['Date'] = pd.to_datetime(data['Date'], format='%Y-%m-%d-%H:%M')
-    
-    # Sort by date first
-    data = data.sort_values(by=['Date'])
-    data = data.reset_index(drop=True)
-    
-    # Smart time handling with tolerance
-    timeStep = conf['timeStep']
+    try:
+        timeStep = float(conf['timeStep'])
+    except (TypeError, ValueError):
+        timeStep = 15.0
+    if timeStep <= 0:
+        timeStep = 15.0
     timeStep_td = pd.Timedelta(minutes=timeStep)
-        
-    # Find and fill only REAL gaps (larger than timeStep * 2)
-    filled_data = []
-    filled_data.append(data.iloc[0].to_dict())  # Add first row
-    
-    for i in range(1, len(data)):
-        current_row = data.iloc[i]
-        prev_row = filled_data[-1]
-        
-        time_gap = current_row['Date'] - prev_row['Date']
-        expected_gaps = int(time_gap / timeStep_td)
-        
-        # Only fill if there's a gap larger than 2x timeStep
-        if expected_gaps >= 2:
-            # Fill missing timepoints
-            for j in range(1, expected_gaps):
-                interpolated_date = prev_row['Date'] + j * timeStep_td
-                interpolated_row = prev_row.copy()
-                interpolated_row['Date'] = interpolated_date
-                interpolated_row['FileName'] = f"INTERPOLATED_{j}"  # Mark as interpolated
-                filled_data.append(interpolated_row)
-        
-        filled_data.append(current_row.to_dict())
-    
-    # Convert back to DataFrame
-    data = pd.DataFrame(filled_data)
-        
-    # Sort again after any adjustments
-    data = data.sort_values(by=['Date'])
-    data = data.reset_index(drop=True)
-    N = len(data)
-    
-    # Handle duplicate timestamps that might arise from snapping
-    for i in range(1, N):
-        if data['Date'][i] <= data['Date'][i-1]:
-            data.loc[i, 'Date'] = data['Date'][i-1] + timeStep_td
-    
-    # Trims or expands the data to the desired number of measurements
+    # The old filler treated a jump of two capture intervals as a missing
+    # frame. The same threshold splits the series for filtering.
+    frame_gap = timeStep_td * 2
+
     if N_exp is not None:
-        if N > N_exp:
-            data = data.iloc[0:N_exp]
-        else:
-            # add rows with last data
-            for i in range(N, N_exp):
-                last_row = data.iloc[-1].to_dict()
-                last_row['Date'] = last_row['Date'] + timeStep_td
-                data = pd.concat([data, pd.DataFrame([last_row])], ignore_index=True)
-    
+        try:
+            n_exp = int(N_exp)
+        except (TypeError, ValueError):
+            n_exp = None
+        if n_exp is not None and n_exp > 0 and len(data) > n_exp:
+            data = data.iloc[:n_exp].copy()
+
     # Reads the pixel size
     path = os.path.abspath(os.path.join(folder, 'metadata.json'))
     try:
@@ -129,64 +158,69 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
         print(f"Warning: Could not read pixel_size from {path}, defaulting to 1.0")
         pixel_size = 1.0
     
-    # Beginning of the data processing
-    mainRoot = data['MainRootLength'].to_numpy().astype('float')
-    lateralRoots = data['LateralRootsLength'].to_numpy().astype('float')
-    numlateralRoots = data['NumberOfLateralRoots'].to_numpy().astype('int')
-    hypocotylLength = data['HypocotylLength'].to_numpy().astype('float') 
+    # A NaN here is a bad measurement on a real frame, not a missing hour.
+    # It stays NaN. Missing hours are introduced later by the hourly grid.
+    # Copy: recent pandas hands back a read-only array, and the 6-hour
+    # cleanup and the shrink correction both write into these values.
+    mainRoot = np.array(pd.to_numeric(data['MainRootLength'], errors='coerce'), dtype=float, copy=True)
+    lateralRoots = np.array(pd.to_numeric(data['LateralRootsLength'], errors='coerce'), dtype=float, copy=True)
+    numlateralRoots = np.array(pd.to_numeric(data['NumberOfLateralRoots'], errors='coerce'), dtype=float, copy=True)
+    hypocotylLength = np.array(pd.to_numeric(data['HypocotylLength'], errors='coerce'), dtype=float, copy=True)
 
-    # Check for NaN or invalid values
-    if np.any(np.isnan(mainRoot)):
-        warnings.warn(f"NaN values found in MainRootLength at indices: {np.where(np.isnan(mainRoot))[0]}")
-    if np.any(np.isnan(lateralRoots)):
-        warnings.warn(f"NaN values found in LateralRootsLength at indices: {np.where(np.isnan(lateralRoots))[0]}")
-    if np.any(np.isnan(numlateralRoots)):
-        warnings.warn(f"NaN values found in NumberOfLateralRoots at indices: {np.where(np.isnan(numlateralRoots))[0]}")
-    if np.any(np.isnan(hypocotylLength)):
-        warnings.warn(f"NaN values found in HypocotylLength at indices: {np.where(np.isnan(hypocotylLength))[0]}")
-        
-    # Replace NaN with 0 for processing
-    mainRoot = np.nan_to_num(mainRoot, nan=0.0)
-    lateralRoots = np.nan_to_num(lateralRoots, nan=0.0)
-    numlateralRoots = np.nan_to_num(numlateralRoots, nan=0.0)
-    hypocotylLength = np.nan_to_num(hypocotylLength, nan=0.0)
+    # Early zeros are only trusted when a real frame about 6 h earlier is
+    # also zero. A missing frame must not stand in for that earlier photo,
+    # and it must not be written as zero.
+    dates = data['Date']
+    half_step = timeStep_td / 2
+    six_hours = pd.Timedelta(hours=6)
+    for t in range(len(data)):
+        delta = (dates - (dates.iloc[t] - six_hours)).abs()
+        j = int(np.argmin(delta.to_numpy()))
+        if delta.iloc[j] > half_step or j >= t:
+            continue
+        if (
+            np.isfinite(numlateralRoots[j]) and np.isfinite(numlateralRoots[t])
+            and numlateralRoots[j] == 0 and numlateralRoots[t] == 0
+        ):
+            finite = np.isfinite(lateralRoots[:t])
+            lateralRoots[:t] = np.where(finite, 0.0, lateralRoots[:t])
+            finite = np.isfinite(numlateralRoots[:t])
+            numlateralRoots[:t] = np.where(finite, 0.0, numlateralRoots[:t])
+        if (
+            np.isfinite(mainRoot[j]) and np.isfinite(mainRoot[t])
+            and mainRoot[j] == 0 and mainRoot[t] == 0
+        ):
+            finite = np.isfinite(mainRoot[:t])
+            mainRoot[:t] = np.where(finite, 0.0, mainRoot[:t])
+        if (
+            np.isfinite(hypocotylLength[j]) and np.isfinite(hypocotylLength[t])
+            and hypocotylLength[j] == 0 and hypocotylLength[t] == 0
+        ):
+            finite = np.isfinite(hypocotylLength[:t])
+            hypocotylLength[:t] = np.where(finite, 0.0, hypocotylLength[:t])
 
-    # Remove spurious lateral roots at the beginning
-    space = int((6 * 60) / timeStep)  # 6 hours worth of timeSteps
+    def _frame_spans(series):
+        return _finite_time_spans(dates, np.isfinite(series), frame_gap)
 
-    for t in range(space, len(numlateralRoots)):
-        if t-space >= 0 and t < len(numlateralRoots):
-            if numlateralRoots[t-space] == 0 and numlateralRoots[t] == 0:
-                lateralRoots[:t] = 0
-                numlateralRoots[:t] = 0
-            if mainRoot[t-space] == 0 and mainRoot[t] == 0:
-                mainRoot[:t] = 0
-            if hypocotylLength[t-space] == 0 and hypocotylLength[t] == 0:
-                hypocotylLength[:t] = 0
-    
-    # Smooth
-    mainRoot = signal.medfilt(mainRoot, 9) 
-    lateralRoots = signal.medfilt(lateralRoots, 9) 
-    numlateralRoots = signal.medfilt(numlateralRoots, 9)
-    hypocotylLength = signal.medfilt(hypocotylLength, 9)
+    mainRoot = _median_filter_spans(mainRoot, _frame_spans(mainRoot), 9)
+    lateralRoots = _median_filter_spans(lateralRoots, _frame_spans(lateralRoots), 9)
+    numlateralRoots = _median_filter_spans(numlateralRoots, _frame_spans(numlateralRoots), 9)
+    hypocotylLength = _median_filter_spans(hypocotylLength, _frame_spans(hypocotylLength), 9)
 
-    # Check that the values never decrease
-    for i in range(1, len(mainRoot)):
-        dif = mainRoot[i] < mainRoot[i-1]
-        if dif:
-            mainRoot[i] = mainRoot[i-1]
-        
-        dif = numlateralRoots[i] < numlateralRoots[i-1]
-        if dif and numlateralRoots[i-1] > 0:
-            numlateralRoots[i] = numlateralRoots[i-1]
-
-        dif = lateralRoots[i] < lateralRoots[i-1]
-        if dif and lateralRoots[i-1] > 0:
-            lateralRoots[i] = lateralRoots[i-1]
-        
-        dif = hypocotylLength[i] < hypocotylLength[i-1]
-        if dif and hypocotylLength[i-1] > 0:
-            hypocotylLength[i] = hypocotylLength[i-1]
+    # Lengths are not allowed to shrink inside a photographed run. The value
+    # is not carried across a gap. Lateral and hypocotyl lengths only hold
+    # when the previous sample was already above zero, as before.
+    for series, hold_only_if_positive in (
+        (mainRoot, False),
+        (numlateralRoots, True),
+        (lateralRoots, True),
+        (hypocotylLength, True),
+    ):
+        for start, end in _frame_spans(series):
+            for i in range(start + 1, end):
+                previous = series[i - 1]
+                if series[i] < previous and (not hold_only_if_positive or previous > 0):
+                    series[i] = previous
 
     # Multiply by pixel size
     mainRoot_mm = mainRoot.copy() * pixel_size
@@ -199,18 +233,20 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
     data['TotalLength (mm)'] = mainRoot_mm + lateralRoots_mm
     data['HypocotylLength (mm)'] = hypocotyl_mm
 
-    # Save file names (excluding interpolated ones if desired)
-    original_files = data[~data['FileName'].str.contains('INTERPOLATED', na=False)]['FileName']
-    original_files.to_csv(os.path.abspath(os.path.join(folder, 'FilesAfterPostprocessing.csv')), index=False)
+    data['FileName'].to_csv(
+        os.path.abspath(os.path.join(folder, 'FilesAfterPostprocessing.csv')),
+        index=False,
+    )
 
-    # Remove original columns
-    try:
-        data = data.drop(columns=['FileName', 'Frame', 'MainRootLength', 'LateralRootsLength', 'TotalLength', 'HypocotylLength'])
-    except:
-        try:
-            data = data.drop(columns=['FileName', 'MainRootLength', 'LateralRootsLength', 'TotalLength', 'HypocotylLength'])
-        except KeyError:
-             pass
+    # Pixel columns and the filename are not hourly means. Drop whichever
+    # of them this file actually has.
+    data = data.drop(columns=[
+        col for col in (
+            'FileName', 'Frame', 'MainRootLength', 'LateralRootsLength',
+            'TotalLength', 'HypocotylLength',
+        )
+        if col in data.columns
+    ])
     
     # Create elapsed time column, in hours
     data['ElapsedTime (h)'] = ((data['Date'] - data['Date'][0]).dt.total_seconds() / 3600).round(2)
@@ -228,26 +264,13 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
     reference_timestamp = data.index[0].floor(FREQ_HOUR)
     
     # --- USE DYNAMIC ALIAS HERE (e.g., '60min' or '60T') ---
+    # Hours with no photo are NaN. Do not repeat the last measurement to
+    # fill out the processing limit.
     hour_data = data.resample(f'60{FREQ_MIN}', origin=reference_timestamp).mean()
-    
-    # Handle N_exp for hourly data
+
     if N_exp is not None:
         expected_hour_count = expected_hourly_rows(N_exp, timeStep)
-        if expected_hour_count is None:
-            expected_hour_count = len(hour_data)
-        
-        if len(hour_data) < expected_hour_count:
-            missing_hours = expected_hour_count - len(hour_data)
-            last_hour = hour_data.index[-1]
-            
-            # --- USE DYNAMIC ALIAS HERE ---
-            new_hours = pd.date_range(start=last_hour + pd.Timedelta(hours=1), 
-                                     periods=missing_hours, freq=f'60{FREQ_MIN}')
-            new_data = pd.DataFrame(index=new_hours)
-            for column in hour_data.columns:
-                new_data[column] = hour_data[column].iloc[-1]
-            hour_data = pd.concat([hour_data, new_data])
-        elif len(hour_data) > expected_hour_count:
+        if expected_hour_count is not None and len(hour_data) > expected_hour_count:
             hour_data = hour_data.iloc[:expected_hour_count]
     
     data = hour_data.reset_index()
@@ -257,35 +280,53 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
     
     data['NewDay'] = (data['Date'].dt.hour == 0) & (data['Date'].dt.minute == 0)
     data['ElapsedTime (h)'] = elapsed_hours_from_t0(data['Date'], data['Date'].iloc[0])
-    data['NumberOfLateralRoots'] = data['NumberOfLateralRoots'].round(0)
+    data['NumberOfLateralRoots'] = pd.to_numeric(
+        data['NumberOfLateralRoots'], errors='coerce',
+    ).round(0)
 
-    # Calculate gradients
-    mainRootGrad = np.gradient(data['MainRootLength (mm)'].to_numpy(), edge_order=2)
-    lateralRootsGrad = np.gradient(data['LateralRootsLength (mm)'].to_numpy(), edge_order=2)
-    totalRootsGrad = np.gradient(data['TotalLength (mm)'].to_numpy(), edge_order=2)
-    hypocotylGrad = np.gradient(data['HypocotylLength (mm)'].to_numpy(), edge_order=2) 
-    
-    # Calculate ratios
-    total_length = data['TotalLength (mm)'].to_numpy()
-    main_length = data['MainRootLength (mm)'].to_numpy()
-    
-    with np.errstate(divide='ignore', invalid='ignore'):
-        mainOverTotal = np.where(total_length > 0, 
-                                 main_length / total_length * 100, 
-                                 100.0)
-    mainOverTotal = signal.medfilt(mainOverTotal, 5)
+    hour_dates = data['Date']
+    hour_gap = pd.Timedelta(hours=1, minutes=30)
+    elapsed_hours = pd.to_numeric(data['ElapsedTime (h)'], errors='coerce').to_numpy(dtype=float)
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        lateralDensity = np.where(main_length > 0,
-                                  data['LateralRootsLength (mm)'].to_numpy() / main_length,
-                                  0.0)
-    lateralDensity = signal.medfilt(lateralDensity, 5)
+    def _hour_spans(series):
+        return _finite_time_spans(hour_dates, np.isfinite(series), hour_gap)
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        discreteLateralDensity = np.where(main_length > 0,
-                                          10 * data['NumberOfLateralRoots'].to_numpy() / main_length,
-                                          0.0)
-    discreteLateralDensity = signal.medfilt(discreteLateralDensity, 5)
+    main_mm = pd.to_numeric(data['MainRootLength (mm)'], errors='coerce').to_numpy(dtype=float)
+    lateral_mm = pd.to_numeric(data['LateralRootsLength (mm)'], errors='coerce').to_numpy(dtype=float)
+    total_mm = pd.to_numeric(data['TotalLength (mm)'], errors='coerce').to_numpy(dtype=float)
+    hypocotyl_mm = pd.to_numeric(data['HypocotylLength (mm)'], errors='coerce').to_numpy(dtype=float)
+    n_lateral = pd.to_numeric(data['NumberOfLateralRoots'], errors='coerce').to_numpy(dtype=float)
+
+    mainRootGrad = _gradient_spans(main_mm, elapsed_hours, _hour_spans(main_mm))
+    lateralRootsGrad = _gradient_spans(lateral_mm, elapsed_hours, _hour_spans(lateral_mm))
+    totalRootsGrad = _gradient_spans(total_mm, elapsed_hours, _hour_spans(total_mm))
+    hypocotylGrad = _gradient_spans(hypocotyl_mm, elapsed_hours, _hour_spans(hypocotyl_mm))
+
+    # A missing length stays a missing ratio. A real zero length keeps the
+    # old fallback (100% main, density 0) because that photo was measured.
+    mainOverTotal = np.full(len(data), np.nan, dtype=float)
+    both = np.isfinite(total_mm) & np.isfinite(main_mm)
+    positive = both & (total_mm > 0)
+    mainOverTotal[positive] = main_mm[positive] / total_mm[positive] * 100.0
+    mainOverTotal[both & ~positive] = 100.0
+
+    lateralDensity = np.full(len(data), np.nan, dtype=float)
+    both = np.isfinite(lateral_mm) & np.isfinite(main_mm)
+    positive = both & (main_mm > 0)
+    lateralDensity[positive] = lateral_mm[positive] / main_mm[positive]
+    lateralDensity[both & ~positive] = 0.0
+
+    discreteLateralDensity = np.full(len(data), np.nan, dtype=float)
+    both = np.isfinite(n_lateral) & np.isfinite(main_mm)
+    positive = both & (main_mm > 0)
+    discreteLateralDensity[positive] = 10.0 * n_lateral[positive] / main_mm[positive]
+    discreteLateralDensity[both & ~positive] = 0.0
+
+    mainOverTotal = _median_filter_spans(mainOverTotal, _hour_spans(mainOverTotal), 5)
+    lateralDensity = _median_filter_spans(lateralDensity, _hour_spans(lateralDensity), 5)
+    discreteLateralDensity = _median_filter_spans(
+        discreteLateralDensity, _hour_spans(discreteLateralDensity), 5,
+    )
 
     # Add calculated columns
     data['MainRootLengthGrad (mm/h)'] = mainRootGrad

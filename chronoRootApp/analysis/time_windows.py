@@ -49,6 +49,65 @@ def datetime_from_filename(name):
         return None
 
 
+def elapsed_day_clock(names, step_minutes=15):
+    """Day and HH:MM elapsed from the first timestamped filename.
+
+    The viewers used to advance one capture interval per frame. A missing
+    picture then still counted as that interval, so the day ran ahead of the
+    clocks written in the filenames. Each name is parsed with
+    datetime_from_filename and measured from the first stamp that parses.
+
+    A name with no stamp adds step_minutes to the previous frame. Frames
+    before the first real stamp stay at zero. When nothing parses, every
+    frame uses that constant interval, which is the old clock. Returns
+    three int arrays (days, hours, minutes).
+    """
+    try:
+        step = int(step_minutes)
+    except (TypeError, ValueError):
+        step = 15
+    if step <= 0:
+        step = 15
+
+    stamps = [datetime_from_filename(name) for name in (names or [])]
+    n = len(stamps)
+    days = np.zeros(n, dtype=int)
+    hours = np.zeros(n, dtype=int)
+    minutes = np.zeros(n, dtype=int)
+    origin = None
+    for ts in stamps:
+        if ts is not None:
+            origin = ts
+            break
+    if origin is None:
+        elapsed = np.arange(n, dtype=int) * step
+        days[:] = elapsed // 1440
+        hours[:] = (elapsed // 60) % 24
+        minutes[:] = elapsed % 60
+        return days, hours, minutes
+
+    # Frames before the first real stamp stay at 0. A later name with no
+    # stamp moves one capture interval past the previous frame; the next
+    # real stamp replaces that guess.
+    previous = None
+    for i, ts in enumerate(stamps):
+        if ts is None:
+            if previous is None:
+                elapsed_min = 0
+            else:
+                previous = previous + pd.Timedelta(minutes=step)
+                elapsed_min = int((previous - origin).total_seconds() // 60)
+        else:
+            previous = ts
+            elapsed_min = int((ts - origin).total_seconds() // 60)
+        if elapsed_min < 0:
+            elapsed_min = 0
+        days[i] = elapsed_min // 1440
+        hours[i] = (elapsed_min // 60) % 24
+        minutes[i] = elapsed_min % 60
+    return days, hours, minutes
+
+
 def parse_datetime(value):
     if value is None or value == '':
         return None
