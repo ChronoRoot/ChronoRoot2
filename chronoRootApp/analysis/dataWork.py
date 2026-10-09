@@ -13,7 +13,7 @@ from scipy import signal
 import json
 import warnings
 
-from .time_windows import datetime_from_filename, elapsed_hours_from_t0
+from .time_windows import datetime_from_filename, elapsed_hours_from_t0, period_frame_indices
 from .utils.fileUtilities import expected_hourly_rows
 
 
@@ -147,6 +147,15 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
             n_exp = None
         if n_exp is not None and n_exp > 0 and len(data) > n_exp:
             data = data.iloc[:n_exp].copy()
+
+    # The analysis period is the timelapse that gets measured. Frames before
+    # the window start and after its end are left out, the same way a
+    # processing limit drops frames past its last day.
+    kept = period_frame_indices(data['FileName'].tolist(), conf)
+    if not kept:
+        raise ValueError("No frames fall inside the analysis period")
+    if len(kept) != len(data):
+        data = data.iloc[kept].reset_index(drop=True)
 
     # Reads the pixel size
     path = os.path.abspath(os.path.join(folder, 'metadata.json'))

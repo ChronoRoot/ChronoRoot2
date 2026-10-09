@@ -476,6 +476,46 @@ def _window_for_group(group, duration_hours, t0_override=None):
     return start, t0, end
 
 
+def period_frame_indices(names, conf):
+    """Indices of filenames that fall inside the saved analysis period.
+
+    Processing limit decides how much of the recording is tracked. The
+    analysis period then keeps only the timelapse that should be measured
+    and shown. With no saved groups, every index is returned. The last
+    index is the last picture of that timelapse.
+    """
+    names = list(names or [])
+    count = len(names)
+    if count == 0:
+        return []
+    groups = list((conf or {}).get('timeGroups') or [])
+    if not groups:
+        return list(range(count))
+    stamps = [datetime_from_filename(name) for name in names]
+    parsed = [ts for ts in stamps if ts is not None]
+    if not parsed:
+        return list(range(count))
+    duration = (conf or {}).get('timeDurationHours')
+    if duration in (None, ''):
+        duration_hours = default_duration_hours(groups)
+    else:
+        try:
+            duration_hours = float(duration)
+        except (TypeError, ValueError):
+            duration_hours = default_duration_hours(groups)
+    group = match_time_group(groups, min(parsed), max(parsed))
+    if group is None:
+        return list(range(count))
+    window = _window_for_group(group, duration_hours)
+    if window is None:
+        return list(range(count))
+    start, _t0, end = window
+    return [
+        i for i, ts in enumerate(stamps)
+        if ts is not None and start <= ts <= end
+    ]
+
+
 def apply_time_windows(data, conf):
     """Recompute ElapsedTime from each group's t0, crop, and pad a shared grid."""
     if data is None or data.empty:

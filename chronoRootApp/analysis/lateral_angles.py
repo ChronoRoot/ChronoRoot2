@@ -41,6 +41,7 @@ from .time_windows import (
     elapsed_hours_from_t0,
     match_time_group,
     parse_datetime,
+    period_frame_indices,
     resolved_time_groups,
     snapshot_hours as conf_snapshot_hours,
 )
@@ -354,6 +355,8 @@ def getAngles(conf, path):
     images = pd.read_csv(os.path.join(path, "FilesAfterPostprocessing.csv"))
     images.dropna(inplace=True)
     images = images['FileName'].tolist()
+    kept = period_frame_indices(images, conf)
+    images = [images[i] for i in kept]
 
     rsml_dir = os.path.join(path, "RSML")
     rsml_files = os.listdir(rsml_dir)
@@ -853,7 +856,7 @@ def performStatisticalAnalysisFirstLR(conf, data, metric):
     return
 
 
-def estimateAngles(path, ax, img, i=-1, tip=False):
+def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None):
     """
     Estimate and visualize lateral root angles on an image.
     
@@ -872,14 +875,7 @@ def estimateAngles(path, ax, img, i=-1, tip=False):
     """
     plt.ioff()
     paths = utils.load_paths(os.path.join(path, 'RSML'))
-
-    # Initialize tracking variables
-    lateral_roots = []
-    lateral_root_starts = []
-    lateral_root_names = []
-    num_roots = 0
-
-    step = paths[i]
+    step = rsml_path or paths[i]
     tree = ET.parse(step).getroot()
 
     with open(os.path.join(path, 'metadata.json')) as f:
@@ -890,7 +886,12 @@ def estimateAngles(path, ax, img, i=-1, tip=False):
     w = x2 - x1
 
     plant = tree[1][0][0]
-    
+
+    lateral_roots = []
+    lateral_root_starts = []
+    lateral_root_names = []
+    num_roots = 0
+
     # Check if lateral roots exist
     if len(plant) > 1:
         lateral_root_elements = plant[1:]
@@ -969,34 +970,42 @@ def plotLateralAnglesOnTop(conf):
                     
                     if os.path.exists(results_path):
                         metadata = load_result_metadata(results_path)
-                        
-                        i = -1
 
                         # Load list of postprocessed images
                         images = pd.read_csv(os.path.join(results_path, "FilesAfterPostprocessing.csv"))
                         images.dropna(inplace=True)
                         images = images["FileName"].tolist()
+                        kept = period_frame_indices(images, conf)
+                        if kept:
+                            images = [images[i] for i in kept]
+                        if not images:
+                            continue
 
                         rsml_files = os.listdir(os.path.join(results_path, "RSML"))
 
                         # Filter to images with corresponding RSML
                         images = [image for image in images 
                                  if image.split('/')[-1].replace('.png', '.rsml') in rsml_files]
+                        if not images:
+                            continue
                         
                         video_dir = video_image_dir(metadata) or metadata.get("folder")
                         images = [os.path.join(video_dir, image) for image in images]
 
-                        # Load and crop the image
+                        # Load and crop the last picture inside the analysis period
                         bbox = get_bounding_box(metadata)
-                        crop = cv2.imread(images[i])[bbox[0]:bbox[1], bbox[2]:bbox[3]]
+                        crop = cv2.imread(images[-1])[bbox[0]:bbox[1], bbox[2]:bbox[3]]
                         
                         # Save cropped image
                         save = exp + "_" + robot + "_" + cam + "_" + plant + "_crop.png"
                         cv2.imwrite(os.path.join(save_path, save), crop)
 
+                        last_name = os.path.basename(images[-1]).replace('.png', '.rsml')
+                        rsml_path = os.path.join(results_path, 'RSML', last_name)
+
                         # Generate emergence angles visualization
                         fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
-                        estimateAngles(results_path, ax, crop.copy(), i)
+                        estimateAngles(results_path, ax, crop.copy(), rsml_path=rsml_path)
                         plt.title("Emergence Angles")
 
                         save = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_emergence_angles.svg"
@@ -1008,7 +1017,7 @@ def plotLateralAnglesOnTop(conf):
 
                         # Generate tip angles visualization
                         fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
-                        estimateAngles(results_path, ax, crop.copy(), i, True)
+                        estimateAngles(results_path, ax, crop.copy(), rsml_path=rsml_path, tip=True)
                         plt.title("Tip Angles")
 
                         filename = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_tip_angles.svg"

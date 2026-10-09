@@ -52,6 +52,7 @@ from gui.snapshot_hours_dialog import SnapshotHoursDialog
 from analysis.time_windows import (
     PERIOD_GATE_MESSAGE,
     analysis_period_is_current,
+    period_frame_indices,
     report_folder_name,
 )
 from gui.report_browser import ReportBranch, load_report_catalog
@@ -756,7 +757,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
     def get_image_paths(self):
         if not os.path.exists(os.path.join(self.selected_plant, "log.txt")):
-            return None, None, None, None
+            return None, None, None, None, None
         
         metadata = load_result_metadata(self.selected_plant)
         bbox = get_bounding_box(metadata)
@@ -773,21 +774,37 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             image2_path = None
 
         from analysis.utils.fileUtilities import list_video_pngs
-        from analysis.utils.tiff_stack import mask_stack_paths, tiff_n_frames
+        from analysis.utils.tiff_stack import mask_stack_paths, result_frame_names, tiff_n_frames
 
         layout = mask_stack_paths(self.selected_plant)
         origs, _video_dir = list_video_pngs(metadata)
+        names = result_frame_names(self.selected_plant)
+        period = {
+            'timeGroups': getattr(self, 'timeGroups', None) or [],
+            'timeDurationHours': getattr(self, 'timeDurationHours', None),
+            'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),
+        }
+        chosen = period_frame_indices(names, period) if names else []
+        frame_index = chosen[-1] if chosen else None
 
         if layout["kind"] == "tiff" and os.path.isfile(layout["seg_multi"]):
             n_pages = tiff_n_frames(layout["seg_multi"])
             overlay = layout["seg_multi"]
             if n_pages <= 0:
-                return None, image2_path, overlay, bbox
-            if origs:
-                image1_path = origs[min(len(origs), n_pages) - 1]
-            else:
-                image1_path = None
-            return image1_path, image2_path, overlay, bbox
+                return None, image2_path, overlay, bbox, None
+            if frame_index is None:
+                frame_index = n_pages - 1
+            frame_index = max(0, min(frame_index, n_pages - 1))
+            image1_path = None
+            wanted = os.path.basename(names[frame_index]) if names and frame_index < len(names) else ''
+            if wanted and origs:
+                for candidate in origs:
+                    if os.path.basename(candidate) == wanted:
+                        image1_path = candidate
+                        break
+            if image1_path is None and origs:
+                image1_path = origs[min(frame_index, len(origs) - 1)]
+            return image1_path, image2_path, overlay, bbox, frame_index
 
         overlayPath = layout["seg_multi"]
         pathlib_dir = pathlib.Path(overlayPath)
@@ -796,19 +813,28 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         image_files = sorted(image_files, key=lambda x: natural_keys(x))
 
         if len(image_files) == 0:
-            return None, image2_path, overlayPath, None
-        
-        overlay = image_files[-1]
-        last_name = overlay.split(os.path.sep)[-1]
+            return None, image2_path, overlayPath, None, None
+
+        if frame_index is None:
+            frame_index = len(image_files) - 1
+        frame_index = max(0, min(frame_index, len(image_files) - 1))
+        overlay = image_files[frame_index]
+        if names and frame_index < len(names):
+            wanted = os.path.basename(names[frame_index])
+            for candidate in image_files:
+                if os.path.basename(candidate) == wanted:
+                    overlay = candidate
+                    break
+        last_name = os.path.basename(overlay)
         image1_path = None
-        for candidate in reversed(origs):
+        for candidate in origs or []:
             if os.path.basename(candidate) == last_name:
                 image1_path = candidate
                 break
         if image1_path is None and origs:
-            image1_path = origs[-1]
+            image1_path = origs[min(frame_index, len(origs) - 1)]
 
-        return image1_path, image2_path, overlay, bbox
+        return image1_path, image2_path, overlay, bbox, frame_index
 
     def update_image_labels(self):
         # Add safety check
@@ -831,7 +857,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.image_label2.show()
             return
 
-        image1_path, image2_path, overlay, bbox = self.get_image_paths()
+        image1_path, image2_path, overlay, bbox, frame_index = self.get_image_paths()
 
         pixmap1 = None
         pixmap2 = None
@@ -872,7 +898,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 if overlay_on and os.path.exists(overlay):
                     if str(overlay).lower().endswith((".tif", ".tiff")):
                         n_pages = tiff_n_frames(overlay)
-                        seg = read_tiff_page(overlay, n_pages - 1, bgr=False) if n_pages else None
+                        page = n_pages - 1 if frame_index is None else frame_index
+                        page = max(0, min(page, n_pages - 1)) if n_pages else 0
+                        seg = read_tiff_page(overlay, page, bgr=False) if n_pages else None
                     else:
                         with Image.open(overlay) as ov:
                             if ov.mode == "L":
@@ -1148,6 +1176,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             
             # Load data using the helper function
             images, segs, bbox, conf, clock_names = plant_viewer.load_plant_data(path)
+            conf = dict(conf)
+            conf['timeGroups'] = list(getattr(self, 'timeGroups', None) or [])
+            conf['timeDurationHours'] = getattr(self, 'timeDurationHours', None)
+            conf['timeSyncMode'] = getattr(self, 'timeSyncMode', 'clock')
             
             # Create and show window
             # We attach it to 'self' so it doesn't get garbage collected

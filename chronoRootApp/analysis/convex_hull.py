@@ -23,8 +23,10 @@ from analysis.utils.tiff_stack import (
 from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 from analysis.time_windows import (
     closest_timed_path,
+    datetime_from_filename,
     match_time_group,
     parse_datetime,
+    period_frame_indices,
     resolved_time_groups,
     snapshot_hours as conf_snapshot_hours,
 )
@@ -116,7 +118,7 @@ def _read_graph(graph_file, graph_folder):
     except Exception:
         return None
 
-def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+def calculate_atlas_geometry(experiment_paths: List[str], conf=None) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Scans all experiments to determine the maximum biological bounding box relative to the seed.
     Returns:
@@ -132,8 +134,14 @@ def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, in
         # Load all results folders
         result_paths = utils.load_paths(exp_path, '*/*/*/Results*')
         
-        for r_path in result_paths:            
-            img, graph_path = load_plant_seg_and_graph(r_path, use_last=True)
+        for r_path in result_paths:
+            names = result_frame_names(r_path)
+            chosen = period_frame_indices(names, conf) if names else []
+            if chosen:
+                target = datetime_from_filename(names[chosen[-1]])
+                img, graph_path = load_plant_seg_and_graph(r_path, target=target)
+            else:
+                img, graph_path = load_plant_seg_and_graph(r_path, use_last=True)
             if img is None:
                 continue
 

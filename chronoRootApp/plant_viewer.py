@@ -14,7 +14,7 @@ from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
 from analysis.utils.fileUtilities import list_video_pngs
 from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
-from analysis.time_windows import elapsed_day_clock
+from analysis.time_windows import elapsed_day_clock, period_frame_indices
 from analysis.utils.tiff_stack import (
     TiffStackReader,
     load_seg_frame,
@@ -220,19 +220,27 @@ class ChronoViewWindow(QMainWindow):
 
         self.timeStep = conf.get('timeStep', 15)
         if conf.get('processingLimit', 0) != 0:
-            limit_days = int(conf['processingLimit'])
-            frames_per_day = (24 * 60) // self.timeStep
-            max_frames = limit_days * frames_per_day
-            self.n = min(self.n, max_frames)
+            try:
+                limit_days = int(conf['processingLimit'])
+            except (TypeError, ValueError):
+                limit_days = 0
+            try:
+                step = int(self.timeStep)
+            except (TypeError, ValueError):
+                step = 15
+            if limit_days > 0 and step > 0:
+                frames_per_day = (24 * 60) // step
+                self.n = min(self.n, limit_days * frames_per_day)
 
-        # View full sequence passes Results_raw names, already in frame order.
-        # Preview only has the image paths. Both carry the capture stamp, and
-        # the clock is elapsed from the first picture rather than frame index.
+        # Processing limit keeps the first tracked frames. The analysis period
+        # then keeps only the pictures inside the chosen timelapse, so the
+        # player stops at the last picture of that window.
         saved = list(clock_names or [])
-        if len(saved) >= self.n:
-            clock_source = saved[:self.n]
-        else:
-            clock_source = list(self.images[:self.n])
+        base_names = (saved if len(saved) >= self.n else list(self.images))[:self.n]
+        chosen = period_frame_indices(base_names, conf)
+        self._frame_index = [i for i in chosen if i < len(self.images)]
+        self.n = len(self._frame_index)
+        clock_source = [base_names[i] for i in self._frame_index if i < len(base_names)]
         self.days, self.hours, self.minutes = elapsed_day_clock(
             clock_source, self.timeStep,
         )
@@ -293,10 +301,13 @@ class ChronoViewWindow(QMainWindow):
         return _cv2_to_qpixmap(img)
 
     def update_display(self):
-        if self.idx >= len(self.images):
+        if self.idx >= self.n or self.idx >= len(self._frame_index):
+            return
+        src = self._frame_index[self.idx]
+        if src >= len(self.images):
             return
 
-        img = cv2.imread(self.images[self.idx])
+        img = cv2.imread(self.images[src])
         if img is None:
             return
 
@@ -307,7 +318,7 @@ class ChronoViewWindow(QMainWindow):
                 img = img[y1:y2, x1:x2]
 
         if self.use_seg and self.segFiles is not None:
-            seg = load_seg_frame(self.segFiles, self.idx)
+            seg = load_seg_frame(self.segFiles, src)
             if seg is not None:
                 img = _overlay_label_segmentation(img, seg)
 
