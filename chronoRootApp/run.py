@@ -52,7 +52,6 @@ from gui.snapshot_hours_dialog import SnapshotHoursDialog
 from analysis.time_windows import (
     PERIOD_GATE_MESSAGE,
     analysis_period_is_current,
-    period_frame_indices,
     report_folder_name,
 )
 from gui.report_browser import ReportBranch, load_report_catalog
@@ -779,13 +778,28 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         layout = mask_stack_paths(self.selected_plant)
         origs, _video_dir = list_video_pngs(metadata)
         names = result_frame_names(self.selected_plant)
-        period = {
-            'timeGroups': getattr(self, 'timeGroups', None) or [],
-            'timeDurationHours': getattr(self, 'timeDurationHours', None),
-            'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),
-        }
-        chosen = period_frame_indices(names, period) if names else []
-        frame_index = chosen[-1] if chosen else None
+        # The last picture follows postprocess. FilesAfterPostprocessing is
+        # written there and already stops at the analysis period. Before
+        # that file exists, show the last frame analysis actually tracked.
+        frame_index = None
+        post_csv = os.path.join(self.selected_plant, "FilesAfterPostprocessing.csv")
+        if names and os.path.isfile(post_csv):
+            posted = []
+            try:
+                import csv
+                with open(post_csv, newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        name = (row.get("FileName") or "").strip()
+                        if name:
+                            posted.append(name)
+            except Exception:
+                posted = []
+            if posted:
+                last_name = os.path.basename(posted[-1])
+                for i, name in enumerate(names):
+                    if os.path.basename(str(name)) == last_name:
+                        frame_index = i
+                        break
 
         if layout["kind"] == "tiff" and os.path.isfile(layout["seg_multi"]):
             n_pages = tiff_n_frames(layout["seg_multi"])
@@ -1176,11 +1190,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             
             # Load data using the helper function
             images, segs, bbox, conf, clock_names = plant_viewer.load_plant_data(path)
-            conf = dict(conf)
-            conf['timeGroups'] = list(getattr(self, 'timeGroups', None) or [])
-            conf['timeDurationHours'] = getattr(self, 'timeDurationHours', None)
-            conf['timeSyncMode'] = getattr(self, 'timeSyncMode', 'clock')
-            
+
             # Create and show window
             # We attach it to 'self' so it doesn't get garbage collected
             self.review_window = plant_viewer.ChronoViewWindow(
