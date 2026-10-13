@@ -71,7 +71,7 @@ def plant_metadata_paths(path):
     return chosen
 
 
-def prepare_rerun(metadata_path):
+def prepare_rerun(metadata_path, processing_limit=None):
     """Same run setup as 1_analysis, using the saved ROI, seed, and limits."""
     conf = hydrate_run_config(load_json(metadata_path), metadata_path)
     experiment = conf.get("Experiment") or conf.get("identifier")
@@ -81,6 +81,8 @@ def prepare_rerun(metadata_path):
         str(experiment) + "_" + str(conf.get("Images", "")) + "_" + str(conf.get("plant", ""))
     )
     conf["Plant"] = conf.get("Plant") or "Arabidopsis thaliana"
+    if processing_limit is not None:
+        conf["processingLimit"] = processing_limit
     if not video_has_qr(conf):
         known = conf.get("knownDistance")
         pixels = conf.get("pixelDistance")
@@ -89,12 +91,13 @@ def prepare_rerun(metadata_path):
     return conf
 
 
-def analyze_experiment(metadata_path):
+def analyze_experiment(metadata_path, processing_limit=None):
     try:
-        conf = prepare_rerun(metadata_path)
+        conf = prepare_rerun(metadata_path, processing_limit)
         print(
             f"Rerunning {conf.get('Experiment')} rpi {conf.get('rpi')} "
-            f"cam {conf.get('cam')} plant {conf.get('plant')}",
+            f"cam {conf.get('cam')} plant {conf.get('plant')} "
+            f"(processing limit {conf.get('processingLimit')} × 24 hours)",
             flush=True,
         )
         plantAnalysis(conf, True)
@@ -123,19 +126,41 @@ if __name__ == "__main__":
         default=4,
         help="How many plants to analyze at once (default: 4)",
     )
+    parser.add_argument(
+        "--processing-limit",
+        type=float,
+        default=None,
+        help=(
+            "Days of images to reprocess for every plant, same unit as the GUI "
+            "processing limit. 0 keeps each full sequence. "
+            "Default: the limit saved in each plant's metadata."
+        ),
+    )
 
     args = parser.parse_args()
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+    processing_limit = None
+    if args.processing_limit is not None:
+        if args.processing_limit < 0:
+            raise SystemExit("--processing-limit cannot be negative")
+        processing_limit = int(round(args.processing_limit))
 
     experiments = plant_metadata_paths(args.path)
     if not experiments:
         raise SystemExit(f"No Results_*/metadata.json files under {args.path}")
 
     print(f"Found {len(experiments)} plants under {os.path.abspath(args.path)}", flush=True)
+    if processing_limit is None:
+        print("Processing limit: each plant's saved value", flush=True)
+    elif processing_limit == 0:
+        print("Processing limit: full sequence for every plant", flush=True)
+    else:
+        print(f"Processing limit: {processing_limit} × 24 hours for every plant", flush=True)
+    jobs = [(metadata_path, processing_limit) for metadata_path in experiments]
     if args.workers == 1:
-        for metadata_path in experiments:
-            analyze_experiment(metadata_path)
+        for job in jobs:
+            analyze_experiment(*job)
     else:
         with Pool(args.workers) as pool:
-            pool.map(analyze_experiment, experiments)
+            pool.starmap(analyze_experiment, jobs)
