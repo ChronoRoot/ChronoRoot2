@@ -184,13 +184,38 @@ def createSaveFolder(conf):
 
     return paths
 
-def list_video_pngs(conf):
-    """Camera PNG paths, including segmentation_metadata.json input_path fallback."""
+def resolve_existing_dir(path):
+    """Directory that exists for a stored path.
+
+    Metadata written on one machine often uses ``/home/<user>/net/NetScratch/...``.
+    Other machines mount the same files at ``/net/NetScratch/...``.
+    """
+    if not path:
+        return ""
+    path = os.path.expanduser(str(path))
+    if os.path.isdir(path):
+        return path
+    marker = "/net/"
+    index = path.find(marker)
+    if index > 0:
+        shared = path[index:]
+        if os.path.isdir(shared):
+            return shared
+    return path
+
+
+def _candidate_dirs(conf):
     folders = []
     for key in ("ImagePath", "Images"):
-        folder = (conf or {}).get(key) or ""
+        folder = resolve_existing_dir((conf or {}).get(key) or "")
         if folder and folder not in folders:
             folders.append(folder)
+    return folders
+
+
+def list_video_pngs(conf):
+    """Camera PNG paths, including segmentation_metadata.json input_path fallback."""
+    folders = _candidate_dirs(conf)
     images = []
     image_path = folders[0] if folders else ""
     for folder in folders:
@@ -207,7 +232,7 @@ def list_video_pngs(conf):
                 metadata = json.load(handle)
         except (json.JSONDecodeError, OSError):
             continue
-        images_path = metadata.get("input_path")
+        images_path = resolve_existing_dir(metadata.get("input_path") or "")
         if images_path and os.path.isdir(images_path):
             found = loadPath(images_path, ext="*.png")
             if found:
@@ -215,22 +240,51 @@ def list_video_pngs(conf):
     return images, image_path
 
 
+def _segmentation_files(conf):
+    """Ensemble (or legacy Seg) masks, searched from every stored data path."""
+    for folder in _candidate_dirs(conf):
+        ensemble = os.path.join(folder, "Segmentation", "Ensemble")
+        legacy = os.path.join(folder, "Seg")
+        for seg_path in (ensemble, legacy):
+            if not os.path.isdir(seg_path):
+                continue
+            files = loadPath(seg_path, ext="*.png")
+            if files:
+                return files, folder, seg_path
+    return [], "", ""
+
+
+def _pair_frames(images, segmentations):
+    """Keep image order and attach the segmentation with the same file stem."""
+    by_stem = {}
+    for path in segmentations:
+        by_stem[os.path.splitext(os.path.basename(path))[0]] = path
+    paired_images = []
+    paired_segs = []
+    missing = 0
+    for image in images:
+        stem = os.path.splitext(os.path.basename(image))[0]
+        seg = by_stem.get(stem)
+        if seg is None:
+            missing += 1
+            continue
+        paired_images.append(image)
+        paired_segs.append(seg)
+    if missing:
+        print(f"Warning: {missing} images have no segmentation mask and were left out")
+    return paired_images, paired_segs
+
+
 def getImages(conf):
     images, image_path = list_video_pngs(conf)
-    conf["ImagePath"] = image_path or conf.get("Images") or ""
-    
-    # Get the list of segmentation images
-    SegPath = os.path.join(conf['Images'], 'Segmentation', 'Ensemble')
-    if not os.path.exists(SegPath):
-        SegPath = os.path.join(conf['Images'], 'Seg')
-    
-    segFiles = loadPath(SegPath, ext = "*.png") 
+    conf["ImagePath"] = image_path or resolve_existing_dir(conf.get("Images") or "") or ""
 
-    # Save configuration
-    
-    conf['SegPath'] = SegPath
-        
-    return images, segFiles
+    seg_files, seg_root, seg_path = _segmentation_files(conf)
+    if seg_root:
+        conf["Images"] = seg_root
+    conf["SegPath"] = seg_path
+
+    return _pair_frames(images, seg_files)
 
 
 UNSPECIFIED_FACTOR = "unspecified"

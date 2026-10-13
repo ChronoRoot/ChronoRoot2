@@ -59,7 +59,13 @@ def setupPlantAnalysis(conf, replicate):
     """
     # Load image and segmentation file paths
     image_paths, segmentation_paths = getImages(conf)
-    
+    if not image_paths or not segmentation_paths:
+        print(
+            "No images or segmentation masks found. "
+            "Check Images and ImagePath in the plant metadata."
+        )
+        return None, None, None, None, None
+
     limit_frames = processing_limit_frame_count(conf)
     if limit_frames is not None:
         image_paths = image_paths[:limit_frames]
@@ -168,9 +174,10 @@ def plantAnalysis(conf, replicate=False):
                         frame_errors.append(0)
                         continue
                 except Exception as e:
+                    print(f"\nFrame {frame_idx}: {e}")
                     frame_name = getImgName(images[frame_idx], conf)
                     saveProps(frame_name, frame_idx, False, csv_writer, 0, 0)
-                    saveImages(conf, images, frame_idx, root_mask, None, None, None)
+                    saveImages(conf, images, frame_idx, locals().get("root_mask"), None, None, None)
                     frame_errors.append(0)
                     continue
             

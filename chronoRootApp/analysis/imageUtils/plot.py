@@ -165,6 +165,16 @@ def saveImages(conf, images, frame_idx, segmentation_mask, graph=None, skeleton_
         input_path = os.path.join(input_folder, image_name)
         cv2.imwrite(input_path, original_image)
     
+    if segmentation_mask is None:
+        if roi_bounds is None:
+            segmentation_mask = np.zeros((1, 1), dtype=np.uint8)
+        else:
+            y0, y1, x0, x1 = roi_bounds
+            segmentation_mask = np.zeros(
+                (max(1, int(y1) - int(y0)), max(1, int(x1) - int(x0))),
+                dtype=np.uint8,
+            )
+
     if graph is None or graph is False or skeleton_overlay is None:
         colored_image = np.zeros_like(segmentation_mask).astype('uint8')
         colored_image = np.stack([colored_image] * 3, axis=-1)
