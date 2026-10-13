@@ -235,7 +235,6 @@ if __name__ == "__main__":
         plant_paths = [plant_path for plant_path, _label, _exp in jobs_meta]
         pixel_size = resolve_plate_pixel_size(conf, plant_paths)
         plate_label = _format_plate_log(plate_key)
-        print(f"{plate_label} ({len(jobs_meta)} plants)")
         plate_total[plate_key] = (plate_label, len(jobs_meta))
         for plant_path, plot_label, _exp in jobs_meta:
             jobs.append((plant_path, pixel_size, conf, plot_label, plate_key))

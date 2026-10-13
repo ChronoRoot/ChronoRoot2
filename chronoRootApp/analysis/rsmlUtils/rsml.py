@@ -59,20 +59,33 @@ def createTree(conf, frame_idx, images, graph, skeleton, skeleton_overlay):
         seed_node = seed_nodes[0]
 
     seed_position = np.array(graph.nodes[seed_node]['pos'], dtype='int')
-    
-    # Snap seed to nearest skeleton endpoint (in case of trimming offset)
-    if len(end_points) > 0:
-        distances = np.linalg.norm(end_points - seed_position, axis=1)
-        if np.min(distances) < 10.0:
-            nearest_idx = np.argmin(distances)
-            seed_position = end_points[nearest_idx]
-    
+
     # 4. Identify Main Root colors from the graph
     # (These are the edge colors assigned during createGraph traversal)
     main_root_colors = []
     for u, v, data in graph.edges(data=True):
         if data.get('root_type') == 10:
             main_root_colors.append(data.get('color', 0))
+
+    # Snap the seed to a nearby skeleton endpoint only when that endpoint
+    # still touches the main root. The graph Ini is already that start.
+    if len(end_points) > 0:
+        distances = np.linalg.norm(end_points - seed_position, axis=1)
+        snap_distance = float(np.min(distances))
+        nearest = end_points[int(np.argmin(distances))]
+        if 0 < snap_distance < 10.0:
+            touches_main = False
+            ny, nx = int(nearest[1]), int(nearest[0])
+            if 0 <= ny < skeleton_overlay.shape[0] and 0 <= nx < skeleton_overlay.shape[1]:
+                if skeleton_overlay[ny, nx] in main_root_colors:
+                    touches_main = True
+            if not touches_main:
+                for nb in vecinos(skeleton_overlay, nearest):
+                    if skeleton_overlay[nb[1], nb[0]] in main_root_colors:
+                        touches_main = True
+                        break
+            if touches_main:
+                seed_position = nearest
     
     # 5. Build the RSML
     # We pass a COPY of the skeleton overlay because we will erase pixels as we visit them
@@ -80,7 +93,7 @@ def createTree(conf, frame_idx, images, graph, skeleton, skeleton_overlay):
         skeleton_overlay.copy(), 
         seed_position, 
         root, 
-        main_root_colors
+        main_root_colors,
     )
     
     plant = tree.find(".//plant")
@@ -136,9 +149,6 @@ def completeRSML(ske2, seed, rsml, mainRoot):
         return rsml, 0
 
     # Sort Neighbors (Main vs Lateral)
-    main_start = None
-    lateral_starts = []
-    
     main_candidates = [n for n in all_neighbors if ske2[n[1], n[0]] in mainRoot]
     
     if main_candidates:
@@ -271,7 +281,7 @@ def continue_mainRoot(ske2, current, previous, rsml, mainRoot, lat_queue, main_r
             if ske2[n[1], n[0]] == 0: continue
             if not np.array_equal(n, next_main):
                 lat_candidates.append(n)
-        
+
         # Zero the junction node
         ske2[stop_node[1], stop_node[0]] = 0
         
