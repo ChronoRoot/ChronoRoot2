@@ -1,5 +1,6 @@
 """Detect clock-overlap groups, align elapsed time, and crop report windows."""
 
+import csv
 import json
 import os
 import re
@@ -900,150 +901,209 @@ def load_hourly_tables(conf):
     return collect_hourly_data((conf or {}).get('MainFolder') or '')
 
 
-def _span_record(plant_id, date_min, date_max, experiment='', video='', n_plants=1):
-    date_min = parse_datetime(date_min)
-    date_max = parse_datetime(date_max)
-    if date_min is None or date_max is None:
-        return None
-    if date_max < date_min:
-        date_min, date_max = date_max, date_min
-    return {
-        'Experiment': experiment or 'unspecified',
-        'Plant_id': str(plant_id),
-        'Video': video or '',
-        'date_min': date_min,
-        'date_max': date_max,
-        'n_plants': int(n_plants or 1),
-    }
+def collect_acquisition_spans(main_folder):
+    """Earliest and latest clock time for each tracked plant or screening video.
 
-
-def _datetimes_from_names(names):
-    stamps = [datetime_from_filename(n) for n in names or [] if n]
-    stamps = [s for s in stamps if s is not None]
-    if not stamps:
-        return None, None
-    return min(stamps), max(stamps)
-
-
-def _n_plants_from_screening(analysis_dir, meta):
-    seeds_path = os.path.join(analysis_dir, 'seeds.tsv')
-    if os.path.isfile(seeds_path):
-        try:
-            seeds = pd.read_csv(seeds_path, sep='\t', usecols=lambda c: c in ('Plant_id', 'FileName'))
-            if 'Plant_id' in seeds.columns and seeds['Plant_id'].nunique():
-                return int(seeds['Plant_id'].nunique())
-        except Exception:
-            pass
-    group_path = os.path.join(analysis_dir, 'group_info.json')
-    info = meta
-    if os.path.isfile(group_path):
-        try:
-            with open(group_path, 'r') as handle:
-                info = json.load(handle)
-        except Exception:
-            pass
-    counts = info.get('seed_counts') if isinstance(info, dict) else None
-    if counts:
-        try:
-            return int(sum(int(c or 0) for c in counts))
-        except (TypeError, ValueError):
-            pass
-    return 1
-
-
-def _collect_screening_spans(main_folder):
-    root = os.path.join(main_folder, 'analysis') if main_folder else ''
-    if not os.path.isdir(root):
+    Tracking writes Results_raw.csv in time order, so the first and last data
+    rows are the whole span. The same edge read is used for a screening seeds
+    file and, only when no results file has a stamp, for PostProcess_Hour.csv.
+    Group detection still sees one row per plant, not one row per frame.
+    """
+    if not main_folder:
         return pd.DataFrame()
-    rows = []
-    for analysis_id in sorted(os.listdir(root)):
-        analysis_dir = os.path.join(root, analysis_id)
-        if not os.path.isdir(analysis_dir):
-            continue
-        meta = {}
-        meta_path = os.path.join(analysis_dir, 'metadata.json')
-        if os.path.isfile(meta_path):
+
+    def edge_column(path, column, delimiter=','):
+        """First and last non-empty values of one CSV column, or (None, None).
+
+        The body of the file is not parsed. Tracking writes rows in time
+        order, so these two cells are the start and end of the recording.
+        """
+        try:
+            with open(path, 'r', newline='') as handle:
+                header_line = handle.readline()
+                if not header_line:
+                    return None, None
+                header = next(csv.reader([header_line], delimiter=delimiter))
+                if column not in header:
+                    return None, None
+                index = header.index(column)
+                first_line = ''
+                while True:
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        first_line = line
+                        break
+            with open(path, 'rb') as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                chunk = min(size, 65536)
+                handle.seek(size - chunk)
+                tail = handle.read().decode('utf-8', errors='replace')
+        except (OSError, UnicodeError, csv.Error, StopIteration):
+            return None, None
+        first_val = ''
+        if first_line:
             try:
-                with open(meta_path, 'r') as handle:
-                    meta = json.load(handle) or {}
-            except Exception:
-                meta = {}
-        date_min = parse_datetime(meta.get('first_datetime'))
-        date_max = parse_datetime(meta.get('last_datetime'))
+                parsed = next(csv.reader([first_line], delimiter=delimiter))
+            except (csv.Error, StopIteration):
+                parsed = []
+            if len(parsed) > index:
+                first_val = parsed[index].strip()
+        parts = tail.splitlines()
+        if size > chunk and parts:
+            parts = parts[1:]
+        last_val = ''
+        for line in reversed(parts):
+            if not line.strip():
+                continue
+            try:
+                parsed = next(csv.reader([line], delimiter=delimiter))
+            except (csv.Error, StopIteration):
+                continue
+            if len(parsed) > index and parsed[index].strip():
+                last_val = parsed[index].strip()
+                break
+        return first_val or None, last_val or None
+
+    def span_from_edges(first_name, last_name, plant_id, experiment, video, n_plants=1):
+        date_min = datetime_from_filename(first_name) or parse_datetime(first_name)
+        date_max = datetime_from_filename(last_name) or parse_datetime(last_name)
         if date_min is None or date_max is None:
-            date_min, date_max = _datetimes_from_names(
-                [meta.get('first_image'), meta.get('last_image')]
-            )
-        if date_min is None or date_max is None:
+            return None
+        if date_max < date_min:
+            date_min, date_max = date_max, date_min
+        return {
+            'Experiment': experiment or 'unspecified',
+            'Plant_id': str(plant_id),
+            'Video': video or '',
+            'date_min': date_min,
+            'date_max': date_max,
+            'n_plants': int(n_plants or 1),
+        }
+
+    rows = []
+
+    # Screening projects keep one folder per video under analysis/, with the
+    # clock range already stored on metadata when the video was processed.
+    screening_root = os.path.join(main_folder, 'analysis')
+    if os.path.isdir(screening_root):
+        for analysis_id in sorted(os.listdir(screening_root)):
+            analysis_dir = os.path.join(screening_root, analysis_id)
+            if not os.path.isdir(analysis_dir):
+                continue
+            meta = {}
+            meta_path = os.path.join(analysis_dir, 'metadata.json')
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, 'r') as handle:
+                        meta = json.load(handle) or {}
+                except (OSError, json.JSONDecodeError):
+                    meta = {}
+            date_min = parse_datetime(meta.get('first_datetime'))
+            date_max = parse_datetime(meta.get('last_datetime'))
+            if date_min is None or date_max is None:
+                date_min = datetime_from_filename(meta.get('first_image'))
+                date_max = datetime_from_filename(meta.get('last_image'))
+            if date_min is None or date_max is None:
+                seeds_path = os.path.join(analysis_dir, 'seeds.tsv')
+                if os.path.isfile(seeds_path):
+                    first_name, last_name = edge_column(seeds_path, 'FileName', delimiter='\t')
+                    date_min = datetime_from_filename(first_name)
+                    date_max = datetime_from_filename(last_name)
+            n_plants = 1
+            counted_plants = False
             seeds_path = os.path.join(analysis_dir, 'seeds.tsv')
             if os.path.isfile(seeds_path):
                 try:
-                    seeds = pd.read_csv(seeds_path, sep='\t', usecols=lambda c: c in ('FileName',))
-                    date_min, date_max = _datetimes_from_names(seeds['FileName'].tolist())
-                except Exception:
-                    date_min, date_max = None, None
-        record = _span_record(
-            analysis_id, date_min, date_max,
-            experiment=str(meta.get('analysis_id') or analysis_id),
-            video=analysis_id,
-            n_plants=_n_plants_from_screening(analysis_dir, meta),
-        )
-        if record is not None:
-            rows.append(record)
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+                    with open(seeds_path, 'r', newline='') as handle:
+                        reader = csv.DictReader(handle, delimiter='\t')
+                        if reader.fieldnames and 'Plant_id' in reader.fieldnames:
+                            n_plants = len({
+                                (row.get('Plant_id') or '').strip()
+                                for row in reader
+                                if (row.get('Plant_id') or '').strip()
+                            }) or 1
+                            counted_plants = True
+                except OSError:
+                    n_plants = 1
+            if not counted_plants:
+                info = meta
+                group_path = os.path.join(analysis_dir, 'group_info.json')
+                if os.path.isfile(group_path):
+                    try:
+                        with open(group_path, 'r') as handle:
+                            info = json.load(handle) or meta
+                    except (OSError, json.JSONDecodeError):
+                        info = meta
+                counts = info.get('seed_counts') if isinstance(info, dict) else None
+                if counts:
+                    try:
+                        n_plants = int(sum(int(c or 0) for c in counts)) or 1
+                    except (TypeError, ValueError):
+                        n_plants = 1
+            if date_min is None or date_max is None:
+                continue
+            if date_max < date_min:
+                date_min, date_max = date_max, date_min
+            rows.append({
+                'Experiment': str(meta.get('analysis_id') or analysis_id),
+                'Plant_id': str(analysis_id),
+                'Video': str(analysis_id),
+                'date_min': date_min,
+                'date_max': date_max,
+                'n_plants': n_plants,
+            })
+        if rows:
+            return pd.DataFrame(rows)
 
-
-def _collect_results_raw_spans(main_folder):
-    analysis = os.path.join(main_folder, 'Analysis') if main_folder else ''
-    if not os.path.isdir(analysis):
-        return pd.DataFrame()
-    rows = []
-    for dirpath, _dirnames, filenames in os.walk(analysis):
-        if 'Results_raw.csv' not in filenames:
-            continue
-        raw_path = os.path.join(dirpath, 'Results_raw.csv')
-        try:
-            raw = pd.read_csv(raw_path, usecols=lambda c: c in ('FileName', 'Plant_id'))
-        except Exception:
-            continue
-        if 'FileName' not in raw.columns:
-            continue
-        date_min, date_max = _datetimes_from_names(raw['FileName'].tolist())
-        plant_id = ''
-        if 'Plant_id' in raw.columns and raw['Plant_id'].notna().any():
-            plant_id = str(raw['Plant_id'].dropna().iloc[0])
-        if not plant_id:
+    # Standard projects: one Results_raw.csv per plant, rows in capture order.
+    analysis = os.path.join(main_folder, 'Analysis')
+    if os.path.isdir(analysis):
+        for dirpath, _dirnames, filenames in os.walk(analysis):
+            if 'Results_raw.csv' not in filenames:
+                continue
+            raw_path = os.path.join(dirpath, 'Results_raw.csv')
+            first_name, last_name = edge_column(raw_path, 'FileName')
             plant_id = os.path.basename(os.path.dirname(dirpath))
-        experiment = os.path.basename(analysis)
-        meta_path = os.path.join(dirpath, 'metadata.json')
-        video = ''
-        if os.path.isfile(meta_path):
-            try:
-                with open(meta_path, 'r') as handle:
-                    meta = json.load(handle) or {}
-                experiment = str(meta.get('Experiment') or experiment)
-                video = str(meta.get('Video') or '')
-                plant_id = str(meta.get('Plant_id') or plant_id)
-            except Exception:
-                pass
-        record = _span_record(plant_id, date_min, date_max, experiment=experiment, video=video)
-        if record is not None:
-            rows.append(record)
+            experiment = os.path.basename(analysis)
+            video = ''
+            meta_path = os.path.join(dirpath, 'metadata.json')
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, 'r') as handle:
+                        meta = json.load(handle) or {}
+                    experiment = str(meta.get('Experiment') or experiment)
+                    video = str(meta.get('Video') or '')
+                    plant_id = str(meta.get('Plant_id') or plant_id)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            record = span_from_edges(first_name, last_name, plant_id, experiment, video)
+            if record is not None:
+                rows.append(record)
+        if rows:
+            return pd.DataFrame(rows)
+
+        # No raw file had a stamp. Hourly files are the last place a clock
+        # range is written; again only the first and last Date are needed.
+        for dirpath, _dirnames, filenames in os.walk(analysis):
+            if 'PostProcess_Hour.csv' not in filenames:
+                continue
+            hour_path = os.path.join(dirpath, 'PostProcess_Hour.csv')
+            first_value, last_value = edge_column(hour_path, 'Date')
+            if not first_value or not last_value:
+                raw_path = os.path.join(dirpath, 'Results_raw.csv')
+                if os.path.isfile(raw_path):
+                    first_value, last_value = edge_column(raw_path, 'FileName')
+            plant_id = os.path.basename(os.path.dirname(dirpath))
+            record = span_from_edges(
+                first_value, last_value, plant_id, os.path.basename(analysis), '',
+            )
+            if record is not None:
+                rows.append(record)
+
     return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-
-def collect_acquisition_spans(main_folder):
-    """Clock spans from tracking metadata / image names, without Hour CSV."""
-    screening = _collect_screening_spans(main_folder)
-    if not screening.empty:
-        return screening
-    raw = _collect_results_raw_spans(main_folder)
-    if not raw.empty:
-        return raw
-    hourly = collect_hourly_data(main_folder)
-    if hourly.empty:
-        return pd.DataFrame()
-    return plant_date_spans(hourly)
 
 
 PERIOD_GATE_MESSAGE = (

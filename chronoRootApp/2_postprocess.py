@@ -222,33 +222,43 @@ if __name__ == "__main__":
                     if len(results) == 0:
                         os.rmdir(plant)
 
-    # --- Processing: group by shared video/plate, then parallel plants ---
+    # Pixel size is resolved once per plate, including a single QR scan when
+    # the plate does not already have one. Plants from every plate then share
+    # one pool, so a short plate does not leave workers idle.
     plate_groups = collect_plate_groups(analysis)
-
+    jobs = []
+    plate_total = {}
     for plate_key in sorted(plate_groups.keys(), key=lambda k: str(k)):
         jobs_meta = plate_groups[plate_key]
-        plant_paths = [p for p, _label, _exp in jobs_meta]
+        if not jobs_meta:
+            continue
+        plant_paths = [plant_path for plant_path, _label, _exp in jobs_meta]
         pixel_size = resolve_plate_pixel_size(conf, plant_paths)
         plate_label = _format_plate_log(plate_key)
         print(f"{plate_label} ({len(jobs_meta)} plants)")
+        plate_total[plate_key] = (plate_label, len(jobs_meta))
+        for plant_path, plot_label, _exp in jobs_meta:
+            jobs.append((plant_path, pixel_size, conf, plot_label, plate_key))
 
-        jobs = [
-            (plant_path, pixel_size, conf, plot_label)
-            for plant_path, plot_label, _exp in jobs_meta
-        ]
-        if not jobs:
-            continue
-
+    if jobs:
         workers = min(MAX_PLANT_WORKERS, len(jobs))
-        n_ok = 0
+        done_for = {key: 0 for key in plate_total}
+        ok_for = {key: 0 for key in plate_total}
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(process_one_plant, *job) for job in jobs]
+            futures = {
+                executor.submit(process_one_plant, plant_path, pixel_size, conf, plot_label): plate_key
+                for plant_path, pixel_size, conf, plot_label, plate_key in jobs
+            }
             for fut in as_completed(futures):
+                plate_key = futures[fut]
                 plant_path, ok, err = fut.result()
+                done_for[plate_key] += 1
                 if ok:
-                    n_ok += 1
+                    ok_for[plate_key] += 1
                 else:
                     print(f"  Error {os.path.basename(plant_path)}: {err}")
-        print(f"  {n_ok}/{len(jobs)} done")
+                plate_label, total = plate_total[plate_key]
+                if done_for[plate_key] == total:
+                    print(f"  {plate_label}: {ok_for[plate_key]}/{total} done")
 
     print("Post processing finished.")

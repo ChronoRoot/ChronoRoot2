@@ -1559,9 +1559,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.processingLimitField.textChanged.connect(self.syncProcessingLimitField)
 
         self.processingLimitHintLabel = QtWidgets.QLabel(self.tab1)
-        self.processingLimitHintLabel.setGeometry(QtCore.QRect(260, 460, 261, 31))
+        self.processingLimitHintLabel.setGeometry(QtCore.QRect(260, 460, 520, 31))
         self.processingLimitHintLabel.setObjectName("processingLimitHintLabel")
-        self.processingLimitHintLabel.setText("(in days, 0 means no limit)")
+        self.processingLimitHintLabel.setText(
+            "Stops analysis after this × 24 hours. 0 for full sequence.")
+        self.processingLimitField.setToolTip(
+            "Cuts the analysis after this many × 24 hours. 0 keeps the full sequence.")
 
         self.captureIntervalLabel = QtWidgets.QLabel(self.tab1)
         self.captureIntervalLabel.setGeometry(QtCore.QRect(10, 510, 161, 31))
@@ -2085,6 +2088,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportProcessingLimitField = QtWidgets.QLineEdit(self.tab4)
         self.reportProcessingLimitField.setGeometry(QtCore.QRect(140, 400, 51, 31))
         self.reportProcessingLimitField.setObjectName("reportProcessingLimitField")
+        self.reportProcessingLimitField.setToolTip(
+            "Cuts the analysis after this many × 24 hours. 0 keeps the full sequence.")
         self.reportProcessingLimitField.textChanged.connect(self.syncProcessingLimitField)
 
         self.reportMappingText = QtWidgets.QLabel(self.tab4)
