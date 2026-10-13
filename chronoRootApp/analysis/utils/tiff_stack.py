@@ -98,6 +98,14 @@ def result_frame_names(result_dir):
 
 
 def graph_path_for_name(graphs_dir, filename):
+    """Path of the graph file for one frame.
+
+    New results store every frame in Graphs/graphs.xml.gz. Older results keep
+    one compressed GraphML file per image.
+    """
+    combined = os.path.join(graphs_dir, "graphs.xml.gz")
+    if os.path.isfile(combined):
+        return combined
     stem = os.path.basename(filename or "")
     lower = stem.lower()
     if lower.endswith(".png"):

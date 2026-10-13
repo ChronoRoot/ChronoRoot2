@@ -28,11 +28,11 @@ from .utils.metadata_schema import get_bounding_box, get_seed
 from .imageUtils.seg import extract_root_segmentation, extract_skeleton
 from .imageUtils.plot import saveImages
 from .utils.tiff_stack import PlantMaskStacks
-from .graphUtils.save import saveGraph, saveProps
+from .graphUtils.save import GraphSequenceWriter, saveProps
 from .graphUtils.graph import createGraph
 from .graphUtils.graphTrim import trimGraph
 from .graphUtils.graphTrack import graphInit, matchGraphs
-from .rsmlUtils.rsml import createTree, saveRSML
+from .rsmlUtils.rsml import RsmlSequenceWriter, createTree
 
 import os 
 import csv
@@ -113,11 +113,15 @@ def plantAnalysis(conf, replicate=False):
     analysis_log = []
     frame_errors = []  # 0 = success, 1 = error for each frame
 
+    rsml_writer = None
+    graph_writer = None
     try:
         with open(measurements_file, 'w+') as csv_file:
             csv_writer = csv.writer(csv_file)
             header = ['FileName', 'Frame', 'MainRootLength', 'LateralRootsLength', 'NumberOfLateralRoots', 'TotalLength', 'HypocotylLength']
             csv_writer.writerow(header)
+            rsml_writer = RsmlSequenceWriter(conf)
+            graph_writer = GraphSequenceWriter(conf)
         
             # ====================================================================
             # PHASE 1: Find first frame with valid root structure
@@ -223,8 +227,8 @@ def plantAnalysis(conf, replicate=False):
         
             frame_name = getImgName(images[growth_start_frame], conf)
             saveImages(conf, images, growth_start_frame, initial_root_mask, initial_graph, initial_skeleton_overlay, initial_hypocotyl_skeleton)
-            saveGraph(initial_graph, conf, frame_name)
-            saveRSML(initial_rsml, conf, frame_name)
+            graph_writer.add(initial_graph, growth_start_frame, frame_name)
+            rsml_writer.add(initial_rsml, growth_start_frame, frame_name)
             saveProps(frame_name, growth_start_frame, initial_graph, csv_writer, initial_lateral_count, initial_hypocotyl_length)
         
             # ====================================================================
@@ -378,8 +382,8 @@ def plantAnalysis(conf, replicate=False):
             
                 frame_name = getImgName(images[frame_idx], conf)
                 saveImages(conf, images, frame_idx, current_root_mask, current_graph, current_skeleton_overlay, current_hypocotyl_skeleton)
-                saveGraph(current_graph, conf, frame_name)
-                saveRSML(current_rsml, conf, frame_name)
+                graph_writer.add(current_graph, frame_idx, frame_name)
+                rsml_writer.add(current_rsml, frame_idx, frame_name)
                 saveProps(frame_name, frame_idx, current_graph, csv_writer, current_lateral_count, current_hypocotyl_length)
         
             print('\n\nGrowth tracking complete')
@@ -417,5 +421,9 @@ def plantAnalysis(conf, replicate=False):
             cleanup_superseded_results(plant_slot_path(conf), output_folders['result'])
     
     finally:
+        if rsml_writer is not None:
+            rsml_writer.close()
+        if graph_writer is not None:
+            graph_writer.close()
         mask_stacks.close()
     return

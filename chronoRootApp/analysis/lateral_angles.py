@@ -37,6 +37,12 @@ from .utils.fileUtilities import (
     build_plant_id,
 )
 from .utils.metadata_schema import get_bounding_box, video_image_dir
+from .rsmlUtils.rsml import (
+    direct_lateral_roots,
+    load_rsml_index,
+    main_root_of,
+    resolve_rsml_plant,
+)
 from .time_windows import (
     collect_hourly_data,
     datetime_from_filename,
@@ -347,8 +353,8 @@ def getAngles(conf, path):
     """
     Extract and save angle measurements for all lateral roots in a time series.
     
-    Processes all RSML files in the specified path, tracks lateral roots across
-    frames, and calculates tip and emergence angles. Laterals shorter than half
+    Reads the plant's RSML sequence (or legacy per-frame files), tracks lateral
+    roots across frames, and calculates tip and emergence angles. Laterals shorter than half
     the configured emergence distance are left out of the mean angles. The first
     tracked root is always measured, including while it is still short.
 
@@ -369,14 +375,12 @@ def getAngles(conf, path):
     images = [images[i] for i in kept]
 
     rsml_dir = os.path.join(path, "RSML")
-    rsml_files = os.listdir(rsml_dir)
-    
-    # Use basename to match files, avoiding issues with special characters in 'path'
-    paths = []
+    rsml_index = load_rsml_index(rsml_dir)
+    selected = []
     for image in images:
-        rsml_name = os.path.basename(image).replace('.png', '.rsml')
-        if rsml_name in rsml_files:
-            paths.append(os.path.join(rsml_dir, rsml_name))
+        image_name = os.path.basename(image)
+        if image_name in rsml_index:
+            selected.append(image_name)
 
     lateral_roots = []
     lateral_root_starts = []
@@ -403,15 +407,12 @@ def getAngles(conf, path):
         writer.writerow(["Img", "Number of lateral roots", "Mean tip angle", 
                         "Mean emergence angle", "First LR tip", "First LR emergence"])
 
-        for step in paths:
-            tree = ET.parse(step).getroot()
-
-            plant = tree[1][0][0]
-            imgname = os.path.basename(step).replace('.rsml', '.png')
+        for imgname in selected:
+            main_root = main_root_of(rsml_index.get(imgname))
+            lateral_root_elements = direct_lateral_roots(main_root)
 
             # Check if lateral roots exist (more than just primary root)
-            if len(plant) > 1:
-                lateral_root_elements = plant[1:]
+            if lateral_root_elements:
                 
                 points_list = []
                 start_points = []
@@ -913,9 +914,8 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
         ax: Modified matplotlib axes with angle visualizations
     """
     plt.ioff()
-    paths = utils.load_paths(os.path.join(path, 'RSML'))
-    step = rsml_path or paths[i]
-    tree = ET.parse(step).getroot()
+    plant = resolve_rsml_plant(path, rsml_path=rsml_path, index=i)
+    main_root = main_root_of(plant)
 
     with open(os.path.join(path, 'metadata.json')) as f:
         metadata = json.load(f)
@@ -923,16 +923,13 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
     emergence_mm = float(emergence_distance)
     min_length_mm = 0.5 * emergence_mm
 
-    plant = tree[1][0][0]
-
     lateral_roots = []
     lateral_root_starts = []
     lateral_root_names = []
     num_roots = 0
 
-    # Check if lateral roots exist
-    if len(plant) > 1:
-        lateral_root_elements = plant[1:]
+    lateral_root_elements = direct_lateral_roots(main_root)
+    if lateral_root_elements:
 
         points_list = []
         start_points = []
@@ -1006,9 +1003,11 @@ def render_plant_angle_figures(job):
         rsml_dir = os.path.join(results_path, "RSML")
         if not os.path.isdir(rsml_dir):
             return label, True, ''
-        rsml_files = os.listdir(rsml_dir)
-        images = [image for image in images
-                  if image.split('/')[-1].replace('.png', '.rsml') in rsml_files]
+        try:
+            rsml_index = load_rsml_index(rsml_dir)
+        except (ET.ParseError, OSError):
+            return label, True, ''
+        images = [image for image in images if os.path.basename(image) in rsml_index]
         if not images:
             return label, True, ''
 
@@ -1020,12 +1019,11 @@ def render_plant_angle_figures(job):
         # last frame that still has the laterals as separate roots.
         overlay_image = images[-1]
         for image in reversed(images):
-            candidate = os.path.join(
-                rsml_dir, os.path.basename(image).replace('.png', '.rsml'),
-            )
             try:
-                main_root = ET.parse(candidate).getroot()[1][0][0]
+                main_root = main_root_of(rsml_index.get(os.path.basename(image)))
             except (ET.ParseError, IndexError, OSError):
+                continue
+            if main_root is None:
                 continue
             direct = 0
             nested = 0

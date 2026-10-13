@@ -18,11 +18,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import copy
 import getpass
 import re
 import numpy as np
 import os
 from ..imageUtils.seg import skeleton_nodes
+
+SEQUENCE_RSML_NAME = "sequence.rsml"
 
 # Global counter for RSML points
 n_points = 0
@@ -376,7 +379,7 @@ def add_point(polyline, point):
     ET.SubElement(polyline, 'point', {'x': str(point[0]), 'y': str(point[1])}).tail = '\n\t\t\t\t'
 
 def createHeader(conf, i, images):
-    rsml_file = "analysis/default.rsml"
+    rsml_file = _default_rsml_path()
     tree = ET.parse(rsml_file)
     root = tree.getroot()
     metadata = root[0]
@@ -425,3 +428,233 @@ def saveRSML(rsmlTree, conf, image_name):
     path = os.path.join(conf['folders']['rsml'], image_name.replace('.png','.rsml'))
     rsmlTree.write(open(path, 'w'), encoding='unicode')
     return
+
+
+def sequence_rsml_path(rsml_dir):
+    return os.path.join(rsml_dir, SEQUENCE_RSML_NAME)
+
+
+def _default_rsml_path():
+    bundled = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "default.rsml"))
+    if os.path.isfile(bundled):
+        return bundled
+    return "analysis/default.rsml"
+
+
+def _local_tag(tag):
+    if isinstance(tag, str) and tag.startswith("{"):
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _set_child_text(parent, tag, text):
+    if parent is None or text is None:
+        return
+    element = parent.find(tag)
+    if element is not None:
+        element.text = text
+
+
+def captured_timestamp(image_name):
+    """Timestamp embedded in a ChronoRoot image basename, or None."""
+    time_str = os.path.basename(image_name or "").replace(".png", "")
+    nums = re.findall(r"\d+", time_str)
+    if len(nums) >= 6:
+        return f"{nums[0]}-{nums[1]}-{nums[2]}T{nums[3]}:{nums[4]}:{nums[5]}"
+    return None
+
+
+def _sequence_header(conf):
+    tree = ET.parse(_default_rsml_path())
+    metadata = tree.getroot().find("metadata")
+    _set_child_text(metadata, "user", getpass.getuser())
+    _set_child_text(metadata, "file-key", str(conf.get("fileKey", "unknown")))
+    _set_child_text(metadata, "last-modified", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    image = metadata.find("image")
+    _set_child_text(image, "name", str(conf.get("sequenceLabel", "sequence")))
+    _set_child_text(image, "captured", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    sequence = metadata.find("time-sequence")
+    _set_child_text(sequence, "label", str(conf.get("sequenceLabel", "default")))
+    _set_child_text(sequence, "index", "0")
+    _set_child_text(sequence, "unified", "false")
+
+    definitions = ET.SubElement(metadata, "property-definitions")
+    for label, typ in (("frame_index", "integer"), ("image_name", "string")):
+        definition = ET.SubElement(definitions, "property-definition")
+        ET.SubElement(definition, "label").text = label
+        ET.SubElement(definition, "type").text = typ
+
+    meta_xml = ET.tostring(metadata, encoding="unicode")
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        '<rsml xmlns:po="http://www.plantontology.org/xml-dtd/po.dtd">\n'
+        f"{meta_xml}\n"
+        "<scene>\n"
+    )
+
+
+def _prefix_descendant_ids(plant, plant_id):
+    for elem in plant.iter():
+        if elem is plant:
+            continue
+        old = elem.get("id")
+        if old:
+            elem.set("id", f"{plant_id}_{old}")
+
+
+def plant_for_frame(rsml_tree, frame_idx, image_name):
+    """Deep copy of one frame's plant, indexed and given document-unique ids."""
+    source = rsml_tree.find(".//plant")
+    if source is None:
+        raise ValueError(f"RSML tree for frame {frame_idx} has no plant")
+    plant = copy.deepcopy(source)
+    plant_id = f"plant_{int(frame_idx)}"
+    image_name = os.path.basename(image_name or "")
+    _prefix_descendant_ids(plant, plant_id)
+    plant.set("id", plant_id)
+    plant.set("label", image_name)
+
+    meta = ET.Element("metadata")
+    captured = captured_timestamp(image_name)
+    if captured:
+        observed = ET.SubElement(meta, "observation-date")
+        observed.text = captured
+    props = ET.Element("properties")
+    for name, value in (("frame_index", str(int(frame_idx))), ("image_name", image_name)):
+        prop = ET.SubElement(props, "property", {"name": name})
+        ET.SubElement(prop, "value").text = value
+    plant.insert(0, props)
+    plant.insert(0, meta)
+    return plant
+
+
+class RsmlSequenceWriter:
+    """One RSML document; each tracked frame is appended as its own plant."""
+
+    def __init__(self, conf):
+        self.path = sequence_rsml_path(conf["folders"]["rsml"])
+        self._closed = False
+        self._handle = open(self.path, "w", encoding="utf-8")
+        try:
+            self._handle.write(_sequence_header(conf))
+            self._handle.flush()
+        except Exception:
+            self._handle.close()
+            self._closed = True
+            raise
+
+    def add(self, rsml_tree, frame_idx, image_name):
+        if self._closed or rsml_tree is None:
+            return
+        plant = plant_for_frame(rsml_tree, frame_idx, image_name)
+        self._handle.write(ET.tostring(plant, encoding="unicode"))
+        self._handle.write("\n")
+        self._handle.flush()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            handle.write("</scene>\n</rsml>\n")
+        finally:
+            handle.close()
+
+
+def plant_property(plant, name):
+    if plant is None:
+        return None
+    for prop in plant.findall("./properties/property"):
+        if prop.get("name") == name:
+            value = prop.findtext("value")
+            if value is not None:
+                return value
+    return None
+
+
+def plant_image_name(plant):
+    value = plant_property(plant, "image_name")
+    if value:
+        return os.path.basename(value)
+    label = plant.get("label") or ""
+    if label.lower().endswith(".png"):
+        return os.path.basename(label)
+    return None
+
+
+def main_root_of(plant):
+    """Primary root of a plant. Metadata and properties may precede it."""
+    if plant is None:
+        return None
+    for child in plant:
+        if _local_tag(child.tag) == "root" and child.get("label") == "mainRoot":
+            return child
+    for child in plant:
+        if _local_tag(child.tag) == "root":
+            return child
+    return None
+
+
+def direct_lateral_roots(main_root):
+    if main_root is None:
+        return []
+    return [child for child in main_root if _local_tag(child.tag) == "root"]
+
+
+def _plants_in_tree(tree):
+    root = tree.getroot() if hasattr(tree, "getroot") else tree
+    scene = None
+    for child in root:
+        if _local_tag(child.tag) == "scene":
+            scene = child
+            break
+    if scene is None:
+        return []
+    return [child for child in scene if _local_tag(child.tag) == "plant"]
+
+
+def load_rsml_index(rsml_dir):
+    """Map image basename to plant element.
+
+    `sequence.rsml` is one plant per frame, in document order. Older results
+    are one `.rsml` file per frame, in natural filename order.
+    """
+    if not rsml_dir or not os.path.isdir(rsml_dir):
+        raise FileNotFoundError(f"RSML directory not found: {rsml_dir}")
+    ordered = {}
+    sequence = sequence_rsml_path(rsml_dir)
+    if os.path.isfile(sequence):
+        for plant in _plants_in_tree(ET.parse(sequence)):
+            name = plant_image_name(plant)
+            if name:
+                ordered[name] = plant
+        return ordered
+
+    from ..utils.fileUtilities import loadPath
+    for path in loadPath(rsml_dir, "*.rsml"):
+        if os.path.basename(path) == SEQUENCE_RSML_NAME:
+            continue
+        plants = _plants_in_tree(ET.parse(path))
+        if not plants:
+            continue
+        ordered[os.path.basename(path).replace(".rsml", ".png")] = plants[0]
+    return ordered
+
+
+def resolve_rsml_plant(results_path, rsml_path=None, index=-1):
+    """Plant element for a results folder, legacy file path, or sequence index."""
+    index_map = load_rsml_index(os.path.join(results_path, "RSML"))
+    if rsml_path:
+        image_name = os.path.basename(rsml_path).replace(".rsml", ".png")
+        plant = index_map.get(image_name)
+        if plant is None:
+            raise KeyError(f"No RSML plant for {image_name} in {results_path}")
+        return plant
+    names = list(index_map)
+    if not names:
+        raise FileNotFoundError(f"No RSML plants in {results_path}")
+    return index_map[names[index]]

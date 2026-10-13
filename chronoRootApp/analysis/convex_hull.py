@@ -4,7 +4,6 @@ import pandas as pd
 import os
 import numpy as np
 import cv2
-import networkx as nx
 import json
 import scipy.stats as stats
 import logging
@@ -13,6 +12,7 @@ from typing import Tuple, List
 # Import shared utilities
 from analysis.utils import report_utils as utils
 from analysis.utils.fileUtilities import convertFromPathSafe, normalize_factor_value
+from analysis.graphUtils.save import GRAPHS_FILENAME, loadGraph
 from analysis.utils.tiff_stack import (
     graph_path_for_name,
     mask_stack_paths,
@@ -62,7 +62,7 @@ def _legacy_seg_pngs(seg_folder):
 
 
 def load_plant_seg_and_graph(r_path, target=None, timestep=15, hour=None, use_last=False):
-    """Load one binary Seg frame and the matching graph path (TIFF or legacy PNG)."""
+    """Load one binary Seg frame, its graph path, and the frame image name."""
     layout = mask_stack_paths(r_path)
     graph_folder = os.path.join(r_path, "Graphs")
     names = result_frame_names(r_path)
@@ -70,7 +70,7 @@ def load_plant_seg_and_graph(r_path, target=None, timestep=15, hour=None, use_la
     if layout["kind"] == "tiff" and os.path.isfile(layout["seg"]):
         n_pages = tiff_n_frames(layout["seg"])
         if n_pages <= 0:
-            return None, None
+            return None, None, None
         if use_last:
             idx = n_pages - 1
         elif target is not None and names:
@@ -81,13 +81,14 @@ def load_plant_seg_and_graph(r_path, target=None, timestep=15, hour=None, use_la
         idx = max(0, min(idx, n_pages - 1))
         img = read_tiff_page(layout["seg"], idx)
         if img is None:
-            return None, None
-        graph_file = graph_path_for_name(graph_folder, names[idx]) if idx < len(names) else None
-        return img, graph_file
+            return None, None, None
+        image_name = names[idx] if idx < len(names) else None
+        graph_file = graph_path_for_name(graph_folder, image_name) if image_name else None
+        return img, graph_file, image_name
 
     seg_files = _legacy_seg_pngs(layout["seg"])
     if not seg_files:
-        return None, None
+        return None, None, None
     if use_last:
         current_seg_file = seg_files[-1]
     else:
@@ -96,25 +97,42 @@ def load_plant_seg_and_graph(r_path, target=None, timestep=15, hour=None, use_la
             current_seg_file = seg_files[_hour_frame_index(len(seg_files), timestep, hour)]
     img = cv2.imread(current_seg_file, 0)
     if img is None:
-        return None, None
-    graph_file = os.path.join(
-        graph_folder,
-        os.path.basename(current_seg_file).replace("png", "xml.gz"),
-    )
-    return img, graph_file
+        return None, None, None
+    image_name = os.path.basename(current_seg_file)
+    graph_file = graph_path_for_name(graph_folder, image_name)
+    if os.path.basename(graph_file) != GRAPHS_FILENAME:
+        graph_file = os.path.join(
+            graph_folder,
+            image_name.replace("png", "xml.gz"),
+        )
+    return img, graph_file, image_name
 
 
-def _read_graph(graph_file, graph_folder):
+def _read_graph(graph_file, graph_folder, image_name=None):
+    combined = os.path.join(graph_folder, GRAPHS_FILENAME)
+    if os.path.isfile(combined):
+        if image_name:
+            try:
+                return loadGraph(combined, image_name=image_name)
+            except Exception:
+                pass
+        try:
+            return loadGraph(combined, which="last")
+        except Exception:
+            return None
     if graph_file:
         try:
-            return nx.read_graphml(graph_file)
+            return loadGraph(graph_file)
         except Exception:
             pass
-    fallback_graphs = utils.load_paths(graph_folder, "*.xml.gz")
+    fallback_graphs = [
+        path for path in utils.load_paths(graph_folder, "*.xml.gz")
+        if os.path.basename(path) != GRAPHS_FILENAME
+    ]
     if not fallback_graphs:
         return None
     try:
-        return nx.read_graphml(fallback_graphs[-1])
+        return loadGraph(fallback_graphs[-1])
     except Exception:
         return None
 
@@ -139,15 +157,15 @@ def calculate_atlas_geometry(experiment_paths: List[str], conf=None) -> Tuple[Tu
             chosen = period_frame_indices(names, conf) if names else []
             if chosen:
                 target = datetime_from_filename(names[chosen[-1]])
-                img, graph_path = load_plant_seg_and_graph(r_path, target=target)
+                img, graph_path, image_name = load_plant_seg_and_graph(r_path, target=target)
             else:
-                img, graph_path = load_plant_seg_and_graph(r_path, use_last=True)
+                img, graph_path, image_name = load_plant_seg_and_graph(r_path, use_last=True)
             if img is None:
                 continue
 
             img = np.pad(img, ((0,0), (PADDING_X, 0)))
 
-            g = _read_graph(graph_path, os.path.join(r_path, 'Graphs/'))
+            g = _read_graph(graph_path, os.path.join(r_path, 'Graphs/'), image_name=image_name)
             if g is None:
                 continue
 
@@ -315,13 +333,13 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
             metric_row = _hour_metric_row(df_temporal, target, hour)
             if metric_row is None:
                 continue
-            img, graph_file = load_plant_seg_and_graph(
+            img, graph_file, image_name = load_plant_seg_and_graph(
                 r_path, target=target, timestep=timestep, hour=hour
             )
             if img is None:
                 continue
 
-            g = _read_graph(graph_file, os.path.join(r_path, 'Graphs/'))
+            g = _read_graph(graph_file, os.path.join(r_path, 'Graphs/'), image_name=image_name)
             if g is None:
                 continue
 
