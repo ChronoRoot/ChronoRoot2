@@ -23,7 +23,9 @@ import numpy as np
 import json
 import os
 import csv
+import multiprocessing
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from .utils import report_utils as utils
 import scipy.stats as stats
 from .utils.fileUtilities import (
@@ -37,6 +39,7 @@ from .utils.fileUtilities import (
 from .utils.metadata_schema import get_bounding_box, video_image_dir
 from .time_windows import (
     collect_hourly_data,
+    datetime_from_filename,
     default_duration_hours,
     elapsed_hours_from_t0,
     match_time_group,
@@ -73,6 +76,8 @@ import logging
 logging.getLogger('matplotlib.category').setLevel(logging.ERROR)
 plt.switch_backend('agg')
 pd.options.mode.chained_assignment = None
+
+MAX_ANGLE_FIGURE_WORKERS = 4
 
 
 def traverse_root(root_element, is_lateral_root=False):
@@ -313,17 +318,17 @@ def matching(new_starts, all_new_points, old_starts, all_old_points, old_names, 
 
 def lenRoot(points, pixel_size=0.04):
     """
-    Calculate the total length of a root polyline in physical units.
-    
+    Calculate the total length of a root polyline in millimeters.
+
     Sums the Euclidean distances between consecutive points and converts
-    from pixels to centimeters using the pixel size.
-    
+    from pixels to millimeters using the pixel size.
+
     Args:
         points: List of [x, y] coordinate pairs defining the root
-        pixel_size: Size of each pixel in cm
-    
+        pixel_size: Size of each pixel in mm
+
     Returns:
-        float: Total root length in cm
+        float: Total root length in mm
     """
     # Convert to numpy array for vectorized operations
     points_array = np.array(points)
@@ -343,14 +348,19 @@ def getAngles(conf, path):
     Extract and save angle measurements for all lateral roots in a time series.
     
     Processes all RSML files in the specified path, tracks lateral roots across
-    frames, and calculates tip and emergence angles. Results are saved to a CSV file.
-    
+    frames, and calculates tip and emergence angles. Laterals shorter than half
+    the configured emergence distance are left out of the mean angles. The first
+    tracked root is always measured, including while it is still short.
+
+    Results are saved to LateralRootsData.csv. The first root's polyline on each
+    frame is saved to FirstLRTrack.json for the 72-hour zoom figure.
+
     Args:
         conf: Configuration dictionary containing 'emergenceDistance' parameter
         path: Path to the analysis results folder containing RSML subfolder
-    
+
     Returns:
-        None (writes results to LateralRootsData.csv)
+        None (writes LateralRootsData.csv and FirstLRTrack.json)
     """
     images = pd.read_csv(os.path.join(path, "FilesAfterPostprocessing.csv"))
     images.dropna(inplace=True)
@@ -377,7 +387,17 @@ def getAngles(conf, path):
 
     metadata = load_result_metadata(path)
     pixel_size = metadata['pixel_size']
-    
+    emergence_mm = float(conf['emergenceDistance'])
+    min_length_mm = 0.5 * emergence_mm
+
+    # Kept across frames so a picture with no lateral elements repeats the
+    # last measurement, as the tracker itself does.
+    measured_tips = []
+    measured_emergences = []
+    first_tip = None
+    first_emergence = None
+    first_lr_frames = []
+
     with open(filepath, 'w+') as f:
         writer = csv.writer(f)
         writer.writerow(["Img", "Number of lateral roots", "Mean tip angle", 
@@ -387,7 +407,8 @@ def getAngles(conf, path):
             tree = ET.parse(step).getroot()
 
             plant = tree[1][0][0]
-            
+            imgname = os.path.basename(step).replace('.rsml', '.png')
+
             # Check if lateral roots exist (more than just primary root)
             if len(plant) > 1:
                 lateral_root_elements = plant[1:]
@@ -395,7 +416,8 @@ def getAngles(conf, path):
                 points_list = []
                 start_points = []
 
-                # First: perform tracking of lateral roots
+                # First: perform tracking of lateral roots. Short roots stay
+                # in the track so they can be followed once they grow.
                 for lr_element in lateral_root_elements:
                     points = traverse_root(lr_element, is_lateral_root=True)
                     points_list.append(points)
@@ -407,31 +429,46 @@ def getAngles(conf, path):
                     num_roots
                 )
                 
-                # Second: estimate angles for all tracked roots
-                tip_angles = []
-                emergence_angles = []
+                # Means use only laterals at least half the emergence distance.
+                # The first tracked root is always recorded, even while short.
+                measured_tips = []
+                measured_emergences = []
+                first_tip = None
+                first_emergence = None
 
                 for root in lateral_roots:
-                    tip_angle = tipAngle(root)
-                    emergence_angle = emergenceAngle(
-                        root, 
-                        float(conf['emergenceDistance']), 
-                        pixel_size
-                    )
-                    tip_angles.append(tip_angle)
-                    emergence_angles.append(emergence_angle)
+                    length_mm = float(lenRoot(root, pixel_size))
+                    tip_angle = float(tipAngle(root))
+                    emergence_angle = float(emergenceAngle(root, emergence_mm, pixel_size))
+                    if first_tip is None:
+                        first_tip = tip_angle
+                        first_emergence = emergence_angle
+                        first_lr_frames.append({
+                            'img': imgname,
+                            'points': [[int(p[0]), int(p[1])] for p in root],
+                            'length_mm': round(length_mm, 3),
+                        })
+                    if length_mm >= min_length_mm:
+                        measured_tips.append(tip_angle)
+                        measured_emergences.append(emergence_angle)
 
-            # Robustly extract the image name for the CSV column
-            imgname = os.path.basename(step).replace('.rsml', '.png')
-            
-            if num_roots == 0:
+            if num_roots == 0 or first_tip is None:
                 measures = [imgname, 0, 0, 0, 0, 0]
             else:
-                measures = [imgname, num_roots, round(np.mean(tip_angles), 3), 
-                            round(np.mean(emergence_angles), 3), 
-                            round(tip_angles[0], 3), round(emergence_angles[0], 3)]
+                if measured_tips:
+                    mean_tip = round(float(np.mean(measured_tips)), 3)
+                    mean_emergence = round(float(np.mean(measured_emergences)), 3)
+                else:
+                    mean_tip = 0
+                    mean_emergence = 0
+                measures = [imgname, len(measured_tips), mean_tip, mean_emergence,
+                            round(first_tip, 3), round(first_emergence, 3)]
             writer.writerow(measures)
-    
+
+    track_path = os.path.join(path, 'FirstLRTrack.json')
+    with open(track_path, 'w') as track_file:
+        json.dump({'frames': first_lr_frames}, track_file)
+
     return
 
 
@@ -856,20 +893,22 @@ def performStatisticalAnalysisFirstLR(conf, data, metric):
     return
 
 
-def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None):
+def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_distance=2):
     """
     Estimate and visualize lateral root angles on an image.
-    
+
     Parses the RSML file, calculates angles for all lateral roots,
     and plots the angle measurement lines on the provided axes.
-    
+    Laterals shorter than half the emergence distance are not drawn.
+
     Args:
         path: Path to the analysis results folder
         ax: Matplotlib axes to draw on
         img: Image array to display as background
         i: Index of the RSML file to use (-1 = last file)
         tip: If True, show tip angles; if False, show emergence angles
-    
+        emergence_distance: Emergence distance in mm, same value as the measurement
+
     Returns:
         ax: Modified matplotlib axes with angle visualizations
     """
@@ -880,10 +919,9 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None):
 
     with open(os.path.join(path, 'metadata.json')) as f:
         metadata = json.load(f)
-
-    y1, y2, x1, x2 = get_bounding_box(metadata)
-    h = y2 - y1
-    w = x2 - x1
+    pixel_size = metadata['pixel_size']
+    emergence_mm = float(emergence_distance)
+    min_length_mm = 0.5 * emergence_mm
 
     plant = tree[1][0][0]
 
@@ -895,7 +933,7 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None):
     # Check if lateral roots exist
     if len(plant) > 1:
         lateral_root_elements = plant[1:]
-        
+
         points_list = []
         start_points = []
 
@@ -906,123 +944,291 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None):
             start_points.append(points[0])
 
         lateral_root_starts, lateral_roots, lateral_root_names, num_roots = matching(
-            start_points, points_list, 
-            lateral_root_starts, lateral_roots, lateral_root_names, 
+            start_points, points_list,
+            lateral_root_starts, lateral_roots, lateral_root_names,
             num_roots
         )
-        
-        # Second: estimate angles
-        tip_angles = []
-        emergence_angles = []
+
+        # Display image and overlay angle measurements. Short roots stay
+        # tracked, but they are left out of the drawing.
+        ax.imshow(img)
 
         for root in lateral_roots:
-            tip_angle = tipAngle(root)
-            emergence_angle = emergenceAngle(root, 2, metadata['pixel_size'])
-            tip_angles.append(tip_angle)
-            emergence_angles.append(emergence_angle)
-
-        # Display image and overlay angle measurements
-        ax.imshow(img)
-        
-        for i in range(len(points_list)):
-            if not tip:
-                plotAngles(ax, points_list[i], emergence_angles[i], tip=tip)
+            if lenRoot(root, pixel_size) < min_length_mm:
+                continue
+            if tip:
+                angle = tipAngle(root)
             else:
-                plotAngles(ax, points_list[i], tip_angles[i], tip=tip)
+                angle = emergenceAngle(root, emergence_mm, pixel_size)
+            plotAngles(
+                ax, root, angle, tip=tip,
+                distance_cm=emergence_mm, pixel_size=pixel_size,
+            )
         ax.axis('off')
-    
+
     return ax
+
+
+def render_plant_angle_figures(job):
+    """Draw one plant's angle overlays and first-lateral 72 h zoom.
+
+    Top-level so a spawn process pool can call it. Tracking is not repeated
+    here: the zoom reads FirstLRTrack.json written by getAngles.
+    """
+    conf = job['conf']
+    exp = job['exp']
+    robot = job['robot']
+    cam = job['cam']
+    plant = job['plant']
+    label = f"{exp}/{robot}/{cam}/{plant}"
+    try:
+        results_path = job['results_path']
+        save_path = job['save_path']
+        safe_exp = job['safe_exp']
+        safe_robot = job['safe_robot']
+        safe_cam = job['safe_cam']
+        safe_plant = job['safe_plant']
+
+        metadata = load_result_metadata(results_path)
+        images_csv = os.path.join(results_path, "FilesAfterPostprocessing.csv")
+        if not os.path.isfile(images_csv):
+            return label, True, ''
+
+        images = pd.read_csv(images_csv)
+        images.dropna(inplace=True)
+        images = images["FileName"].tolist()
+        kept = period_frame_indices(images, conf)
+        if kept:
+            images = [images[i] for i in kept]
+        if not images:
+            return label, True, ''
+
+        rsml_dir = os.path.join(results_path, "RSML")
+        if not os.path.isdir(rsml_dir):
+            return label, True, ''
+        rsml_files = os.listdir(rsml_dir)
+        images = [image for image in images
+                  if image.split('/')[-1].replace('.png', '.rsml') in rsml_files]
+        if not images:
+            return label, True, ''
+
+        video_dir = video_image_dir(metadata) or metadata.get("folder")
+        images = [os.path.join(video_dir, image) for image in images]
+
+        # The last picture is sometimes a failed RSML trace: one order-1
+        # lateral, and the other laterals nested under it. Walk back to the
+        # last frame that still has the laterals as separate roots.
+        overlay_image = images[-1]
+        for image in reversed(images):
+            candidate = os.path.join(
+                rsml_dir, os.path.basename(image).replace('.png', '.rsml'),
+            )
+            try:
+                main_root = ET.parse(candidate).getroot()[1][0][0]
+            except (ET.ParseError, IndexError, OSError):
+                continue
+            direct = 0
+            nested = 0
+            for child in main_root:
+                if child.tag != 'root':
+                    continue
+                direct += 1
+                nested += len(child.findall('.//root'))
+            if direct <= 1 and nested >= 3:
+                continue
+            overlay_image = image
+            break
+
+        bbox = get_bounding_box(metadata)
+        crop = cv2.imread(overlay_image)[bbox[0]:bbox[1], bbox[2]:bbox[3]]
+
+        save = exp + "_" + robot + "_" + cam + "_" + plant + "_crop.png"
+        cv2.imwrite(os.path.join(save_path, save), crop)
+
+        last_name = os.path.basename(overlay_image).replace('.png', '.rsml')
+        rsml_path = os.path.join(results_path, 'RSML', last_name)
+        emergence_mm = float(conf['emergenceDistance'])
+        stamp = datetime_from_filename(overlay_image)
+        when = stamp.strftime('%Y-%m-%d %H:%M') if stamp is not None else os.path.basename(overlay_image)
+
+        fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
+        estimateAngles(
+            results_path, ax, crop.copy(), rsml_path=rsml_path,
+            emergence_distance=emergence_mm,
+        )
+        plt.title(f"Emergence Angles — {when}")
+        save = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_emergence_angles.svg"
+        plt.savefig(os.path.join(save_path, save), bbox_inches="tight", dpi=200)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
+        estimateAngles(
+            results_path, ax, crop.copy(), rsml_path=rsml_path, tip=True,
+            emergence_distance=emergence_mm,
+        )
+        plt.title(f"Tip Angles — {when}")
+        filename = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_tip_angles.svg"
+        plt.savefig(os.path.join(save_path, filename), bbox_inches="tight", dpi=200)
+        plt.close(fig)
+
+        track_path = os.path.join(results_path, 'FirstLRTrack.json')
+        if not os.path.isfile(track_path):
+            print(
+                f'Warning: missing FirstLRTrack.json in {results_path}, skipping first-LR zoom',
+                flush=True,
+            )
+            return label, True, ''
+
+        with open(track_path) as track_file:
+            track = json.load(track_file)
+
+        stamped = []
+        for entry in track.get('frames') or []:
+            ts = datetime_from_filename(entry.get('img', ''))
+            points = entry.get('points') or []
+            if ts is None or len(points) == 0:
+                continue
+            stamped.append((ts, entry))
+
+        window = []
+        if stamped:
+            t0 = min(ts for ts, _entry in stamped)
+            for ts, entry in stamped:
+                hours = (ts - t0).total_seconds() / 3600.0
+                if 0 <= hours <= 72:
+                    window.append((hours, entry))
+            window.sort(key=lambda item: item[0])
+
+        chosen = []
+        if window:
+            seen = set()
+            targets = [i * 72.0 / 7.0 for i in range(8)]
+            for target in targets:
+                nearest = min(range(len(window)), key=lambda i: abs(window[i][0] - target))
+                if nearest not in seen:
+                    seen.add(nearest)
+                    chosen.append(window[nearest])
+
+        if chosen:
+            fig, axes = plt.subplots(2, 4, figsize=(12, 6), dpi=150, constrained_layout=True)
+            axes_flat = list(np.ravel(axes))
+            drawn = 0
+            for ax, (hours, entry) in zip(axes_flat, chosen):
+                image_path = os.path.join(video_dir, os.path.basename(entry['img']))
+                full = cv2.imread(image_path)
+                if full is None:
+                    ax.axis('off')
+                    continue
+                panel = full[bbox[0]:bbox[1], bbox[2]:bbox[3]]
+                pts = np.asarray(entry['points'], dtype=float)
+                if panel.size == 0 or pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
+                    ax.axis('off')
+                    continue
+                minx, miny = pts.min(axis=0)
+                maxx, maxy = pts.max(axis=0)
+                pad = max(20, int(round(0.2 * max(maxx - minx, maxy - miny, 1))))
+                x1 = max(0, int(np.floor(minx)) - pad)
+                y1 = max(0, int(np.floor(miny)) - pad)
+                x2 = min(panel.shape[1], int(np.ceil(maxx)) + pad + 1)
+                y2 = min(panel.shape[0], int(np.ceil(maxy)) + pad + 1)
+                if x2 <= x1 or y2 <= y1:
+                    ax.axis('off')
+                    continue
+                zoom = panel[y1:y2, x1:x2]
+                if zoom.size == 0:
+                    ax.axis('off')
+                    continue
+                ax.imshow(cv2.cvtColor(zoom, cv2.COLOR_BGR2RGB))
+                ax.plot(pts[:, 0] - x1, pts[:, 1] - y1, color='#ff2d2d', linewidth=2)
+                ax.set_title(
+                    f'{hours:.1f} h\n{float(entry.get("length_mm", 0)):.1f} mm',
+                    fontsize=9,
+                )
+                ax.axis('off')
+                drawn += 1
+            for ax in axes_flat[len(chosen):]:
+                ax.axis('off')
+            if drawn:
+                zoom_name = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h.png"
+                fig.savefig(os.path.join(save_path, zoom_name), dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+        return label, True, ''
+    except Exception as exc:
+        plt.close('all')
+        return label, False, str(exc)
 
 
 def plotLateralAnglesOnTop(conf):
     """
     Generate angle visualization overlays for all plants.
-    
+
     Creates images showing the emergence and tip angle measurements
-    overlaid on the original root images for visual verification.
-    
+    overlaid on the original root images, plus an 8-frame zoom of the
+    first lateral root over its first 72 hours. Plants are rendered in
+    parallel.
+
     Args:
         conf: Configuration dictionary with 'MainFolder' path
-    
+
     Returns:
         None (saves PNG and SVG images to Report folder)
     """
     exp_path = os.path.join(conf['MainFolder'], "Analysis")
+    if not os.path.isdir(exp_path):
+        return
 
+    jobs = []
     for exp in os.listdir(exp_path):
+        robot_path = os.path.join(exp_path, exp)
+        if not os.path.isdir(robot_path):
+            continue
         safe_exp = convertToPathSafe(exp)
         save_path = angle_overlays_dir(conf, safe_exp)
-        robot_path = os.path.join(exp_path, exp)
 
         for robot in os.listdir(robot_path):
-            safe_robot = convertToPathSafe(robot)
             cam_path = os.path.join(robot_path, robot)
+            if not os.path.isdir(cam_path):
+                continue
+            safe_robot = convertToPathSafe(robot)
 
             for cam in os.listdir(cam_path):
-                safe_cam = convertToPathSafe(cam)
                 plant_path = os.path.join(cam_path, cam)
+                if not os.path.isdir(plant_path):
+                    continue
+                safe_cam = convertToPathSafe(cam)
 
                 for plant in os.listdir(plant_path):
-                    safe_plant = convertToPathSafe(plant)
-                    results_path = get_latest_result_dir(os.path.join(plant_path, plant))
-                    if results_path is None:
+                    slot = os.path.join(plant_path, plant)
+                    if not os.path.isdir(slot):
                         continue
-                    
-                    if os.path.exists(results_path):
-                        metadata = load_result_metadata(results_path)
+                    results_path = get_latest_result_dir(slot)
+                    if results_path is None or not os.path.exists(results_path):
+                        continue
+                    jobs.append({
+                        'conf': conf,
+                        'exp': exp,
+                        'robot': robot,
+                        'cam': cam,
+                        'plant': plant,
+                        'safe_exp': safe_exp,
+                        'safe_robot': safe_robot,
+                        'safe_cam': safe_cam,
+                        'safe_plant': convertToPathSafe(plant),
+                        'results_path': results_path,
+                        'save_path': save_path,
+                    })
 
-                        # Load list of postprocessed images
-                        images = pd.read_csv(os.path.join(results_path, "FilesAfterPostprocessing.csv"))
-                        images.dropna(inplace=True)
-                        images = images["FileName"].tolist()
-                        kept = period_frame_indices(images, conf)
-                        if kept:
-                            images = [images[i] for i in kept]
-                        if not images:
-                            continue
+    if not jobs:
+        return
 
-                        rsml_files = os.listdir(os.path.join(results_path, "RSML"))
-
-                        # Filter to images with corresponding RSML
-                        images = [image for image in images 
-                                 if image.split('/')[-1].replace('.png', '.rsml') in rsml_files]
-                        if not images:
-                            continue
-                        
-                        video_dir = video_image_dir(metadata) or metadata.get("folder")
-                        images = [os.path.join(video_dir, image) for image in images]
-
-                        # Load and crop the last picture inside the analysis period
-                        bbox = get_bounding_box(metadata)
-                        crop = cv2.imread(images[-1])[bbox[0]:bbox[1], bbox[2]:bbox[3]]
-                        
-                        # Save cropped image
-                        save = exp + "_" + robot + "_" + cam + "_" + plant + "_crop.png"
-                        cv2.imwrite(os.path.join(save_path, save), crop)
-
-                        last_name = os.path.basename(images[-1]).replace('.png', '.rsml')
-                        rsml_path = os.path.join(results_path, 'RSML', last_name)
-
-                        # Generate emergence angles visualization
-                        fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
-                        estimateAngles(results_path, ax, crop.copy(), rsml_path=rsml_path)
-                        plt.title("Emergence Angles")
-
-                        save = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_emergence_angles.svg"
-                        plt.savefig(os.path.join(save_path, save), bbox_inches="tight", dpi=200)
-
-                        plt.close()
-                        plt.clf()
-                        plt.cla()
-
-                        # Generate tip angles visualization
-                        fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
-                        estimateAngles(results_path, ax, crop.copy(), rsml_path=rsml_path, tip=True)
-                        plt.title("Tip Angles")
-
-                        filename = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_tip_angles.svg"
-                        plt.savefig(os.path.join(save_path, filename), bbox_inches="tight", dpi=200)
-                        
-                        plt.close()
-                        plt.clf()
-                        plt.cla()
+    workers = min(MAX_ANGLE_FIGURE_WORKERS, len(jobs))
+    print(f'Angle overlays ({len(jobs)} plants, up to {workers} workers)', flush=True)
+    ctx = multiprocessing.get_context('spawn')
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+        futures = [executor.submit(render_plant_angle_figures, job) for job in jobs]
+        for future in as_completed(futures):
+            label, ok, err = future.result()
+            if not ok:
+                print(f'Warning: angle figures failed for {label}: {err}', flush=True)
+    return
