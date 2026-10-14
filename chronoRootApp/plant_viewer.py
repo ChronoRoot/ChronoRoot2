@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGraphicsScene, QGraphicsPixmapItem, QStyle,
                              QDialog, QGraphicsRectItem, QGraphicsTextItem,
                              QRubberBand)
-from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSize, pyqtSignal, QPointF
+from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSize, pyqtSignal, QPointF, QObject, QThread, pyqtSlot
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 
 from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
@@ -203,9 +203,74 @@ def _overlay_label_segmentation(img, seg, colors=None):
     return out
 
 
+class _FrameJob(QObject):
+    """One persistent decode thread. The newest request is the one that runs."""
+
+    finished = pyqtSignal(int, object)
+    trigger = pyqtSignal(int, object)
+
+    def __init__(self):
+        super().__init__()
+        self.latest = 0
+
+    @pyqtSlot(int, object)
+    def run_job(self, generation, fn):
+        if generation != self.latest:
+            return
+        try:
+            result = fn()
+        except Exception:
+            result = None
+        if generation != self.latest:
+            return
+        self.finished.emit(generation, result)
+
+
+def _open_frame_thread(window):
+    window._frame_generation = 0
+    window._frame_closing = False
+    window._frame_on_image = None
+    window._frame_thread = QThread(window)
+    window._frame_worker = _FrameJob()
+    window._frame_worker.moveToThread(window._frame_thread)
+    window._frame_worker.trigger.connect(
+        window._frame_worker.run_job, Qt.QueuedConnection,
+    )
+    window._frame_worker.finished.connect(
+        lambda generation, img, window=window: _finish_frame_read(window, generation, img)
+    )
+    window._frame_thread.start()
+
+
+def _submit_frame(window, decode, on_image):
+    window._frame_generation += 1
+    generation = window._frame_generation
+    window._frame_on_image = on_image
+    window._frame_worker.latest = generation
+    window._frame_worker.trigger.emit(generation, decode)
+
+
+def _finish_frame_read(window, generation, img):
+    if window._frame_closing or generation != window._frame_generation:
+        return
+    callback = window._frame_on_image
+    if callback is not None:
+        callback(img)
+
+
+def _close_frame_thread(window):
+    window._frame_closing = True
+    window._frame_generation += 1
+    thread = getattr(window, "_frame_thread", None)
+    if thread is None:
+        return
+    thread.quit()
+    thread.wait()
+
+
 # --- MAIN WINDOW CLASS ---
 class ChronoViewWindow(QMainWindow):
-    def __init__(self, images, segFiles, bbox, conf, parent=None, clock_names=None):
+    def __init__(self, images, segFiles, bbox, conf, parent=None, clock_names=None, first_frame=None):
         super().__init__(parent)
         self.images = images
         self.segFiles = segFiles
@@ -283,7 +348,21 @@ class ChronoViewWindow(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.next_frame)
 
-        self.update_display()
+        _open_frame_thread(self)
+        if first_frame is not None:
+            self._show_prepared_frame(first_frame)
+        else:
+            self.update_display()
+
+    def _show_prepared_frame(self, img):
+        """Show a frame that was already decoded and cropped off the GUI thread."""
+        self.pixmap_item.setPixmap(self.cv2_to_qpixmap(img))
+        self.lbl_frame.setText(
+            f"Frame {self.idx + 1}/{self.n}  |  Day {self.days[self.idx]}  Time {self.hours[self.idx]:02d}:{self.minutes[self.idx]:02d}"
+        )
+        self.slider.blockSignals(True)
+        self.slider.setValue(self.idx)
+        self.slider.blockSignals(False)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -303,29 +382,41 @@ class ChronoViewWindow(QMainWindow):
         if src >= len(self.images):
             return
 
-        img = cv2.imread(self.images[src])
-        if img is None:
-            return
-
-        if self.bbox and len(self.bbox) == 4:
-            y1, y2, x1, x2 = self.bbox
-            h, w = img.shape[:2]
-            if 0 <= y1 < y2 <= h and 0 <= x1 < x2 <= w:
-                img = img[y1:y2, x1:x2]
-
-        if self.use_seg and self.segFiles is not None:
-            seg = load_seg_frame(self.segFiles, src)
-            if seg is not None:
-                img = _overlay_label_segmentation(img, seg)
-
-        self.pixmap_item.setPixmap(self.cv2_to_qpixmap(img))
-        self.lbl_frame.setText(
-            f"Frame {self.idx + 1}/{self.n}  |  Day {self.days[self.idx]}  Time {self.hours[self.idx]:02d}:{self.minutes[self.idx]:02d}"
-        )
-
+        idx = self.idx
+        bbox = self.bbox
+        use_seg = self.use_seg
+        seg_files = self.segFiles
+        path = self.images[src]
+        self.lbl_frame.setText("Loading frame…")
         self.slider.blockSignals(True)
-        self.slider.setValue(self.idx)
+        self.slider.setValue(idx)
         self.slider.blockSignals(False)
+
+        def decode():
+            img = cv2.imread(path)
+            if img is None:
+                return None
+            if bbox and len(bbox) == 4:
+                y1, y2, x1, x2 = bbox
+                h, w = img.shape[:2]
+                if 0 <= y1 < y2 <= h and 0 <= x1 < x2 <= w:
+                    img = img[y1:y2, x1:x2]
+            if use_seg and seg_files is not None:
+                seg = load_seg_frame(seg_files, src)
+                if seg is not None:
+                    img = _overlay_label_segmentation(img, seg)
+            return img
+
+        def show(img):
+            if img is None:
+                self.lbl_frame.setText("Failed to load frame")
+                return
+            self.pixmap_item.setPixmap(self.cv2_to_qpixmap(img))
+            self.lbl_frame.setText(
+                f"Frame {idx + 1}/{self.n}  |  Day {self.days[idx]}  Time {self.hours[idx]:02d}:{self.minutes[idx]:02d}"
+            )
+
+        _submit_frame(self, decode, show)
 
     def set_frame(self, val):
         self.idx = val
@@ -349,6 +440,8 @@ class ChronoViewWindow(QMainWindow):
         self.update_display()
 
     def closeEvent(self, event):
+        self.timer.stop()
+        _close_frame_thread(self)
         if isinstance(self.segFiles, TiffStackReader):
             self.segFiles.close()
         super().closeEvent(event)
@@ -428,7 +521,12 @@ class PlantROISelectorWindow(QDialog):
         action_layout.addWidget(self.btn_cancel)
         layout.addLayout(action_layout)
 
+        _open_frame_thread(self)
         self._update_display(refit=True)
+
+    def closeEvent(self, event):
+        _close_frame_thread(self)
+        super().closeEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -456,59 +554,74 @@ class PlantROISelectorWindow(QDialog):
         self.use_seg = not self.use_seg
         self._update_display(refit=False)
 
-    def _load_frame(self):
-        if not self.images:
+    def _load_frame(self, idx, images, seg_files, previous_rois, own_previous_roi, plant_label, use_seg):
+        if not images:
             return None
-        img = cv2.imread(self.images[self.idx])
+        img = cv2.imread(images[idx])
         if img is None:
             return None
-        self.image_height, self.image_width = img.shape[:2]
 
-        for label, x1, y1, x2, y2 in self.previous_rois:
+        for label, x1, y1, x2, y2 in previous_rois:
             draw_labeled_roi(img, x1, y1, x2, y2, label, color=(255, 0, 0))
 
-        if self.own_previous_roi:
-            x1, y1, x2, y2 = self.own_previous_roi
-            label = self.plant_label or "current plant"
+        if own_previous_roi:
+            x1, y1, x2, y2 = own_previous_roi
+            label = plant_label or "current plant"
             draw_labeled_roi(img, x1, y1, x2, y2, label, color=(0, 0, 255))
 
-        if self.use_seg and self.seg_files and self.idx < len(self.seg_files):
-            seg = cv2.imread(self.seg_files[self.idx], cv2.IMREAD_UNCHANGED)
+        if use_seg and seg_files and idx < len(seg_files):
+            seg = cv2.imread(seg_files[idx], cv2.IMREAD_UNCHANGED)
             if seg is not None:
                 img = _overlay_label_segmentation(img, seg)
 
         return img
+
+    def _update_display(self, refit=False):
+        idx = self.idx
+        images = self.images
+        seg_files = self.seg_files
+        previous_rois = list(self.previous_rois)
+        own_previous_roi = self.own_previous_roi
+        plant_label = self.plant_label
+        use_seg = self.use_seg
+        self.lbl_frame.setText("Loading frame…")
+        self.slider.blockSignals(True)
+        if images:
+            self.slider.setRange(0, len(images) - 1)
+            self.slider.setValue(idx)
+        self.slider.blockSignals(False)
+
+        def decode():
+            return self._load_frame(
+                idx, images, seg_files, previous_rois, own_previous_roi, plant_label, use_seg,
+            )
+
+        def show(img):
+            if img is None:
+                self.lbl_frame.setText("Failed to load frame")
+                return
+            self.image_height, self.image_width = img.shape[:2]
+            self.pixmap_item.setPixmap(_cv2_to_qpixmap(img))
+            self.scene.setSceneRect(QRectF(self.pixmap_item.pixmap().rect()))
+            self.lbl_frame.setText(self._frame_time_text())
+            if self.pending_roi:
+                self.lbl_info.setText(
+                    "Press Enter or Confirm to apply this selection. Scroll to zoom. Ctrl+drag to pan."
+                )
+            else:
+                self.lbl_info.setText(
+                    "Drag a rectangle on the image. Press Enter to confirm. Scroll to zoom. Ctrl+drag to pan."
+                )
+            if refit:
+                QTimer.singleShot(0, self._fit_image)
+
+        _submit_frame(self, decode, show)
 
     def _frame_time_text(self):
         minutes = (self.idx * self.time_delta) % 60
         hours = int((self.idx * self.time_delta / 60) % 24)
         days = int(self.idx * self.time_delta // 1440)
         return f"Frame {self.idx + 1}/{len(self.images)}  |  Day {days}  Time {hours:02d}:{int(minutes):02d}"
-
-    def _update_display(self, refit=False):
-        img = self._load_frame()
-        if img is None:
-            self.lbl_frame.setText("Failed to load frame")
-            return
-
-        self.pixmap_item.setPixmap(_cv2_to_qpixmap(img))
-        self.scene.setSceneRect(QRectF(self.pixmap_item.pixmap().rect()))
-        self.slider.blockSignals(True)
-        self.slider.setRange(0, len(self.images) - 1)
-        self.slider.setValue(self.idx)
-        self.slider.blockSignals(False)
-
-        self.lbl_frame.setText(self._frame_time_text())
-        if self.pending_roi:
-            self.lbl_info.setText(
-                "Press Enter or Confirm to apply this selection. Scroll to zoom. Ctrl+drag to pan."
-            )
-        else:
-            self.lbl_info.setText(
-                "Drag a rectangle on the image. Press Enter to confirm. Scroll to zoom. Ctrl+drag to pan."
-            )
-        if refit:
-            QTimer.singleShot(0, self._fit_image)
 
     def _fit_image(self):
         if self.pixmap_item.pixmap():
@@ -609,7 +722,12 @@ class SeedSelectorWindow(QDialog):
         action_layout.addWidget(self.btn_cancel)
         layout.addLayout(action_layout)
 
+        _open_frame_thread(self)
         self._update_display(refit=True)
+
+    def closeEvent(self, event):
+        _close_frame_thread(self)
+        super().closeEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -635,11 +753,11 @@ class SeedSelectorWindow(QDialog):
         self.idx = val
         self._update_display(refit=True)
 
-    def _load_frame(self):
-        if not self.images or len(self.bbox) != 4:
+    def _load_frame(self, idx, images, seg_files, bbox, use_seg, seed_pos):
+        if not images or len(bbox) != 4:
             return None
-        y1, y2, x1, x2 = self.bbox
-        img = cv2.imread(self.images[self.idx])
+        y1, y2, x1, x2 = bbox
+        img = cv2.imread(images[idx])
         if img is None:
             return None
         h, w = img.shape[:2]
@@ -647,15 +765,15 @@ class SeedSelectorWindow(QDialog):
             return None
         img = img[y1:y2, x1:x2].copy()
 
-        if self.use_seg and self.seg_files and self.idx < len(self.seg_files):
-            seg = cv2.imread(self.seg_files[self.idx], cv2.IMREAD_UNCHANGED)
+        if use_seg and seg_files and idx < len(seg_files):
+            seg = cv2.imread(seg_files[idx], cv2.IMREAD_UNCHANGED)
             if seg is not None:
                 if len(seg.shape) >= 2:
                     seg = seg[y1:y2, x1:x2]
                 img = _overlay_label_segmentation(img, seg)
 
-        if self.seed_pos is not None:
-            draw_seed_marker(img, int(self.seed_pos[0]), int(self.seed_pos[1]))
+        if seed_pos is not None:
+            draw_seed_marker(img, int(seed_pos[0]), int(seed_pos[1]))
         return img
 
     def _on_point_selected(self, scene_pos):
@@ -667,35 +785,47 @@ class SeedSelectorWindow(QDialog):
         self._update_display(refit=False)
 
     def _update_display(self, refit=False):
-        img = self._load_frame()
-        if img is None:
-            self.lbl_frame.setText("Failed to load frame")
-            return
-
-        self.pixmap_item.setPixmap(_cv2_to_qpixmap(img))
-        self.scene.setSceneRect(QRectF(self.pixmap_item.pixmap().rect()))
+        idx = self.idx
+        images = self.images
+        seg_files = self.seg_files
+        bbox = self.bbox
+        use_seg = self.use_seg
+        seed_pos = self.seed_pos
+        self.lbl_frame.setText("Loading frame…")
         self.slider.blockSignals(True)
-        self.slider.setRange(0, len(self.images) - 1)
-        self.slider.setValue(self.idx)
+        if images:
+            self.slider.setRange(0, len(images) - 1)
+            self.slider.setValue(idx)
         self.slider.blockSignals(False)
 
-        minutes = (self.idx * self.time_delta) % 60
-        hours = int((self.idx * self.time_delta / 60) % 24)
-        days = int(self.idx * self.time_delta // 1440)
-        self.lbl_frame.setText(
-            f"Frame {self.idx + 1}/{len(self.images)}  |  Day {days}  Time {hours:02d}:{int(minutes):02d}"
-        )
-        if self.seed_pos is not None:
-            self.lbl_info.setText(
-                f"Root at ({int(self.seed_pos[0])}, {int(self.seed_pos[1])}). Enter to confirm. "
-                "Scroll to zoom. Ctrl+drag to pan."
+        def decode():
+            return self._load_frame(idx, images, seg_files, bbox, use_seg, seed_pos)
+
+        def show(img):
+            if img is None:
+                self.lbl_frame.setText("Failed to load frame")
+                return
+            self.pixmap_item.setPixmap(_cv2_to_qpixmap(img))
+            self.scene.setSceneRect(QRectF(self.pixmap_item.pixmap().rect()))
+            minutes = (idx * self.time_delta) % 60
+            hours = int((idx * self.time_delta / 60) % 24)
+            days = int(idx * self.time_delta // 1440)
+            self.lbl_frame.setText(
+                f"Frame {idx + 1}/{len(images)}  |  Day {days}  Time {hours:02d}:{int(minutes):02d}"
             )
-        else:
-            self.lbl_info.setText(
-                "Click root origin. Enter to confirm. Scroll to zoom. Ctrl+drag to pan."
-            )
-        if refit:
-            QTimer.singleShot(0, self._fit_image)
+            if seed_pos is not None:
+                self.lbl_info.setText(
+                    f"Root at ({int(seed_pos[0])}, {int(seed_pos[1])}). Enter to confirm. "
+                    "Scroll to zoom. Ctrl+drag to pan."
+                )
+            else:
+                self.lbl_info.setText(
+                    "Click root origin. Enter to confirm. Scroll to zoom. Ctrl+drag to pan."
+                )
+            if refit:
+                QTimer.singleShot(0, self._fit_image)
+
+        _submit_frame(self, decode, show)
 
     def _fit_image(self):
         if self.pixmap_item.pixmap():
@@ -785,7 +915,12 @@ class GroupROISelectorWindow(QDialog):
         self.use_seg = False
         self.idx = len(self.images) - 1 if self.images else 0
         self._update_group_label()
+        _open_frame_thread(self)
         self._update_display()
+
+    def closeEvent(self, event):
+        _close_frame_thread(self)
+        super().closeEvent(event)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -882,17 +1017,15 @@ class GroupROISelectorWindow(QDialog):
         self.use_seg = not self.use_seg
         self._update_display()
 
-    def _load_current_image(self):
-        if not self.images:
+    def _load_current_image(self, idx, images, seg_files, use_seg):
+        if not images:
             return None
-        img = cv2.imread(self.images[self.idx])
+        img = cv2.imread(images[idx])
         if img is None:
             return None
 
-        self.image_height, self.image_width = img.shape[:2]
-
-        if self.use_seg and self.seg_files and self.idx < len(self.seg_files):
-            seg = cv2.imread(self.seg_files[self.idx], cv2.IMREAD_UNCHANGED)
+        if use_seg and seg_files and idx < len(seg_files):
+            seg = cv2.imread(seg_files[idx], cv2.IMREAD_UNCHANGED)
             if seg is not None:
                 img = _overlay_label_segmentation(img, seg)
         return img
@@ -980,24 +1113,33 @@ class GroupROISelectorWindow(QDialog):
             self.lbl_info.setText("No images available")
             return
 
-        img = self._load_current_image()
-        if img is None:
-            self.lbl_info.setText("Failed to load frame")
-            return
-
-        pixmap = _cv2_to_qpixmap(img)
-        self.pixmap_item.setPixmap(pixmap)
-        self.scene.setSceneRect(QRectF(pixmap.rect()))
-
+        idx = self.idx
+        images = self.images
+        seg_files = self.seg_files
+        use_seg = self.use_seg
+        self.lbl_info.setText("Loading frame…")
         self.slider.blockSignals(True)
-        self.slider.setRange(0, len(self.images) - 1)
-        self.slider.setValue(self.idx)
+        self.slider.setRange(0, len(images) - 1)
+        self.slider.setValue(idx)
         self.slider.blockSignals(False)
 
-        self._redraw_confirmed_overlays()
-        self._refresh_info_line()
-        self._update_nav_buttons()
-        QTimer.singleShot(0, self._fit_image)
+        def decode():
+            return self._load_current_image(idx, images, seg_files, use_seg)
+
+        def show(img):
+            if img is None:
+                self.lbl_info.setText("Failed to load frame")
+                return
+            self.image_height, self.image_width = img.shape[:2]
+            pixmap = _cv2_to_qpixmap(img)
+            self.pixmap_item.setPixmap(pixmap)
+            self.scene.setSceneRect(QRectF(pixmap.rect()))
+            self._redraw_confirmed_overlays()
+            self._refresh_info_line()
+            self._update_nav_buttons()
+            QTimer.singleShot(0, self._fit_image)
+
+        _submit_frame(self, decode, show)
 
     def _fit_image(self):
         if self.pixmap_item.pixmap():

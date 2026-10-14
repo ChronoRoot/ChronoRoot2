@@ -187,10 +187,11 @@ class ZoomableImage(QLabel):
 class CalibrationHelper(QMainWindow):
     distance_measured = pyqtSignal(int)
 
-    def __init__(self, video_dir):
+    def __init__(self, video_dir, dialog_parent=None):
         super().__init__()
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.video_dir = os.path.abspath(video_dir)
+        self._dialog_parent = dialog_parent
         self.initUI()
         self.load_first_frame()
         
@@ -252,20 +253,31 @@ class CalibrationHelper(QMainWindow):
 
     def load_first_frame(self):
         """Load the first frame of the first video in the directory"""
-        if not os.path.exists(self.video_dir):
+        from gui.background import run_off_main_thread
+
+        video_dir = self.video_dir
+
+        def load():
+            if not os.path.exists(video_dir):
+                return ('missing_dir', None)
+            images, _ = getImages({'Images': video_dir})
+            if not images:
+                return ('no_images', None)
+            with PIL.Image.open(images[0]) as src:
+                frame = np.array(src.convert("RGB"))
+            return ('ok', frame)
+
+        status, frame = run_off_main_thread(
+            self._dialog_parent or self,
+            "Loading calibration image…",
+            load,
+        )
+        if status == 'missing_dir':
             QMessageBox.critical(self, "Error", "Video directory does not exist!")
             return
-        
-        images, _ = getImages({'Images': self.video_dir})
-
-        
-        if not images:
+        if status == 'no_images':
             QMessageBox.warning(self, "Warning", "No images found in directory!")
             return
-            
-        # Load first frame of first video
-        frame = PIL.Image.open(images[0]).convert("RGB")
-        frame = np.array(frame)
         self.frame_widget.set_frame(frame)
             
     def on_point_selected(self, point):

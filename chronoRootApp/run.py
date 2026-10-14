@@ -43,6 +43,7 @@ from analysis.utils.metadata_schema import (
     pending_analysis_path,
 )
 from analysis.utils.report_utils import natural_key as natural_keys
+from gui.background import run_off_main_thread
 from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
 from gui import pipeline_runner
 from gui.stats_config_dialog import StatsConfigDialog
@@ -54,7 +55,7 @@ from analysis.time_windows import (
     analysis_period_is_current,
     report_folder_name,
 )
-from gui.report_browser import ReportBranch, load_report_catalog
+from gui.report_browser import ReportBranch, filter_report_preview, load_report_catalog
 from analysis.utils.remap_identifiers import (
     RemapError,
     apply_experiment_remap,
@@ -68,27 +69,6 @@ REPORT_STATS_ROLE = QtCore.Qt.UserRole + 1
 
 WINDOW_WIDTH = 811
 WINDOW_HEIGHT = TAB_HEIGHT + 20
-
-
-class PlantInventoryWorker(QtCore.QObject):
-    """Background scan of Analysis/; results applied on the UI thread."""
-
-    finished = QtCore.pyqtSignal(int, str, object)  # generation, project_path, rows
-    failed = QtCore.pyqtSignal(int, str, str)
-
-    def __init__(self, generation, project_path, analysis_path):
-        super().__init__()
-        self.generation = generation
-        self.project_path = project_path
-        self.analysis_path = analysis_path
-
-    @QtCore.pyqtSlot()
-    def run(self):
-        try:
-            rows = scan_analysis_plants(self.analysis_path)
-            self.finished.emit(self.generation, self.project_path, rows)
-        except Exception as exc:
-            self.failed.emit(self.generation, self.project_path, str(exc))
 
 
 class AspectRatioLabel(QLabel):
@@ -139,11 +119,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._overlay_pixmap_cache = {}
         self._plants_loaded_for = None
         self._plants_dirty = True
-        self._inventory_generation = 0
         self._last_seen_project = None
-        self._inventory_thread = None
-        self._inventory_worker = None
         self._prefer_index_after_load = None
+        self._inventory_busy = False
+        self._shown_report_plot = None
         self.setupUi(self)
 
     def current_project_key(self):
@@ -178,7 +157,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
     def invalidate_plant_inventory(self):
         """Drop Overview/Overlay plant lists after a project change."""
-        self._inventory_generation += 1
         self._plants_dirty = True
         self._plants_loaded_for = None
         self._overlay_pixmap_cache.clear()
@@ -283,12 +261,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.ensure_plant_inventory(force=True)
 
     def ensure_plant_inventory(self, force=False):
-        """Start an async scan if the inventory is stale (or force=True)."""
+        """Scan Analysis/ off the GUI thread if the inventory is stale (or force=True)."""
+        if self._inventory_busy:
+            return
         if not force and not self.inventory_is_stale():
             return
         project = self.current_project_key()
-        generation = self._inventory_generation + 1
-        self._inventory_generation = generation
         self._plants_dirty = True
 
         # Clear UI immediately so old-project rows cannot linger
@@ -302,49 +280,30 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.plant_dropdown.blockSignals(False)
 
         self._set_inventory_loading(True)
-
         analysis_root = os.path.join(project, "Analysis") if project else ""
+        self._inventory_busy = True
 
-        # Drop previous worker thread (stale results ignored via generation)
-        if self._inventory_thread is not None:
-            try:
-                self._inventory_thread.quit()
-            except Exception:
-                pass
-            self._inventory_thread = None
-            self._inventory_worker = None
+        def show_rows(rows):
+            if project != self.current_project_key():
+                self._set_inventory_loading(False)
+                return
+            self.apply_plant_inventory(project, rows)
 
-        worker = PlantInventoryWorker(generation, project, analysis_root)
-        thread = QtCore.QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_inventory_finished)
-        worker.failed.connect(self._on_inventory_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._inventory_worker = worker
-        self._inventory_thread = thread
-        thread.start()
-
-    def _on_inventory_failed(self, generation, project_path, message):
-        if generation != self._inventory_generation:
-            return
-        if project_path != self.current_project_key():
-            return
-        self._set_inventory_loading(False)
-        self._plants_dirty = True
-        QtWidgets.QMessageBox.warning(
-            self, "Plant list", f"Failed to load plants:\n{message}"
-        )
-
-    def _on_inventory_finished(self, generation, project_path, rows):
-        if generation != self._inventory_generation:
-            return
-        if project_path != self.current_project_key():
-            return
-        self.apply_plant_inventory(project_path, rows)
+        try:
+            run_off_main_thread(
+                self,
+                "Loading plant list…",
+                lambda: scan_analysis_plants(analysis_root),
+                then=show_rows,
+            )
+        except Exception as exc:
+            self._set_inventory_loading(False)
+            self._plants_dirty = True
+            QtWidgets.QMessageBox.warning(
+                self, "Plant list", f"Failed to load plants:\n{exc}"
+            )
+        finally:
+            self._inventory_busy = False
 
     def apply_plant_inventory(self, project_path, rows):
         """Fill Overview table + Overlay combo on the UI thread."""
@@ -375,8 +334,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if hasattr(self, "plant_dropdown") and self.plant_dropdown is not None:
                 label = f"{experiment} — {rpi} / {camera} / {plant}"
                 self.plant_dropdown.addItem(label, active_path)
+            if row % 100 == 99:
+                QtWidgets.QApplication.processEvents()
 
         self.table.resizeColumnsToContents()
+        QtWidgets.QApplication.processEvents()
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True)
         self.table.sortItems(current_sort_column, current_sort_order)
@@ -492,7 +454,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def open_remap_identifiers_dialog(self):
         project = self.projectField.text().strip()
         analysis_folder = os.path.join(project, "Analysis") if project else ""
-        if not project or not os.path.isdir(analysis_folder):
+        if not project:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Error",
@@ -500,7 +462,21 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             )
             return
 
-        unique_counts = collect_experiment_counts(analysis_folder)
+        def read_counts():
+            if not os.path.isdir(analysis_folder):
+                return None
+            return collect_experiment_counts(analysis_folder)
+
+        unique_counts = run_off_main_thread(
+            self, "Reading plant identifiers…", read_counts,
+        )
+        if unique_counts is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Error",
+                "Select a project that contains an Analysis folder first.",
+            )
+            return
         if not unique_counts:
             QtWidgets.QMessageBox.information(
                 self,
@@ -541,7 +517,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         try:
-            apply_experiment_remap(analysis_folder, mapping)
+            run_off_main_thread(
+                self,
+                "Updating identifiers…",
+                lambda: apply_experiment_remap(analysis_folder, mapping),
+            )
         except RemapError as e:
             QtWidgets.QMessageBox.critical(self, "Remap failed", str(e))
             self.refresh_table()
@@ -563,80 +543,84 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         )
 
     def universal_open(self, path):
-        try:
-            path = os.path.abspath(os.path.expanduser(path))
-            
-            # 1. Detect Environment
-            is_container = any(k in os.environ for k in ['APPTAINER_CONTAINER', 'SINGULARITY_CONTAINER'])
-            is_wsl = False
-            if os.path.exists("/proc/version"):
-                with open("/proc/version", "r") as f:
-                    if "microsoft" in f.read().lower():
-                        is_wsl = True
+        def open_path():
+            display = path
+            try:
+                display = os.path.abspath(os.path.expanduser(path))
 
-            # --- STRATEGY 1: WSL Interop (Hardcoded Path Logic) ---
-            if is_wsl:
-                # Inside Apptainer, 'explorer.exe' won't be in PATH. 
-                # We must use the absolute path via the bind.
-                explorer_cmd = "/mnt/c/Windows/explorer.exe"
-                                
-                if os.path.exists(explorer_cmd):
+                # 1. Detect Environment
+                is_container = any(k in os.environ for k in ['APPTAINER_CONTAINER', 'SINGULARITY_CONTAINER'])
+                is_wsl = False
+                if os.path.exists("/proc/version"):
+                    with open("/proc/version", "r") as f:
+                        if "microsoft" in f.read().lower():
+                            is_wsl = True
+
+                # --- STRATEGY 1: WSL Interop (Hardcoded Path Logic) ---
+                if is_wsl:
+                    # Inside Apptainer, 'explorer.exe' won't be in PATH.
+                    # We must use the absolute path via the bind.
+                    explorer_cmd = "/mnt/c/Windows/explorer.exe"
+
+                    if os.path.exists(explorer_cmd):
+                        try:
+                            # Attempt to translate path
+                            win_path = None
+                            print(f"Translating WSL path: {display}")
+
+                            if display.startswith("/mnt/c/"):
+                                print("Using manual path conversion for WSL")
+                                # Manual fallback for the bind you provided
+                                win_path = display.replace("/mnt/c/", "C:\\").replace("/", "\\")
+                            else:
+                                # Hardcode fallback for standard WSL distro paths
+                                wsl_path = "//wsl.localhost/ubuntu/".replace("/", "\\")
+                                win_path = wsl_path + display.lstrip("/").replace("/", "\\")
+
+                            print(f"Converted WSL path to Windows path: {win_path}")
+                            if win_path:
+                                print(f"Opening path in Windows Explorer: {win_path}")
+                                print(f"Using explorer command: {explorer_cmd}")
+                                subprocess.Popen(["/bin/sh", "-c", f"{explorer_cmd} '{win_path}'"])
+                                return True, display
+                        except Exception as e:
+                            print(f"WSL Explorer Bridge failed: {e}")
+
+                # --- STRATEGY 2: D-Bus (The "Native Linux" path) ---
+                # This works perfectly on Native Ubuntu/Apptainer-on-Ubuntu
+                if is_container and shutil.which("dbus-send"):
                     try:
-                        # Attempt to translate path
-                        win_path = None
-                        print(f"Translating WSL path: {path}")
-                        
-                        if path.startswith("/mnt/c/"):
-                            print("Using manual path conversion for WSL")
-                            # Manual fallback for the bind you provided
-                            win_path = path.replace("/mnt/c/", "C:\\").replace("/", "\\")
-                        else:
-                            # Hardcode fallback for standard WSL distro paths
-                            wsl_path = "//wsl.localhost/ubuntu/".replace("/", "\\")  
-                            win_path = wsl_path + path.lstrip("/").replace("/", "\\")
-                            
-                        print(f"Converted WSL path to Windows path: {win_path}")
-                        if win_path:
-                            print(f"Opening path in Windows Explorer: {win_path}")
-                            print(f"Using explorer command: {explorer_cmd}")
-                            subprocess.Popen(["/bin/sh", "-c", f"{explorer_cmd} '{win_path}'"])
-                            return
-                    except Exception as e:
-                        print(f"WSL Explorer Bridge failed: {e}")
+                        # We add a timeout so it doesn't hang if no one is listening (like in WSL)
+                        subprocess.run([
+                            "dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.FileManager1",
+                            "--type=method_call", "/org/freedesktop/FileManager1",
+                            "org.freedesktop.FileManager1.ShowItems",
+                            f"array:string:file://{display}", "string:''"
+                        ], timeout=1, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                        return True, display
+                    except Exception:
+                        pass  # Fall through if D-Bus times out or fails
 
-            # --- STRATEGY 2: D-Bus (The "Native Linux" path) ---
-            # This works perfectly on Native Ubuntu/Apptainer-on-Ubuntu
-            if is_container and shutil.which("dbus-send"):
-                try:
-                    # We add a timeout so it doesn't hang if no one is listening (like in WSL)
-                    subprocess.run([
-                        "dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.FileManager1",
-                        "--type=method_call", "/org/freedesktop/FileManager1",
-                        "org.freedesktop.FileManager1.ShowItems", 
-                        f"array:string:file://{path}", "string:''"
-                    ], timeout=1, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    return
-                except:
-                    pass # Fall through if D-Bus times out or fails
+                # --- STRATEGY 3: Standard OS Openers (Final Fallback) ---
+                if platform.system() == "Darwin":
+                    subprocess.Popen(["open", display])
+                    return True, display
+                elif platform.system() == "Windows":
+                    os.startfile(display)
+                    return True, display
 
-            # --- STRATEGY 3: Standard OS Openers (Final Fallback) ---
-            if platform.system() == "Darwin":
-                subprocess.Popen(["open", path])
-                return
-            elif platform.system() == "Windows":
-                os.startfile(path)
-                return
-            
-            # Standard Linux xdg-open
-            if shutil.which("xdg-open"):
-                subprocess.Popen(["xdg-open", path], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                return
+                # Standard Linux xdg-open
+                if shutil.which("xdg-open"):
+                    subprocess.Popen(["xdg-open", display], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    return True, display
 
-        except Exception as e:
-            print(f"Universal Open Error: {e}")
+            except Exception as e:
+                print(f"Universal Open Error: {e}")
+            return False, display
 
-        # UI Fallback if everything fails
-        QtWidgets.QMessageBox.information(None, 'Manual Action', f'Auto-open failed. Path:\n{path}')
+        opened, display = run_off_main_thread(self, "Opening folder…", open_path)
+        if not opened:
+            QtWidgets.QMessageBox.information(None, 'Manual Action', f'Auto-open failed. Path:\n{display}')
         
     def current_report_dir(self):
         return os.path.join(
@@ -673,16 +657,14 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             os.path.relpath(path, os.path.join(self.projectField.text(), "Analysis")),
         )
 
-        if not os.path.exists(os.path.dirname(removed_path)):
-            os.makedirs(os.path.dirname(removed_path))
+        def move_plant():
+            if not os.path.exists(os.path.dirname(removed_path)):
+                os.makedirs(os.path.dirname(removed_path))
+            if os.path.exists(removed_path):
+                shutil.rmtree(removed_path)
+            shutil.move(path, removed_path)
 
-        # Remove existing destination if it exists
-        if os.path.exists(removed_path):
-            shutil.rmtree(removed_path)
-
-        # Move to removed folder
-        shutil.move(path, removed_path)
-        
+        run_off_main_thread(self, "Moving plant…", move_plant)
         self.refresh_table()
         
         return
@@ -871,29 +853,24 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.image_label2.show()
             return
 
-        image1_path, image2_path, overlay, bbox, frame_index = self.get_image_paths()
+        def load():
+            # get_image_paths reads the plant selected above. The window is
+            # disabled for the duration of this call, so that path stays put.
+            image1_path, image2_path, overlay, bbox, frame_index = self.get_image_paths()
+            summary = None
+            if image2_path is not None and os.path.exists(image2_path):
+                with open(image2_path, 'rb') as handle:
+                    summary = handle.read()
 
-        pixmap1 = None
-        pixmap2 = None
-
-        # Check if image paths exist
-        if image1_path is None and overlay is None:
-            self.image_label1.clear()
-            pixmap1 = QtGui.QPixmap("placeholder_figures/plant_placeholder.png")
-            self.image_label1.set_pixmap(pixmap1)
-            self.image_label1.show()
-        elif (
-            not image1_path
-            or not os.path.exists(image1_path)
-            or not overlay
-            or not os.path.exists(overlay)
-        ):
-            self.image_label1.clear()
-            pixmap1 = QtGui.QPixmap("placeholder_figures/plant_placeholder_2.png")
-            self.image_label1.set_pixmap(pixmap1)
-            self.image_label1.show()
-        else:
-            self.image_label1.clear()
+            if image1_path is None and overlay is None:
+                return ('placeholder', None, summary)
+            if (
+                not image1_path
+                or not os.path.exists(image1_path)
+                or not overlay
+                or not os.path.exists(overlay)
+            ):
+                return ('placeholder2', None, summary)
 
             try:
                 from analysis.utils.tiff_stack import overlay_on_rgb, read_tiff_page, tiff_n_frames
@@ -924,24 +901,46 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                     if seg is not None:
                         img = overlay_on_rgb(img, seg)
 
-                rgb = np.ascontiguousarray(img)
-                rh, rw, _ = rgb.shape
-                qImg = QtGui.QImage(
-                    rgb.data.tobytes(), rw, rh, 3 * rw, QtGui.QImage.Format_RGB888
-                )
-                pixmap1 = QtGui.QPixmap.fromImage(qImg)
+                rgb = np.ascontiguousarray(img).copy()
+                return ('image', rgb, summary)
+            except Exception as exc:
+                return ('error', str(exc), summary)
 
-                self.image_label1.set_pixmap(pixmap1)
-                self.image_label1.show()
+        kind, payload, summary = run_off_main_thread(self, "Loading plant…", load)
 
-            except Exception as e:
-                self.image_label1.setText(f"Analysis is not yet finished. \nRefresh to update\nError: {str(e)}")
-                self.image_label1.setAlignment(QtCore.Qt.AlignCenter)
-                self.image_label1.show()
+        pixmap1 = None
+        pixmap2 = None
 
-        # Check if image2_path exists
-        if image2_path is not None and os.path.exists(image2_path):
-            pixmap2 = QtGui.QPixmap(image2_path)
+        if kind == 'placeholder':
+            self.image_label1.clear()
+            pixmap1 = QtGui.QPixmap("placeholder_figures/plant_placeholder.png")
+            self.image_label1.set_pixmap(pixmap1)
+            self.image_label1.show()
+        elif kind == 'placeholder2':
+            self.image_label1.clear()
+            pixmap1 = QtGui.QPixmap("placeholder_figures/plant_placeholder_2.png")
+            self.image_label1.set_pixmap(pixmap1)
+            self.image_label1.show()
+        elif kind == 'error':
+            self.image_label1.setText(
+                f"Analysis is not yet finished. \nRefresh to update\nError: {payload}"
+            )
+            self.image_label1.setAlignment(QtCore.Qt.AlignCenter)
+            self.image_label1.show()
+        else:
+            self.image_label1.clear()
+            rgb = payload
+            rh, rw, _ = rgb.shape
+            qimg = QtGui.QImage(
+                rgb.data.tobytes(), rw, rh, 3 * rw, QtGui.QImage.Format_RGB888
+            )
+            pixmap1 = QtGui.QPixmap.fromImage(qimg)
+            self.image_label1.set_pixmap(pixmap1)
+            self.image_label1.show()
+
+        if summary is not None:
+            pixmap2 = QtGui.QPixmap()
+            pixmap2.loadFromData(summary)
             self.image_label2.set_pixmap(pixmap2)
             self.image_label2.show()
         else:
@@ -968,16 +967,17 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             os.path.relpath(plant_slot, os.path.join(self.projectField.text(), "Analysis")),
         )
 
-        if not os.path.exists(os.path.dirname(removed_path)):
-            os.makedirs(os.path.dirname(removed_path))
+        def move_plant():
+            if not os.path.exists(os.path.dirname(removed_path)):
+                os.makedirs(os.path.dirname(removed_path))
+            if os.name == 'nt':
+                os.system(f'move "{plant_slot}" "{removed_path}"')
+            elif sys.platform == 'darwin':
+                os.system(f'mv "{plant_slot}" "{removed_path}"')
+            else:
+                os.system(f'mv "{plant_slot}" "{removed_path}"')
 
-        # Open the directory in the file explorer
-        if os.name == 'nt':
-            os.system(f'move "{plant_slot}" "{removed_path}"')
-        elif sys.platform == 'darwin':
-            os.system(f'mv "{plant_slot}" "{removed_path}"')
-        else:
-            os.system(f'mv "{plant_slot}" "{removed_path}"')
+        run_off_main_thread(self, "Moving plant…", move_plant)
 
         self._clear_overlay_cache_for_path(path)
         # Prefer the same list position (next plant) after the removed entry disappears
@@ -994,56 +994,61 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         # Get and validate video folder
         video_folder = self.videoField.text()
-        
+
         if not video_folder:
             QtWidgets.QMessageBox.warning(None, 'Error', 'Please specify a video folder first!')
             return
-            
-        if not os.path.exists(video_folder):
+
+        def check_video_files():
+            if not os.path.exists(video_folder):
+                return ('missing_folder', None)
+            images = glob.glob(os.path.join(video_folder, "*.png"))
+            # Check if there is no images, then look for a file called "segmentation_metadata.json"
+            if not images:
+                metadata_path = os.path.join(video_folder, 'Segmentation', 'segmentation_metadata.json')
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    images = glob.glob(os.path.join(metadata["input_path"], "*.png"))
+            if not images:
+                return ('no_images', None)
+            seg_folder = os.path.join(video_folder, "Segmentation", "Ensemble")
+            seg_files = glob.glob(os.path.join(seg_folder, "*.png")) if os.path.exists(seg_folder) else []
+            if not seg_files:
+                return ('no_seg', len(images))
+            return ('ok', None)
+
+        file_status, file_info = run_off_main_thread(
+            self, "Checking images…", check_video_files,
+        )
+        if file_status == 'missing_folder':
             QtWidgets.QMessageBox.warning(None, 'Error', 'Video folder does not exist!\nPlease check the path.')
             return
-        
-        # Check for PNG images
-        images = glob.glob(os.path.join(video_folder, "*.png"))
-        
-        # Check if there is no images, then look for a file called "segmentation_metadata.json"
-        if not images:
-            metadata_path = os.path.join(video_folder, 'Segmentation', 'segmentation_metadata.json')
-            if os.path.exists(metadata_path):
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
-                images = glob.glob(os.path.join(metadata["input_path"], "*.png")) 
-                
-        if not images:
+        if file_status == 'no_images':
             QtWidgets.QMessageBox.warning(
-                None, 'Error', 
+                None, 'Error',
                 'No images found in the video folder!\nPlease check the path to the folder where the images are located.'
             )
             return
-        
-        # Check for segmentation files (required for analysis)
-        seg_folder = os.path.join(video_folder, "Segmentation", "Ensemble")
-        seg_files = glob.glob(os.path.join(seg_folder, "*.png")) if os.path.exists(seg_folder) else []
-        
-        if not seg_files:
+        if file_status == 'no_seg':
             QtWidgets.QMessageBox.warning(
                 None, 'Error',
-                f'Found {len(images)} images but no segmentation files!\n\n'
+                f'Found {file_info} images but no segmentation files!\n\n'
                 'Segmentation is required for analysis.\n'
                 'Please ensure the images have been properly segmented first.'
             )
             return
-        
+
         # Validate calibration settings
-        if not self.videoHasQRbutton.isChecked():                
+        if not self.videoHasQRbutton.isChecked():
             if not self.knownDistanceField.text() or not self.pixelDistanceField.text():
                 QtWidgets.QMessageBox.warning(
-                    None, 'Error', 
+                    None, 'Error',
                     'Please provide both known distance and pixel distance for manual calibration,\n'
                     'or enable "Video has QR codes"!'
                 )
                 return
-            
+
             try:
                 known_dist = float(self.knownDistanceField.text())
                 pixel_dist = int(self.pixelDistanceField.text())
@@ -1052,26 +1057,49 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                     return
             except ValueError:
                 QtWidgets.QMessageBox.warning(
-                    None, 'Error', 
+                    None, 'Error',
                     'Invalid calibration values!\nKnown distance must be a number, pixel distance must be an integer.'
                 )
                 return
-        
+
         # All validations passed, run analysis
         self.saveFieldsIntoJson()
 
-        config_path = os.path.join(self.projectField.text(), PROJECT_CONFIG_NAME)
-        try:
-            conf = apply_load_aliases(load_json(config_path))
-            conf['Experiment'] = conf.get('Experiment', '')
-            conf['MainFolder'] = self.projectField.text()
-            conf['rpi'] = self.rpiField.text()
-            conf['cam'] = self.cameraField.text()
-            conf['plant'] = self.plantField.text()
-        except (OSError, json.JSONDecodeError):
-            conf = {}
+        project_text = self.projectField.text()
+        rpi = self.rpiField.text()
+        cam = self.cameraField.text()
+        plant = self.plantField.text()
+        config_path = os.path.join(project_text, PROJECT_CONFIG_NAME)
 
-        if plant_slot_has_finished_analysis(conf):
+        def prepare_analysis():
+            try:
+                conf = apply_load_aliases(load_json(config_path))
+                conf['Experiment'] = conf.get('Experiment', '')
+                conf['MainFolder'] = project_text
+                conf['rpi'] = rpi
+                conf['cam'] = cam
+                conf['plant'] = plant
+            except (OSError, json.JSONDecodeError):
+                conf = {}
+
+            already = plant_slot_has_finished_analysis(conf)
+            image_paths, seg_paths = getImages(conf)
+            limit_frames = processing_limit_frame_count(conf)
+            if limit_frames is not None:
+                image_paths = image_paths[:limit_frames]
+                seg_paths = seg_paths[:limit_frames]
+            try:
+                from analysis.utils.roi_selection import video_path_warnings
+                warnings_text = video_path_warnings(conf)
+            except Exception:
+                warnings_text = ''
+            return conf, already, image_paths, seg_paths, warnings_text
+
+        conf, already, image_paths, seg_paths, warnings_text = run_off_main_thread(
+            self, "Checking images…", prepare_analysis,
+        )
+
+        if already:
             reply = QtWidgets.QMessageBox.question(
                 None,
                 'Plant already analyzed',
@@ -1085,17 +1113,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
-        image_paths, seg_paths = getImages(conf)
-        limit_frames = processing_limit_frame_count(conf)
-        if limit_frames is not None:
-            image_paths = image_paths[:limit_frames]
-            seg_paths = seg_paths[:limit_frames]
-
-        try:
-            from analysis.utils.roi_selection import video_path_warnings
-            warnings_text = video_path_warnings(conf)
-        except Exception:
-            warnings_text = ''
         if warnings_text:
             reply = QtWidgets.QMessageBox.question(
                 None,
@@ -1111,16 +1128,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if seed is None:
             return
 
-        try:
-            conf = apply_load_aliases(load_json(config_path))
-        except (OSError, json.JSONDecodeError):
-            conf = {}
-        conf['MainFolder'] = self.projectField.text()
-        conf['bounding_box'] = bbox
-        conf['seed'] = seed
-        dump_json(pending_analysis_path(self.projectField.text()), conf)
+        def write_pending():
+            try:
+                saved = apply_load_aliases(load_json(config_path))
+            except (OSError, json.JSONDecodeError):
+                saved = {}
+            saved['MainFolder'] = project_text
+            saved['bounding_box'] = bbox
+            saved['seed'] = seed
+            dump_json(pending_analysis_path(project_text), saved)
 
-        pipeline_runner.run_pending_analysis(self.projectField.text())
+        run_off_main_thread(self, None, write_pending)
+        pipeline_runner.run_pending_analysis(project_text)
         
     def redoAnalysis(self):
         select_roi_and_seed = self._import_roi_selection()
@@ -1129,30 +1148,36 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         self.selected_plant = self.current_plant_path()
         metadata_path = os.path.join(self.selected_plant, "metadata.json")
-        if not os.path.exists(metadata_path):
+
+        def prepare_redo():
+            if not os.path.exists(metadata_path):
+                return ('missing', None)
+            try:
+                conf = hydrate_run_config(load_json(metadata_path), metadata_path)
+            except (OSError, json.JSONDecodeError) as exc:
+                return ('error', exc)
+            own_previous_roi = None
+            old_bbox = get_bounding_box(conf)
+            if old_bbox and len(old_bbox) == 4:
+                y1, y2, x1, x2 = old_bbox
+                own_previous_roi = (x1, y1, x2, y2)
+            conf.pop('bounding_box', None)
+            conf.pop('bounding box', None)
+            conf.pop('seed', None)
+            image_paths, seg_paths = getImages(conf)
+            limit_frames = processing_limit_frame_count(conf)
+            if limit_frames is not None:
+                image_paths = image_paths[:limit_frames]
+                seg_paths = seg_paths[:limit_frames]
+            return ('ok', (conf, image_paths, seg_paths, own_previous_roi))
+
+        status, payload = run_off_main_thread(self, "Checking images…", prepare_redo)
+        if status == 'missing':
             return
-
-        try:
-            conf = hydrate_run_config(load_json(metadata_path), metadata_path)
-        except (OSError, json.JSONDecodeError) as e:
-            QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load metadata:\n{e}')
+        if status == 'error':
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load metadata:\n{payload}')
             return
-
-        own_previous_roi = None
-        old_bbox = get_bounding_box(conf)
-        if old_bbox and len(old_bbox) == 4:
-            y1, y2, x1, x2 = old_bbox
-            own_previous_roi = (x1, y1, x2, y2)
-
-        conf.pop('bounding_box', None)
-        conf.pop('bounding box', None)
-        conf.pop('seed', None)
-
-        image_paths, seg_paths = getImages(conf)
-        limit_frames = processing_limit_frame_count(conf)
-        if limit_frames is not None:
-            image_paths = image_paths[:limit_frames]
-            seg_paths = seg_paths[:limit_frames]
+        conf, image_paths, seg_paths, own_previous_roi = payload
 
         bbox, seed = select_roi_and_seed(
             conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
@@ -1162,8 +1187,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         conf['bounding_box'] = bbox
         conf['seed'] = seed
-        dump_json(metadata_path, build_plant_record(conf, source=SOURCE_SINGLE_PLANT))
 
+        def write_metadata():
+            dump_json(metadata_path, build_plant_record(conf, source=SOURCE_SINGLE_PLANT))
+
+        run_off_main_thread(self, None, write_metadata)
         pipeline_runner.run_analysis_config(metadata_path)
 
     def repeatAnalysis(self):
@@ -1182,58 +1210,88 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def reviewPlant(self):
         self.selected_plant = self.current_plant_path()
         path = self.selected_plant
-        if not path or not os.path.exists(path):
+        if not path:
             return
 
-        try:
+        def load():
+            if not os.path.exists(path):
+                return ('missing', None)
+            import cv2
             import plant_viewer
-            
-            # Load data using the helper function
             images, segs, bbox, conf, clock_names = plant_viewer.load_plant_data(path)
+            first = cv2.imread(images[0]) if images else None
+            if first is not None and bbox and len(bbox) == 4:
+                y1, y2, x1, x2 = bbox
+                h, w = first.shape[:2]
+                if 0 <= y1 < y2 <= h and 0 <= x1 < x2 <= w:
+                    first = first[y1:y2, x1:x2].copy()
+            return ('ok', (images, segs, bbox, conf, clock_names, first))
 
-            # Create and show window
-            # We attach it to 'self' so it doesn't get garbage collected
-            self.review_window = plant_viewer.ChronoViewWindow(
-                images, segs, bbox, conf, parent=None, clock_names=clock_names,
-            )
-            self.review_window.show()
-            
+        try:
+            status, payload = run_off_main_thread(self, "Opening plant…", load)
         except FileNotFoundError as e:
             QtWidgets.QMessageBox.warning(self, "Error", str(e))
+            return
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to open review tool:\n{str(e)}")
+            return
+        if status == 'missing':
+            return
+
+        import plant_viewer
+        images, segs, bbox, conf, clock_names, first = payload
+        # Attach the window to self so it doesn't get garbage collected.
+        # first is already cropped to bbox; the constructor shows it as-is.
+        self.review_window = plant_viewer.ChronoViewWindow(
+            images, segs, bbox, conf, parent=None, clock_names=clock_names,
+            first_frame=first,
+        )
+        self.review_window.show()
 
     def preview(self):
         # 1. Save fields
         self.saveFieldsIntoJson()
-        
-        # 2. Validate folder
+
         video_folder = self.videoField.text()
-        if not video_folder or not os.path.exists(video_folder):
+        project_text = self.projectField.text()
+
+        def load():
+            if not video_folder or not os.path.exists(video_folder):
+                return ('bad_folder', None)
+            config_path = os.path.join(project_text, "project_config.json")
+            try:
+                conf = apply_load_aliases(load_json(config_path))
+            except Exception as exc:
+                return ('bad_config', exc)
+            import cv2
+            images, seg_files = getImages(conf)
+            if not images:
+                return ('no_images', None)
+            first = cv2.imread(images[0])
+            return ('ok', (images, seg_files, conf, first))
+
+        try:
+            status, payload = run_off_main_thread(self, "Loading preview…", load)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch preview:\n{e}')
+            return
+        if status == 'bad_folder':
             QtWidgets.QMessageBox.warning(None, 'Error', 'Please specify a valid video folder.')
             return
-            
-        # 3. Load Config
-        config_path = os.path.join(self.projectField.text(), "project_config.json")
-        try:
-            conf = apply_load_aliases(load_json(config_path))
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load config:\n{e}')
+        if status == 'bad_config':
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load config:\n{payload}')
+            return
+        if status == 'no_images':
+            QtWidgets.QMessageBox.warning(None, 'Error', 'No images found.')
             return
 
-        # 4. Load Images & Launch
+        import plant_viewer
+        images, seg_files, conf, first = payload
         try:
-            import plant_viewer            
-            images, segFiles = getImages(conf)
-            
-            if not images:
-                QtWidgets.QMessageBox.warning(None, 'Error', 'No images found.')
-                return
-
-            # Launch Window (BBox=None for full image)
-            self.preview_window = plant_viewer.ChronoViewWindow(images, segFiles, None, conf, parent=None)
+            self.preview_window = plant_viewer.ChronoViewWindow(
+                images, seg_files, None, conf, parent=None, first_frame=first,
+            )
             self.preview_window.show()
-            
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch preview:\n{e}')
         
@@ -1250,7 +1308,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 self, 'Error', 'Please select a project directory first.',
             )
             return False
-        if analysis_period_is_current(self._period_conf(), folder):
+        period_conf = self._period_conf()
+        if run_off_main_thread(
+            self,
+            "Checking analysis period…",
+            lambda: analysis_period_is_current(period_conf, folder),
+        ):
             return True
         reply = QtWidgets.QMessageBox.question(
             self,
@@ -1262,7 +1325,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if reply != QtWidgets.QMessageBox.Yes:
             return False
         self.open_time_window_dialog()
-        if analysis_period_is_current(self._period_conf(), folder):
+        period_conf = self._period_conf()
+        if run_off_main_thread(
+            self,
+            "Checking analysis period…",
+            lambda: analysis_period_is_current(period_conf, folder),
+        ):
             return True
         QtWidgets.QMessageBox.warning(
             self,
@@ -1695,7 +1763,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         try:
             import calibration_helper
-            self.calibration_window = calibration_helper.CalibrationHelper(self.videoField.text())
+            self.calibration_window = calibration_helper.CalibrationHelper(
+                self.videoField.text(), dialog_parent=self,
+            )
             self.calibration_window.distance_measured.connect(
                 lambda pixels: self.pixelDistanceField.setText(str(pixels))
             )
@@ -2260,27 +2330,66 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         report_path = self.current_report_dir()
         current = self.report_tree.currentItem()
         current_report = current.data(0, REPORT_PLOT_ROLE) if current is not None else None
+        project_text = self.projectField.text()
 
-        if (self.projectField.text() == "" or not os.path.exists(self.projectField.text())
-                or not os.path.isdir(report_path) or not current_report):
+        if project_text == "" or not current_report:
+            self._shown_report_plot = None
             self._show_report_placeholder()
+            return
+
+        # Splitter moves and a second call after the tree selects a figure only
+        # need a rescale. The pixels are already in the label.
+        if (
+            self._shown_report_plot == (report_path, current_report)
+            and self.report_label_1._source_pixmap is not None
+        ):
+            size = self.report_label_1.size()
+            if size.width() < 10 or size.height() < 10:
+                size = QtCore.QSize(750, 550)
+            self.report_label_1.set_pixmap(self.report_label_1._source_pixmap, size)
+            self.report_label_1.setAlignment(QtCore.Qt.AlignCenter)
+            self.report_label_1.show()
             return
 
         report_path_1 = os.path.join(report_path, current_report)
-        if not os.path.isfile(report_path_1):
+        stats_file = current.data(0, REPORT_STATS_ROLE) if current is not None else ''
+
+        def load_figure():
+            if (
+                not os.path.exists(project_text)
+                or not os.path.isdir(report_path)
+                or not os.path.isfile(report_path_1)
+            ):
+                return ('placeholder', None, False)
+            has_stats = bool(stats_file) and os.path.isfile(os.path.join(report_path, stats_file))
+            try:
+                with Image.open(report_path_1) as img:
+                    rgba = img.convert("RGBA")
+                    data = rgba.tobytes("raw", "RGBA")
+                    image_size = rgba.size
+            except Exception:
+                return ('placeholder', None, False)
+            return ('ok', (data, image_size), has_stats)
+
+        kind, payload, has_stats = run_off_main_thread(self, "Loading figure…", load_figure)
+        if kind != 'ok':
+            self._shown_report_plot = None
             self._show_report_placeholder()
             return
 
+        data, image_size = payload
+        width, height = image_size
+        qimg = QtGui.QImage(
+            data, width, height, 4 * width, QtGui.QImage.Format_RGBA8888,
+        ).copy()
+        pixmap_1 = QtGui.QPixmap.fromImage(qimg)
         size = self.report_label_1.size()
         if size.width() < 10 or size.height() < 10:
             size = QtCore.QSize(750, 550)
-        pixmap_1 = QtGui.QPixmap(report_path_1)
         self.report_label_1.set_pixmap(pixmap_1, size)
         self.report_label_1.setAlignment(QtCore.Qt.AlignCenter)
         self.report_label_1.show()
-
-        stats_file = current.data(0, REPORT_STATS_ROLE) if current is not None else ''
-        has_stats = bool(stats_file) and os.path.isfile(os.path.join(report_path, stats_file))
+        self._shown_report_plot = (report_path, current_report)
         self.open_stats_button_tab5.setEnabled(has_stats)
 
     def _filter_report_tree(self, text):
@@ -2303,16 +2412,23 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         self.report_tree.clear()
+        self._shown_report_plot = None
         report_path = self.current_report_dir()
-        if not os.path.isdir(report_path):
+        project_text = self.projectField.text()
+
+        def load_catalog():
+            if not project_text or not os.path.isdir(report_path):
+                return None
+            try:
+                return filter_report_preview(load_report_catalog(report_path))
+            except Exception as exc:
+                print(f'Warning: report catalog failed ({exc}); showing placeholder.')
+                return []
+
+        catalog = run_off_main_thread(self, "Loading report…", load_catalog)
+        if not catalog:
             self._show_report_placeholder()
             return
-
-        try:
-            catalog = load_report_catalog(report_path)
-        except Exception as exc:
-            print(f'Warning: report catalog failed ({exc}); showing placeholder.')
-            catalog = []
 
         for branch in catalog:
             self._append_report_tree_item(None, branch)
@@ -2346,7 +2462,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if not stats_file:
             return
         stats_path = os.path.join(self.projectField.text(), "Report", stats_file)
-        if os.path.isfile(stats_path):
+
+        def stats_file_exists():
+            return os.path.isfile(stats_path)
+
+        if run_off_main_thread(self, "Opening folder…", stats_file_exists):
             self.universal_open(stats_path)
 
     def setup_tab5_elements(self):
@@ -2472,7 +2592,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.update_btn.clicked.connect(self.update_software)
         layout.addWidget(self.update_btn, alignment=QtCore.Qt.AlignCenter)
         # Last Commit Info
-        self.commit_label = QLabel(f"Last update: {self.get_last_commit_time()}")
+        self.commit_label = QLabel("Last update: …")
         self.commit_label.setStyleSheet("color: #95a5a6; background-color: transparent; margin-top: 15px;")
         layout.addWidget(self.commit_label, alignment=QtCore.Qt.AlignCenter)
 
@@ -2497,28 +2617,29 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         try:
             self.update_btn.setText("Checking...")
             self.update_btn.setEnabled(False)
-            QtWidgets.QApplication.processEvents()
 
-            # Record the hash before pulling
-            old_hash = self.get_git_hash()
-            
-            # Perform pull (suppress language-specific text output)
-            subprocess.check_call(["git", "pull"], stderr=subprocess.STDOUT)
-            
-            # Record the hash after pulling
-            new_hash = self.get_git_hash()
+            def pull():
+                old_hash = self.get_git_hash()
+                subprocess.check_call(["git", "pull"], stderr=subprocess.STDOUT)
+                new_hash = self.get_git_hash()
+                commit = self.get_last_commit_time()
+                return old_hash, new_hash, commit
+
+            old_hash, new_hash, commit = run_off_main_thread(
+                self, "Checking for updates…", pull,
+            )
 
             if old_hash == new_hash:
                 QtWidgets.QMessageBox.information(self, "Update", "ChronoRoot is already up to date!")
             else:
-                QtWidgets.QMessageBox.information(self, "Update Success", 
+                QtWidgets.QMessageBox.information(self, "Update Success",
                     "Update downloaded successfully!\nPlease restart the application to apply changes.")
-                self.commit_label.setText(f"Last update: {self.get_last_commit_time()}")
+                self.commit_label.setText(f"Last update: {commit}")
 
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Update Error", 
+            QtWidgets.QMessageBox.critical(self, "Update Error",
                 "Failed to update. Make sure you have an internet connection and 'git' is installed.")
-        
+
         finally:
             self.update_btn.setText("Check for Updates")
             self.update_btn.setEnabled(True)
@@ -2531,6 +2652,9 @@ def main():
     # Defer table and UI updates until after window is shown
     QtCore.QTimer.singleShot(100, window.ensure_plant_inventory)
     QtCore.QTimer.singleShot(100, window.update_report_labels)
+    QtCore.QTimer.singleShot(100, lambda: window.commit_label.setText(
+        "Last update: " + run_off_main_thread(window, None, window.get_last_commit_time)
+    ))
     
     sys.exit(app.exec_())
     
