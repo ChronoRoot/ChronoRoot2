@@ -35,22 +35,27 @@ plt.switch_backend('agg')
 
 from .utils.fileUtilities import convertFromPathSafe, convertToPathSafe
 from .utils.report_paths import (
+    GERMINATION_TIME_SLUG,
     MODULE_TEMPORAL,
     REPLICAS_DIR,
     analysis_dir,
     clear_replicas_subdir,
+    data_file,
     metric_dir,
     overview_dir,
     table_file,
     temporal_metric_slug,
 )
 from .stats_utils import (
+    perform_scalar_pairwise_stats,
     perform_temporal_pairwise_stats,
     ensure_factor_columns,
     iter_replica_runs,
 )
 from .report_plots import (
     aggregate_count_lines,
+    emit_replica_scalar_comparisons,
+    emit_scalar_comparison_plots,
     emit_temporal_comparison_plots,
     relative_title,
     subplot_grid,
@@ -95,6 +100,118 @@ METRIC_TITLES = {
 }
 
 MAX_METRIC_WORKERS = 4
+
+GERMINATION_TIME_COLUMN = 'Germination time (h)'
+_MAIN_ROOT_LENGTH_COLUMN = 'MainRootLength (mm)'
+_ELAPSED_HOURS_COLUMN = 'ElapsedTime (h)'
+_GERMINATION_ID_COLUMNS = ['Plant_id', 'Experiment', 'PlateCondition', 'ExtraVariable']
+
+
+def germination_time_hours(plant_frame):
+    """First elapsed hour where main-root length leaves 0.
+
+    Missing hours are ignored. A plant that stays at 0 has no germination time.
+    """
+    if plant_frame is None or plant_frame.empty:
+        return np.nan
+    if _MAIN_ROOT_LENGTH_COLUMN not in plant_frame.columns or _ELAPSED_HOURS_COLUMN not in plant_frame.columns:
+        return np.nan
+    length = pd.to_numeric(plant_frame[_MAIN_ROOT_LENGTH_COLUMN], errors='coerce')
+    elapsed = pd.to_numeric(plant_frame[_ELAPSED_HOURS_COLUMN], errors='coerce')
+    growing = length.notna() & elapsed.notna() & (length > 0)
+    if not growing.any():
+        return np.nan
+    return float(elapsed[growing].min())
+
+
+def germination_times_table(data):
+    """One row per plant that leaves 0, on the report clock."""
+    columns = _GERMINATION_ID_COLUMNS + [GERMINATION_TIME_COLUMN]
+    if data is None or data.empty or 'Plant_id' not in data.columns:
+        return pd.DataFrame(columns=columns)
+    if _MAIN_ROOT_LENGTH_COLUMN not in data.columns or _ELAPSED_HOURS_COLUMN not in data.columns:
+        return pd.DataFrame(columns=columns)
+
+    data = ensure_factor_columns(data)
+    rows = []
+    for plant_id, group in data.groupby('Plant_id', sort=False):
+        hours = germination_time_hours(group)
+        if not np.isfinite(hours):
+            continue
+        first = group.iloc[0]
+        rows.append({
+            'Plant_id': plant_id,
+            'Experiment': first['Experiment'],
+            'PlateCondition': first['PlateCondition'],
+            'ExtraVariable': first['ExtraVariable'],
+            GERMINATION_TIME_COLUMN: hours,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _germination_conf(conf):
+    """Germination time is a clock time, so it stays out of relative-length folders."""
+    germ_conf = dict(conf or {})
+    germ_conf['measureRelativeToInitial'] = False
+    return germ_conf
+
+
+def _write_germination_summary_table(conf, germ_df):
+    grouped = germ_df.groupby(
+        ['Experiment', 'PlateCondition', 'ExtraVariable'],
+    ).agg(
+        n_plants=('Plant_id', 'nunique'),
+        mean=(GERMINATION_TIME_COLUMN, 'mean'),
+        sd=(GERMINATION_TIME_COLUMN, 'std'),
+    ).reset_index()
+    grouped = grouped.round(3)
+    grouped.to_csv(
+        table_file(conf, MODULE_TEMPORAL, GERMINATION_TIME_SLUG, 'summary_table.csv'),
+        index=False,
+    )
+
+
+def performGerminationAnalysis(conf, data):
+    """Boxplots and Mann-Whitney tests of main-root germination time.
+
+    Germination time is the first windowed hour where main-root length leaves 0.
+    Plants that never leave 0 are omitted.
+    """
+    germ_conf = _germination_conf(conf)
+    if (
+        data is None
+        or getattr(data, 'empty', True)
+        or _MAIN_ROOT_LENGTH_COLUMN not in getattr(data, 'columns', [])
+        or 'Plant_id' not in data.columns
+    ):
+        print('Germination time: no hourly main-root lengths, skipping.', flush=True)
+        return
+
+    germ_df = germination_times_table(data)
+    out_csv = data_file(germ_conf, 'Germination_Time.csv')
+    germ_df.to_csv(out_csv, index=False)
+    print(f'Germination time: wrote {out_csv}', flush=True)
+    if germ_df.empty:
+        print('Germination time: no plant left 0, skipping plots.', flush=True)
+        return
+
+    _write_germination_summary_table(germ_conf, germ_df)
+    base_dir = metric_dir(germ_conf, MODULE_TEMPORAL, GERMINATION_TIME_SLUG)
+    perform_scalar_pairwise_stats(
+        germ_conf, germ_df, GERMINATION_TIME_COLUMN, output_dir=None, plant_id_col='Plant_id',
+        module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
+        analysis_type='scalar',
+    )
+    emit_scalar_comparison_plots(
+        germ_conf, germ_df, GERMINATION_TIME_COLUMN, base_dir,
+        module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
+        analysis_type='scalar', metric_label='Germination time',
+    )
+    emit_replica_scalar_comparisons(
+        germ_conf, germ_df, GERMINATION_TIME_COLUMN,
+        module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
+        analysis_type='scalar', metric_label='Germination time',
+    )
 
 
 def _include_lateral_root_plots(conf):

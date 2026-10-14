@@ -46,6 +46,8 @@ ANGLE_METRICS = {
     'first_lr_tip_angle': 'First LR tip',
 }
 
+GERMINATION_TIME_SLUG = 'germination_time'
+
 def metric_slug(display_name: str) -> str:
     """Convert a display metric name to a filesystem-safe folder slug."""
     text = str(display_name).strip().lower()
@@ -145,6 +147,16 @@ def angle_overlays_dir(conf, experiment_slug: str) -> str:
     return path
 
 
+def first_lr_overlays_dir(conf, experiment_slug: str) -> str:
+    """First-lateral zoom panels, beside the tip-angle decay figure."""
+    path = os.path.join(
+        metric_dir(conf, MODULE_ANGLES, 'first_lr_tip_angle'),
+        f'overlays_{experiment_slug}',
+    )
+    ensure_directory(path)
+    return path
+
+
 def individual_plots_dir(conf, experiment_slug: str) -> str:
     path = os.path.join(report_root(conf), INDIVIDUAL_PLOTS_DIR, experiment_slug)
     ensure_directory(path)
@@ -179,7 +191,7 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
 
     root = report_root(conf)
     metric_targets = [
-        (MODULE_TEMPORAL, [temporal_metric_slug(m) for m in TEMPORAL_METRICS]),
+        (MODULE_TEMPORAL, [temporal_metric_slug(m) for m in TEMPORAL_METRICS] + [GERMINATION_TIME_SLUG]),
         (MODULE_CONVEX, [metric_slug(m) for m in CONVEX_METRICS]),
         (MODULE_ANGLES, list(ANGLE_METRICS.keys())),
     ]

@@ -59,6 +59,7 @@ from .utils.report_paths import (
     MODULE_ANGLES,
     angle_overlays_dir,
     data_file,
+    first_lr_overlays_dir,
     plot_file,
     table_file,
     metric_dir,
@@ -966,11 +967,32 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
     return ax
 
 
+def _overlay_tip_angle(ax, points):
+    """Draw the tip-angle chord on ax. Return degrees, or None if undefined."""
+    if points is None or len(points) < 2:
+        return None
+    start = np.asarray(points[0], dtype=float)
+    end = np.asarray(points[-1], dtype=float)
+    if start.shape != (2,) or end.shape != (2,):
+        return None
+    if not np.isfinite(start).all() or not np.isfinite(end).all():
+        return None
+    if float(np.hypot(end[0] - start[0], end[1] - start[1])) == 0.0:
+        return None
+    angle = float(tipAngle(points))
+    if not np.isfinite(angle):
+        return None
+    plotAngles(ax, points, angle, tip=True)
+    return angle
+
+
 def render_plant_angle_figures(job):
     """Draw one plant's angle overlays and first-lateral 72 h zoom.
 
     Top-level so a spawn process pool can call it. Tracking is not repeated
     here: the zoom reads FirstLRTrack.json written by getAngles.
+    The all-lateral folder gets the two incrusted SVGs. The first-lateral
+    montage, with the tip angle drawn, is saved beside the decay figure.
     """
     conf = job['conf']
     exp = job['exp']
@@ -1039,9 +1061,6 @@ def render_plant_angle_figures(job):
 
         bbox = get_bounding_box(metadata)
         crop = cv2.imread(overlay_image)[bbox[0]:bbox[1], bbox[2]:bbox[3]]
-
-        save = exp + "_" + robot + "_" + cam + "_" + plant + "_crop.png"
-        cv2.imwrite(os.path.join(save_path, save), crop)
 
         last_name = os.path.basename(overlay_image).replace('.png', '.rsml')
         rsml_path = os.path.join(results_path, 'RSML', last_name)
@@ -1137,18 +1156,25 @@ def render_plant_angle_figures(job):
                     ax.axis('off')
                     continue
                 ax.imshow(cv2.cvtColor(zoom, cv2.COLOR_BGR2RGB))
-                ax.plot(pts[:, 0] - x1, pts[:, 1] - y1, color='#ff2d2d', linewidth=2)
-                ax.set_title(
-                    f'{hours:.1f} h\n{float(entry.get("length_mm", 0)):.1f} mm',
-                    fontsize=9,
-                )
+                shifted = pts.copy()
+                shifted[:, 0] -= x1
+                shifted[:, 1] -= y1
+                ax.plot(shifted[:, 0], shifted[:, 1], color='#ff2d2d', linewidth=2)
+                angle = _overlay_tip_angle(ax, shifted)
+                length_mm = float(entry.get('length_mm', 0) or 0)
+                title = f'{hours:.1f} h\n{length_mm:.1f} mm'
+                if angle is not None:
+                    title = f'{title}\n{angle:.1f}°'
+                ax.set_title(title, fontsize=9)
                 ax.axis('off')
                 drawn += 1
             for ax in axes_flat[len(chosen):]:
                 ax.axis('off')
             if drawn:
                 zoom_name = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h.png"
-                fig.savefig(os.path.join(save_path, zoom_name), dpi=150, bbox_inches='tight')
+                zoom_dir = job.get('first_lr_save_path') or save_path
+                os.makedirs(zoom_dir, exist_ok=True)
+                fig.savefig(os.path.join(zoom_dir, zoom_name), dpi=150, bbox_inches='tight')
             plt.close(fig)
 
         return label, True, ''
@@ -1163,14 +1189,16 @@ def plotLateralAnglesOnTop(conf):
 
     Creates images showing the emergence and tip angle measurements
     overlaid on the original root images, plus an 8-frame zoom of the
-    first lateral root over its first 72 hours. Plants are rendered in
-    parallel.
+    first lateral root over its first 72 hours with the tip angle drawn.
+    The two SVGs stay in angles/overlays_{experiment}/. The first-lateral
+    montage is saved under angles/first_lr_tip_angle/overlays_{experiment}/.
+    Plants are rendered in parallel.
 
     Args:
         conf: Configuration dictionary with 'MainFolder' path
 
     Returns:
-        None (saves PNG and SVG images to Report folder)
+        None (saves SVG overlays and the first-lateral PNG montage)
     """
     exp_path = os.path.join(conf['MainFolder'], "Analysis")
     if not os.path.isdir(exp_path):
@@ -1183,6 +1211,7 @@ def plotLateralAnglesOnTop(conf):
             continue
         safe_exp = convertToPathSafe(exp)
         save_path = angle_overlays_dir(conf, safe_exp)
+        first_lr_save_path = None
 
         for robot in os.listdir(robot_path):
             cam_path = os.path.join(robot_path, robot)
@@ -1203,6 +1232,8 @@ def plotLateralAnglesOnTop(conf):
                     results_path = get_latest_result_dir(slot)
                     if results_path is None or not os.path.exists(results_path):
                         continue
+                    if first_lr_save_path is None:
+                        first_lr_save_path = first_lr_overlays_dir(conf, safe_exp)
                     jobs.append({
                         'conf': conf,
                         'exp': exp,
@@ -1215,6 +1246,7 @@ def plotLateralAnglesOnTop(conf):
                         'safe_plant': convertToPathSafe(plant),
                         'results_path': results_path,
                         'save_path': save_path,
+                        'first_lr_save_path': first_lr_save_path,
                     })
 
     if not jobs:

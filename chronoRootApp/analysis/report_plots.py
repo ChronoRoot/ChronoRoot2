@@ -112,7 +112,9 @@ _FACTOR_COLUMNS = frozenset({'Experiment', 'PlateCondition', 'ExtraVariable', 'T
 
 def finalize_comparison_axes(plot_obj, conf, *, x_col=None, hue_col=None, facet_col=None):
     """Apply configured factor labels to a matplotlib Axes or seaborn FacetGrid."""
-    if hasattr(plot_obj, 'axes'):
+    # A matplotlib Axes also has .axes (itself). A FacetGrid's .axes is the grid.
+    axes_grid = getattr(plot_obj, 'axes', None)
+    if axes_grid is not None and axes_grid is not plot_obj and hasattr(axes_grid, 'flat'):
         g = plot_obj
         if facet_col in _FACTOR_COLUMNS:
             g.set_titles(col_template='{col_name}')

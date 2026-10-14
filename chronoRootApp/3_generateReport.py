@@ -14,6 +14,7 @@ from analysis import convex_hull
 from analysis.report import (
     plot_individual_plant,
     plot_info_all,
+    performGerminationAnalysis,
     performStatisticalAnalysisForMetrics,
     generateTableTemporal,
 )
@@ -222,6 +223,9 @@ if __name__ == "__main__":
 
     # --- Phase 3: figures and statistics ---
     print('Phase 3/3: generating report figures and statistics...')
+
+    print('Phase 3/3: germination time')
+    performGerminationAnalysis(conf, all_data)
 
     performStatisticalAnalysisForMetrics(conf, plot_data, temporal_parameters)
 
