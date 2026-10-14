@@ -74,7 +74,7 @@ from .stats_utils import (
     _resolve_stats_path,
     _stratify_label,
 )
-from .report_plots import emit_interval_comparison_plots
+from .report_plots import emit_interval_comparison_plots, emit_temporal_comparison_plots
 from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 import cv2
 import logging
@@ -749,6 +749,14 @@ def makeLateralAnglesPlots(conf):
     if synchronized_data.empty:
         print("Warning: No data available for First Lateral Root plots. Skipping.")
     else:
+        # The separate decay figure is the same mean curve as the standard
+        # genotype timeline. It is no longer written.
+        decay_dir = metric_dir(conf, MODULE_ANGLES, first_lr_slug)
+        for retired in (f'{first_lr_slug}_decay.png', f'{first_lr_slug}_decay.svg'):
+            retired_path = os.path.join(decay_dir, retired)
+            if os.path.isfile(retired_path):
+                os.remove(retired_path)
+
         # Plot number of plants with first LR over time
         plt.figure(figsize=(6, 4), dpi=200)
         geno_palette = genotype_palette_for_data(synchronized_data)
@@ -769,20 +777,6 @@ def makeLateralAnglesPlots(conf):
         synchronized_data.dropna(inplace=True)
 
         if not synchronized_data.empty:
-            # Plot tip angle decay over time
-            plt.figure(figsize=(6, 4), dpi=200)
-            sns.lineplot(y="First LR tip", x='Time', hue="Experiment",
-                        data=synchronized_data, errorbar='se', palette=geno_palette)
-            plt.title('First LR tip angle — decay over time since emergence')
-            plt.xlabel('Time (h)')
-            plt.ylabel('Angle')
-            plt.legend(title=geno_label)
-
-            plt.savefig(plot_file(conf, MODULE_ANGLES, first_lr_slug, f'{first_lr_slug}_decay.png'),
-                       dpi=300, bbox_inches='tight')
-            plt.savefig(plot_file(conf, MODULE_ANGLES, first_lr_slug, f'{first_lr_slug}_decay.svg'),
-                       dpi=300, bbox_inches='tight')
-
             performStatisticalAnalysisFirstLR(conf, synchronized_data.copy(), 'First LR tip')
 
             # Generate summary table for first LR tip angles
@@ -887,10 +881,13 @@ def performStatisticalAnalysisFirstLR(conf, data, metric):
                 )
                 f.write('\n')
 
-    emit_interval_comparison_plots(
+    emit_temporal_comparison_plots(
         conf, data, metric, metric_dir(conf, MODULE_ANGLES, slug),
         module=MODULE_ANGLES, metric_slug_name=slug,
-        x_col='Time', metric_label='First LR tip angle',
+        metric_label='First LR tip angle',
+        x_col='Time',
+        xlabel='Time since emergence (h)',
+        ylabel='Angle',
     )
     return
 

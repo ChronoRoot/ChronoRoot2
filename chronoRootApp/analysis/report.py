@@ -124,9 +124,29 @@ def germination_time_hours(plant_frame):
     return float(elapsed[growing].min())
 
 
+def _identity_piece(value):
+    if pd.isna(value):
+        return ''
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def germination_plant_label(row):
+    """Same text as the plant dropdown: Genotype — rpi / camera / plant."""
+    experiment = _identity_piece(row.get('Experiment', ''))
+    rpi = _identity_piece(row.get('rpi', ''))
+    cam = _identity_piece(row.get('cam', ''))
+    plant = _identity_piece(row.get('plant', ''))
+    if rpi and cam and plant:
+        return f'{experiment} — {rpi} / {cam} / {plant}'
+    return f'{experiment} — {_identity_piece(row.get("Plant_id", ""))}'
+
+
 def germination_times_table(data):
     """One row per plant that leaves 0, on the report clock."""
-    columns = _GERMINATION_ID_COLUMNS + [GERMINATION_TIME_COLUMN]
+    hardware = [col for col in ('rpi', 'cam', 'plant') if data is not None and col in getattr(data, 'columns', [])]
+    columns = _GERMINATION_ID_COLUMNS + hardware + [GERMINATION_TIME_COLUMN]
     if data is None or data.empty or 'Plant_id' not in data.columns:
         return pd.DataFrame(columns=columns)
     if _MAIN_ROOT_LENGTH_COLUMN not in data.columns or _ELAPSED_HOURS_COLUMN not in data.columns:
@@ -139,14 +159,30 @@ def germination_times_table(data):
         if not np.isfinite(hours):
             continue
         first = group.iloc[0]
-        rows.append({
+        row = {
             'Plant_id': plant_id,
             'Experiment': first['Experiment'],
             'PlateCondition': first['PlateCondition'],
             'ExtraVariable': first['ExtraVariable'],
             GERMINATION_TIME_COLUMN: hours,
-        })
+        }
+        for col in hardware:
+            row[col] = first[col]
+        rows.append(row)
     return pd.DataFrame(rows, columns=columns)
+
+
+def _iqr_outlier_mask(values):
+    """Tukey fences, the same rule as a boxplot's whiskers."""
+    numeric = pd.to_numeric(values, errors='coerce')
+    q1 = numeric.quantile(0.25)
+    q3 = numeric.quantile(0.75)
+    if not np.isfinite(q1) or not np.isfinite(q3):
+        return pd.Series(False, index=values.index)
+    iqr = q3 - q1
+    low = q1 - 1.5 * iqr
+    high = q3 + 1.5 * iqr
+    return (numeric < low) | (numeric > high)
 
 
 def _germination_conf(conf):
@@ -154,6 +190,48 @@ def _germination_conf(conf):
     germ_conf = dict(conf or {})
     germ_conf['measureRelativeToInitial'] = False
     return germ_conf
+
+
+def _write_germination_plant_list(conf, germ_df):
+    """Latest-to-earliest germination times, outliers listed apart.
+
+    Outliers are outside the 1.5 IQR fences of their genotype. The label is
+    the plant-list entry, so those plants can be removed from the project.
+    """
+    work = germ_df.copy()
+    work['_outlier'] = False
+    for _experiment, index in work.groupby('Experiment').groups.items():
+        work.loc[index, '_outlier'] = _iqr_outlier_mask(
+            work.loc[index, GERMINATION_TIME_COLUMN],
+        ).to_numpy()
+
+    lines = [
+        'Germination times, latest to earliest.',
+        'Outliers lie outside the 1.5 IQR fences of their genotype (the boxplot fences).',
+        'Each label matches the plant list: Genotype — rpi / camera / plant.',
+        '',
+    ]
+
+    def _section(title, subset):
+        lines.append(title)
+        if subset.empty:
+            lines.append('(none)')
+            lines.append('')
+            return
+        ordered = subset.sort_values(
+            [GERMINATION_TIME_COLUMN, 'Experiment', 'Plant_id'],
+            ascending=[False, True, True],
+        )
+        for _idx, row in ordered.iterrows():
+            lines.append(f'{float(row[GERMINATION_TIME_COLUMN]):.2f} h\t{germination_plant_label(row)}')
+        lines.append('')
+
+    _section('Outliers', work[work['_outlier']])
+    _section('Other plants', work[~work['_outlier']])
+    path = table_file(conf, MODULE_TEMPORAL, GERMINATION_TIME_SLUG, 'plant_list.txt')
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write('\n'.join(lines).rstrip() + '\n')
+    print(f'Germination time: wrote {path}', flush=True)
 
 
 def _write_germination_summary_table(conf, germ_df):
@@ -196,6 +274,7 @@ def performGerminationAnalysis(conf, data):
         return
 
     _write_germination_summary_table(germ_conf, germ_df)
+    _write_germination_plant_list(germ_conf, germ_df)
     base_dir = metric_dir(germ_conf, MODULE_TEMPORAL, GERMINATION_TIME_SLUG)
     perform_scalar_pairwise_stats(
         germ_conf, germ_df, GERMINATION_TIME_COLUMN, output_dir=None, plant_id_col='Plant_id',
@@ -206,11 +285,13 @@ def performGerminationAnalysis(conf, data):
         germ_conf, germ_df, GERMINATION_TIME_COLUMN, base_dir,
         module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
         analysis_type='scalar', metric_label='Germination time',
+        show_mean=True,
     )
     emit_replica_scalar_comparisons(
         germ_conf, germ_df, GERMINATION_TIME_COLUMN,
         module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
         analysis_type='scalar', metric_label='Germination time',
+        show_mean=True,
     )
 
 

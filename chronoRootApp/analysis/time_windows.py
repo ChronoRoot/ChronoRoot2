@@ -459,6 +459,24 @@ def resolved_time_groups(conf, data=None):
     return detected, mode
 
 
+def _end_opens_new_hour(t0, end):
+    """True when `end` is a whole number of hours after t0.
+
+    A photo stamped exactly at that instant is the only sample in a new
+    hourly bin. Keeping it adds one last point that only the timelapses
+    with a frame at `end` contribute to, and the genotype mean moves
+    because the other plants are missing, not because those roots changed.
+    """
+    t0_ts = parse_datetime(t0)
+    end_ts = parse_datetime(end)
+    if t0_ts is None or end_ts is None:
+        return False
+    delta_h = (end_ts - t0_ts).total_seconds() / 3600.0
+    if not np.isfinite(delta_h):
+        return False
+    return abs(delta_h - round(delta_h)) < 1e-6
+
+
 def _window_for_group(group, duration_hours, t0_override=None):
     start = parse_datetime(group.get('start')) or parse_datetime(group.get('spanStart'))
     if t0_override is not None:
@@ -577,7 +595,12 @@ def apply_time_windows(data, conf):
             n_unmatched += 1
             continue
         start, t0, end = window
-        cropped = part[(part['Date'] >= start) & (part['Date'] <= end)].copy()
+        # A duration that lands on the hour is [start, end). The frame at
+        # exactly `end` would otherwise become its own one-sample hour.
+        if _end_opens_new_hour(t0, end):
+            cropped = part[(part['Date'] >= start) & (part['Date'] < end)].copy()
+        else:
+            cropped = part[(part['Date'] >= start) & (part['Date'] <= end)].copy()
         if cropped.empty:
             print(
                 f'Skipping plant {key}: no samples in analysis window '

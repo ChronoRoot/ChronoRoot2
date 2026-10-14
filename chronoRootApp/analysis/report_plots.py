@@ -285,7 +285,8 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
 
 def plot_comparison_mode(conf, data, metric, mode, output_path, *,
                          x_col='ElapsedTime (h)', metric_label=None, title=None,
-                         module=None, metric_slug_name=None, analysis_type='temporal'):
+                         module=None, metric_slug_name=None, analysis_type='temporal',
+                         xlabel=None, ylabel=None):
     """Save a line plot matching the grouping used for a comparison mode."""
     data = ensure_factor_columns(data)
     plot_data = data.dropna(subset=[metric]) if metric in data.columns else data
@@ -328,6 +329,10 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
         axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
         _decorate_temporal_grid(g, plot_data, conf, x_col, title=title)
+        if xlabel:
+            g.set_xlabels(xlabel)
+        if ylabel:
+            g.set_ylabels(ylabel)
         g.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close('all')
         _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
@@ -337,9 +342,69 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
         return False
 
 
+def _mark_means_on_axis(ax, data, x_col, metric):
+    """Draw each group's mean as a diamond and a number."""
+    if ax is None or data is None or getattr(data, 'empty', True):
+        return
+    if x_col not in data.columns or metric not in data.columns:
+        return
+    labels = [tick.get_text() for tick in ax.get_xticklabels()]
+    values = pd.to_numeric(data[metric], errors='coerce')
+    marked = False
+    for i, label in enumerate(labels):
+        group = values[data[x_col].astype(str) == str(label)].dropna()
+        if group.empty:
+            continue
+        mean = float(group.mean())
+        ax.scatter(
+            [i], [mean], marker='D', s=28, c='black', zorder=5,
+            linewidths=0, label='_nolegend_',
+        )
+        ax.annotate(
+            f'{mean:.2f}',
+            (i, mean),
+            textcoords='offset points',
+            xytext=(0, 7),
+            ha='center',
+            va='bottom',
+            fontsize=8,
+            zorder=6,
+        )
+        marked = True
+    if not marked:
+        return
+    ymin, ymax = ax.get_ylim()
+    span = ymax - ymin
+    if span > 0:
+        ax.set_ylim(ymin, ymax + 0.12 * span)
+
+
+def _mark_boxplot_means(plot_obj, data, x_col, metric):
+    axes_grid = getattr(plot_obj, 'axes', None)
+    if (
+        axes_grid is not None
+        and axes_grid is not plot_obj
+        and hasattr(axes_grid, 'flat')
+        and hasattr(plot_obj, 'facet_data')
+    ):
+        subsets = []
+        try:
+            for item in plot_obj.facet_data():
+                subsets.append(item[-1])
+        except Exception:
+            subsets = []
+        axes = list(axes_grid.flat)
+        if subsets and len(subsets) == len(axes):
+            for ax, subset in zip(axes, subsets):
+                _mark_means_on_axis(ax, subset, x_col, metric)
+            return
+    _mark_means_on_axis(plot_obj, data, x_col, metric)
+
+
 def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
                                 module=None, metric_slug_name=None, analysis_type='scalar',
-                                metric_label=None, x_col='Experiment', plot_kind='box'):
+                                metric_label=None, x_col='Experiment', plot_kind='box',
+                                show_mean=False):
     """Box/swarm plot for scalar metrics (FPCA PCs, etc.)."""
     data = ensure_factor_columns(data)
 
@@ -356,10 +421,14 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
                         **_palette_kwargs(data, 'Experiment', conf))
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
+            if show_mean:
+                _mark_boxplot_means(ax, data, x_col, metric)
         elif mode == 'genotype_by_plate':
             g = sns.catplot(**_catplot_kwargs(data, 'Experiment', metric, 'Experiment', 'PlateCondition', conf, plot_kind))
             finalize_comparison_axes(g, conf, x_col='Experiment', hue_col='Experiment', facet_col='PlateCondition')
             g.fig.suptitle(title, y=1.02)
+            if show_mean:
+                _mark_boxplot_means(g, data, 'Experiment', metric)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
@@ -367,6 +436,8 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             g = sns.catplot(**_catplot_kwargs(data, 'Experiment', metric, 'Experiment', 'ExtraVariable', conf, plot_kind))
             finalize_comparison_axes(g, conf, x_col='Experiment', hue_col='Experiment', facet_col='ExtraVariable')
             g.fig.suptitle(title, y=1.02)
+            if show_mean:
+                _mark_boxplot_means(g, data, 'Experiment', metric)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
@@ -376,16 +447,22 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
                         **_palette_kwargs(data, 'PlateCondition', conf))
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col='PlateCondition', hue_col='PlateCondition')
+            if show_mean:
+                _mark_boxplot_means(ax, data, 'PlateCondition', metric)
         elif mode == 'by_extra_variable':
             fig, ax = plt.subplots(figsize=(8, 6))
             sns.boxplot(data=data, x='ExtraVariable', y=metric, hue='ExtraVariable', ax=ax,
                         **_palette_kwargs(data, 'ExtraVariable', conf))
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col='ExtraVariable', hue_col='ExtraVariable')
+            if show_mean:
+                _mark_boxplot_means(ax, data, 'ExtraVariable', metric)
         elif mode == 'plate_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, 'PlateCondition', metric, 'PlateCondition', 'Experiment', conf, plot_kind))
             finalize_comparison_axes(g, conf, x_col='PlateCondition', hue_col='PlateCondition', facet_col='Experiment')
             g.fig.suptitle(title, y=1.02)
+            if show_mean:
+                _mark_boxplot_means(g, data, 'PlateCondition', metric)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
@@ -393,6 +470,8 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             g = sns.catplot(**_catplot_kwargs(data, 'ExtraVariable', metric, 'ExtraVariable', 'Experiment', conf, plot_kind))
             finalize_comparison_axes(g, conf, x_col='ExtraVariable', hue_col='ExtraVariable', facet_col='Experiment')
             g.fig.suptitle(title, y=1.02)
+            if show_mean:
+                _mark_boxplot_means(g, data, 'ExtraVariable', metric)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
@@ -481,15 +560,18 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
 
 
 def emit_temporal_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
-                                   analysis_type='temporal', metric_label=None):
+                                   analysis_type='temporal', metric_label=None,
+                                   x_col='ElapsedTime (h)', xlabel=None, ylabel=None):
     """Generate paired {metric}_{mode}.png for every enabled comparison mode."""
     for mode in comparison_modes_for_run(conf, data):
         output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name)
         plot_comparison_mode(
             conf, data, metric, mode, output_path,
+            x_col=x_col,
             metric_label=metric_label or metric,
             module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type,
+            xlabel=xlabel, ylabel=ylabel,
         )
 
 
@@ -504,19 +586,20 @@ def emit_interval_comparison_plots(conf, data, metric, base_dir, *, module, metr
 
 
 def emit_scalar_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
-                                 analysis_type='scalar', metric_label=None):
+                                 analysis_type='scalar', metric_label=None, show_mean=False):
     for mode in comparison_modes_for_run(conf, data):
         plot_scalar_comparison_mode(
             conf, data, metric, mode, base_dir,
             module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type, metric_label=metric_label or metric,
+            show_mean=show_mean,
         )
 
 
 def emit_replica_scalar_comparisons(
     conf, data, metric, *, module, metric_slug_name,
     analysis_type='scalar', metric_label=None, parent_subpath=(),
-    plant_id_col='Plant_id',
+    plant_id_col='Plant_id', show_mean=False,
 ):
     """Scalar stats/plots per ExtraVariable, using non-extra comparison modes."""
     parent_subpath = tuple(parent_subpath)
@@ -537,4 +620,5 @@ def emit_replica_scalar_comparisons(
             replica_conf, subset, metric, replica_dir,
             module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type, metric_label=metric_label or metric,
+            show_mean=show_mean,
         )
