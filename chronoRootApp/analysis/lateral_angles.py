@@ -951,6 +951,19 @@ def makeLateralAnglesPlots(conf):
             # Only plants imaged at this hour. A missing hour is not filled
             # by the nearest other measurement.
             aux = all_data.loc[elapsed == int(hour)].copy()
+            # The last snapshot is the end of the series. A plant whose last
+            # hourly mean falls in that final day, but not on the exact hour,
+            # still belongs there. Earlier snapshots stay exact.
+            if snapshot and int(hour) == int(snapshot[-1]) and len(snapshot) > 1:
+                prev = int(snapshot[-2])
+                have = set(aux['Plant_id'].astype(str)) if not aux.empty and 'Plant_id' in aux.columns else set()
+                late = all_data.loc[(elapsed > prev) & (elapsed <= int(hour))]
+                if not late.empty:
+                    late = late.loc[~late['Plant_id'].astype(str).isin(have)]
+                    if not late.empty:
+                        extra = late.loc[late.groupby('Plant_id')['ElapsedTime (h)'].idxmax()].copy()
+                        extra['ElapsedTime (h)'] = int(hour)
+                        aux = pd.concat([aux, extra], ignore_index=True)
             if 'Mean emergence angle' not in aux.columns or aux.empty:
                 continue
             aux = aux[pd.to_numeric(aux['Mean emergence angle'], errors='coerce').notna()]

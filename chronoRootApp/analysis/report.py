@@ -16,10 +16,12 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import hashlib
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import os
+import shutil
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import scipy.stats as stats
@@ -362,6 +364,45 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
     plt.cla()
     plt.clf()
     plt.close('all')
+
+
+def individual_plot_stamp(dataframe, conf):
+    """Fingerprint of the series and the options that change this figure."""
+    cols = [
+        col for col in (
+            'ElapsedTime (h)', 'MainRootLength (mm)', 'LateralRootsLength (mm)',
+            'HypocotylLength (mm)', 'NumberOfLateralRoots',
+        )
+        if col in dataframe.columns
+    ]
+    text = dataframe[cols].to_csv(index=False)
+    conf = conf or {}
+    text += '|' + '|'.join(str(conf.get(key)) for key in (
+        'includeLateralRootPlots', 'figureClockTicks', 'showFigureClockTicks',
+        'timeDurationHours',
+    ))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def save_individual_plant_plot(savepath, dataframe, name, conf, cache_path):
+    """Draw the plant figure, or copy the stored one when the series is unchanged."""
+    os.makedirs(savepath, exist_ok=True)
+    dest = os.path.join(savepath, name)
+    stamp = individual_plot_stamp(dataframe, conf)
+    stamp_path = cache_path + '.stamp'
+    if os.path.isfile(cache_path) and os.path.isfile(stamp_path):
+        with open(stamp_path, encoding='utf-8') as handle:
+            stored = handle.read()
+        if stored == stamp:
+            if not os.path.isfile(dest) or os.path.getsize(dest) != os.path.getsize(cache_path):
+                shutil.copy(cache_path, dest)
+            return False
+    plot_individual_plant(savepath, dataframe, name, conf)
+    if os.path.isfile(dest):
+        shutil.copy(dest, cache_path)
+        with open(stamp_path, 'w', encoding='utf-8') as handle:
+            handle.write(stamp)
+    return True
 
 def performStatisticalAnalysis(conf, data, metric):
     data = ensure_factor_columns(data)

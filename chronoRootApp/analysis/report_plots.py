@@ -475,9 +475,18 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
         return False
 
 
+def _apply_ylabel(plot_obj, ylabel):
+    if not ylabel:
+        return
+    if hasattr(plot_obj, 'set_ylabels'):
+        plot_obj.set_ylabels(ylabel)
+    else:
+        plot_obj.set_ylabel(ylabel)
+
+
 def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
                                    x_col='Day', module=None, metric_slug_name=None,
-                                   analysis_type='interval', metric_label=None):
+                                   analysis_type='interval', metric_label=None, ylabel=None):
     """Violin for one comparison mode, plus a companion count of plants."""
     data = ensure_factor_columns(data)
 
@@ -493,9 +502,11 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             _violin(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
+            _apply_ylabel(ax, ylabel)
         elif mode == 'genotype_by_plate':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'PlateCondition', conf, 'violin'))
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='PlateCondition')
+            _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
@@ -504,6 +515,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
         elif mode == 'genotype_by_extra':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'ExtraVariable', conf, 'violin'))
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='ExtraVariable')
+            _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
@@ -514,14 +526,17 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             _violin(ax, data, x_col, metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='PlateCondition')
+            _apply_ylabel(ax, ylabel)
         elif mode == 'by_extra_variable':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
             _violin(ax, data, x_col, metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='ExtraVariable')
+            _apply_ylabel(ax, ylabel)
         elif mode == 'plate_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'PlateCondition', 'Experiment', conf, 'violin'))
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='PlateCondition', facet_col='Experiment')
+            _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
@@ -530,6 +545,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
         elif mode == 'extra_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'ExtraVariable', 'Experiment', conf, 'violin'))
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='ExtraVariable', facet_col='Experiment')
+            _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
@@ -565,12 +581,14 @@ def emit_temporal_comparison_plots(conf, data, metric, base_dir, *, module, metr
 
 
 def emit_interval_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
-                                   analysis_type='interval', x_col='Day', metric_label=None):
+                                   analysis_type='interval', x_col='Day', metric_label=None,
+                                   ylabel=None):
     for mode in comparison_modes_for_run(conf, data):
         plot_interval_comparison_mode(
             conf, data, metric, mode, base_dir,
             x_col=x_col, module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type, metric_label=metric_label or metric,
+            ylabel=ylabel,
         )
 
 

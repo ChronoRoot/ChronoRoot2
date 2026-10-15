@@ -3,7 +3,6 @@ ChronoRoot: High-throughput phenotyping by deep learning reveals novel temporal 
 Copyright (C) 2020 Nicolás Gaggion
 """
 
-import shutil
 import pandas as pd
 import os
 import argparse
@@ -12,7 +11,7 @@ from analysis.utils.metadata_schema import apply_load_aliases, load_json
 from analysis.utils import report_utils as utils
 from analysis import convex_hull
 from analysis.report import (
-    plot_individual_plant,
+    save_individual_plant_plot,
     plot_info_all,
     performGerminationAnalysis,
     performStatisticalAnalysisForMetrics,
@@ -139,10 +138,9 @@ if __name__ == "__main__":
 
                     plot_filename = f"{exp_dir_name}_{plant_id}.png"
                     iplot_cache = os.path.join(res_folder, plot_filename)
-                    report_dest = os.path.join(iplots_exp_folder, plot_filename)
-                    plot_individual_plant(iplots_exp_folder, data, plot_filename, conf)
-                    if os.path.exists(report_dest):
-                        shutil.copy(report_dest, iplot_cache)
+                    save_individual_plant_plot(
+                        iplots_exp_folder, data, plot_filename, conf, iplot_cache,
+                    )
 
     all_data = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     if not all_data.empty:
