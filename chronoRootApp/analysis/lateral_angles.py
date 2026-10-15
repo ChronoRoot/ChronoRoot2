@@ -328,35 +328,13 @@ def matching(new_starts, all_new_points, old_starts, all_old_points, old_names, 
 BASE_MATCH_PX = 20.0
 SUFFIX_TOL_PX = 8.0
 CONFIRM_FRAMES = 3
-_DBG_COUNT = {"C": 0, "D": 0, "E": 0}
 
 
-def _dbg(hypothesis_id, message, data):
-    # region agent log
-    try:
-        import json
-        import time
-        if _DBG_COUNT.get(hypothesis_id, 0) >= 30:
-            return
-        _DBG_COUNT[hypothesis_id] = _DBG_COUNT.get(hypothesis_id, 0) + 1
-        record = {
-            "sessionId": "f465cf",
-            "runId": "post-fix",
-            "hypothesisId": hypothesis_id,
-            "location": "lateral_angles.py:update_lateral_tracks",
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(
-            "/home/IPS2/rgaggio/.local/chronoroot/ChronoRoot2/.cursor/debug-f465cf.log",
-            "a",
-            encoding="utf-8",
-        ) as handle:
-            handle.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
-    # endregion
+def localTag(tag):
+    """RSML tag without an XML namespace, when one is present."""
+    if tag[:1] == "{":
+        return tag.split("}", 1)[1]
+    return tag
 
 
 def readPolyline(root_element):
@@ -364,15 +342,14 @@ def readPolyline(root_element):
     if root_element is None:
         return []
     for child in root_element:
-        tag = child.tag.split("}", 1)[-1]
-        if tag != "geometry":
+        if localTag(child.tag) != "geometry":
             continue
         for geometry in child:
-            if geometry.tag.split("}", 1)[-1] != "polyline":
+            if localTag(geometry.tag) != "polyline":
                 continue
             points = []
             for point in geometry:
-                if point.tag.split("}", 1)[-1] != "point":
+                if localTag(point.tag) != "point":
                     continue
                 points.append([int(float(point.attrib["x"])), int(float(point.attrib["y"]))])
             return points
@@ -392,22 +369,35 @@ def extendLateral(element, parent_points, previous_points, other_bases):
         return parent_points
     if len(previous_points) < 2:
         return parent_points
+    # Most order-1 lines have no children. Nothing can be appended.
+    children = [child for child in element if localTag(child.tag) == "root"]
+    if not children:
+        return parent_points
 
     # Which children start at the current end and then follow the old line forward?
+    # Squared distances keep the same nearest-point decisions without a square root.
     continuing = []
-    parent_end = np.asarray(parent_points[-1], dtype=float)
-    previous = np.asarray(previous_points, dtype=float)
-    for child in element:
-        if child.tag.split("}", 1)[-1] != "root":
-            continue
+    parent_end_x = parent_points[-1][0]
+    parent_end_y = parent_points[-1][1]
+    suffix_limit_sq = SUFFIX_TOL_PX * SUFFIX_TOL_PX
+    for child in children:
         child_points = readPolyline(child)
         if len(child_points) < 2:
             continue
-        if float(np.hypot(child_points[0][0] - parent_end[0], child_points[0][1] - parent_end[1])) > 3.0:
+        dx = child_points[0][0] - parent_end_x
+        dy = child_points[0][1] - parent_end_y
+        if dx * dx + dy * dy > 9.0:
             continue
-        end_distances = np.linalg.norm(previous - parent_end, axis=1)
-        split_at = int(np.argmin(end_distances))
-        if float(end_distances[split_at]) > SUFFIX_TOL_PX or split_at >= len(previous_points) - 1:
+        split_at = 0
+        best = None
+        for index, point in enumerate(previous_points):
+            dx = point[0] - parent_end_x
+            dy = point[1] - parent_end_y
+            dist_sq = dx * dx + dy * dy
+            if best is None or dist_sq < best:
+                best = dist_sq
+                split_at = index
+        if best > suffix_limit_sq or split_at >= len(previous_points) - 1:
             continue
         # Walk the child along the old suffix. Growth past the old tip is allowed
         # only after that suffix has been covered.
@@ -415,17 +405,26 @@ def extendLateral(element, parent_points, previous_points, other_bases):
         cursor = 0
         furthest = 0
         follows = True
+        last = len(suffix) - 1
         for point in child_points:
-            while cursor + 1 < len(suffix):
-                here = np.hypot(point[0] - suffix[cursor][0], point[1] - suffix[cursor][1])
-                nxt = np.hypot(point[0] - suffix[cursor + 1][0], point[1] - suffix[cursor + 1][1])
+            px = point[0]
+            py = point[1]
+            while cursor < last:
+                sx = suffix[cursor][0]
+                sy = suffix[cursor][1]
+                nx = suffix[cursor + 1][0]
+                ny = suffix[cursor + 1][1]
+                here = (px - sx) * (px - sx) + (py - sy) * (py - sy)
+                nxt = (px - nx) * (px - nx) + (py - ny) * (py - ny)
                 if nxt > here:
                     break
                 cursor += 1
-            near_cursor = np.hypot(point[0] - suffix[cursor][0], point[1] - suffix[cursor][1]) <= SUFFIX_TOL_PX
+            sx = suffix[cursor][0]
+            sy = suffix[cursor][1]
+            near_cursor = (px - sx) * (px - sx) + (py - sy) * (py - sy) <= suffix_limit_sq
             if near_cursor:
                 furthest = max(furthest, cursor)
-            elif furthest < len(suffix) - 1:
+            elif furthest < last:
                 follows = False
                 break
         if not follows:
@@ -447,21 +446,33 @@ def extendLateral(element, parent_points, previous_points, other_bases):
     # A line that returns to its own base, or that reaches another lateral, is a loop.
     returns = False
     for point in child_points[1:]:
-        if np.hypot(point[0] - own_base[0], point[1] - own_base[1]) <= 12.0:
+        dx = point[0] - own_base[0]
+        dy = point[1] - own_base[1]
+        if dx * dx + dy * dy <= 144.0:
             returns = True
             break
     if returns:
         return parent_points
-    if np.hypot(child_points[0][0] - parent_end[0], child_points[0][1] - parent_end[1]) <= 3.0:
+    dx = child_points[0][0] - parent_end_x
+    dy = child_points[0][1] - parent_end_y
+    if dx * dx + dy * dy <= 9.0:
         merged = parent_points + child_points[1:]
     else:
         merged = parent_points + child_points
     for base in other_bases:
-        if np.hypot(base[0] - own_base[0], base[1] - own_base[1]) <= 6.0:
+        dx = base[0] - own_base[0]
+        dy = base[1] - own_base[1]
+        if dx * dx + dy * dy <= 36.0:
             continue
+        blocked = False
         for point in merged:
-            if np.hypot(point[0] - base[0], point[1] - base[1]) <= 6.0:
-                return parent_points
+            dx = point[0] - base[0]
+            dy = point[1] - base[1]
+            if dx * dx + dy * dy <= 36.0:
+                blocked = True
+                break
+        if blocked:
+            return parent_points
     return merged
 
 
@@ -476,34 +487,46 @@ def update_lateral_tracks(elements, tracks, next_id):
     that actually ended the series.
     """
     # Current order-1 laterals. Each polyline already runs from base to tip.
+    # The pixel length is kept with the line so later frames do not measure it again.
     observations = []
     for element in elements or []:
         points = readPolyline(element)
         if len(points) >= 2:
-            observations.append({"element": element, "points": points, "base": points[0]})
+            observations.append({
+                "element": element,
+                "points": points,
+                "base": points[0],
+                "px": lenRoot(points, pixel_size=1),
+            })
     other_bases = [item["base"] for item in observations]
 
     # Candidate pairs: base within 20 px. Sort so the line closest to the
     # previous tip is tried first, and the closest base breaks a tie.
+    # Squared distances sort in the same order as the distances themselves.
+    base_limit_sq = BASE_MATCH_PX * BASE_MATCH_PX
     pairs = []
     for track_index, track in enumerate(tracks):
         remembered_points = track.get("points") or []
         old_tip = remembered_points[-1] if remembered_points else None
         for obs_index, obs in enumerate(observations):
-            base_distance = float(np.hypot(
-                obs["base"][0] - track["base"][0],
-                obs["base"][1] - track["base"][1],
-            ))
-            if base_distance > BASE_MATCH_PX:
+            dx = obs["base"][0] - track["base"][0]
+            dy = obs["base"][1] - track["base"][1]
+            base_sq = dx * dx + dy * dy
+            if base_sq > base_limit_sq:
                 continue
             if old_tip is None:
-                tip_distance = 0.0
+                tip_sq = 0.0
             else:
-                arr = np.asarray(obs["points"], dtype=float)
-                tip_distance = float(np.min(np.linalg.norm(
-                    arr - np.asarray(old_tip, dtype=float), axis=1
-                )))
-            pairs.append((tip_distance, base_distance, track_index, obs_index))
+                ox = old_tip[0]
+                oy = old_tip[1]
+                tip_sq = None
+                for point in obs["points"]:
+                    dx = point[0] - ox
+                    dy = point[1] - oy
+                    dist_sq = dx * dx + dy * dy
+                    if tip_sq is None or dist_sq < tip_sq:
+                        tip_sq = dist_sq
+            pairs.append((tip_sq, base_sq, track_index, obs_index))
     pairs.sort()
 
     used_tracks = set()
@@ -516,9 +539,12 @@ def update_lateral_tracks(elements, tracks, next_id):
         track = tracks[track_index]
         obs = observations[obs_index]
         merged = extendLateral(obs["element"], obs["points"], track.get("points"), other_bases)
-        remembered = lenRoot(track.get("points"), pixel_size=1)
-        raw_len = lenRoot(obs["points"], pixel_size=1)
-        merged_len = lenRoot(merged, pixel_size=1)
+        remembered = track.get("px")
+        if remembered is None:
+            remembered = lenRoot(track.get("points"), pixel_size=1)
+            track["px"] = remembered
+        # A new list means a child was appended, so the length has to be measured again.
+        merged_len = obs["px"] if merged is obs["points"] else lenRoot(merged, pixel_size=1)
         # Image y grows downward, so a smaller y is higher on the plate.
         moved_up = obs["base"][1] + 6 < track["base"][1]
         jumped = remembered > 0.0 and merged_len > remembered + 40.0
@@ -526,31 +552,6 @@ def update_lateral_tracks(elements, tracks, next_id):
         old_tip = (track.get("points") or [[0, 0]])[-1]
         new_tip = merged[-1] if merged else old_tip
         tip_up = new_tip[1] + 15 < old_tip[1]
-        # region agent log
-        if jumped:
-            _dbg("C", "length jump", {
-                "track": track["id"],
-                "remembered_px": round(remembered, 1),
-                "raw_px": round(raw_len, 1),
-                "merged_px": round(merged_len, 1),
-                "appended": len(merged) > len(obs["points"]) + 2,
-                "accepted": False,
-            })
-        if moved_up:
-            _dbg("D", "base moved up", {
-                "track": track["id"],
-                "track_y": track["base"][1],
-                "obs_y": obs["base"][1],
-                "accepted": False,
-            })
-        if tip_up:
-            _dbg("E", "tip moved up", {
-                "track": track["id"],
-                "old_tip_y": old_tip[1],
-                "new_tip_y": new_tip[1],
-                "accepted": False,
-            })
-        # endregion
         if tip_up or moved_up:
             track["present"] = False
             track["stop_reason"] = "We cannot get to the last tip from the base."
@@ -562,6 +563,7 @@ def update_lateral_tracks(elements, tracks, next_id):
             track["present"] = False
         else:
             track["points"] = merged
+            track["px"] = merged_len
             track["stop_reason"] = None
             track["streak"] += 1
             track["present"] = True
@@ -585,6 +587,7 @@ def update_lateral_tracks(elements, tracks, next_id):
             "id": next_id,
             "base": obs["base"],
             "points": obs["points"],
+            "px": obs["px"],
             "streak": 1,
             "present": True,
             "real": False,
@@ -609,19 +612,7 @@ def select_first_lateral(tracks):
     if not real:
         return None
     real.sort(key=lambda track: (track["born"], track["base"][1], track["id"]))
-    chosen = real[0]
-    # region agent log
-    max_mm = max((item["length_mm"] for item in chosen["history"]), default=0)
-    _dbg("A", "selected first lateral", {
-        "id": chosen["id"],
-        "born": chosen["born"],
-        "max_mm": max_mm,
-        "base_y": chosen["base"][1],
-        "n": len(chosen["history"]),
-        "stop": chosen.get("stop_reason"),
-    })
-    # endregion
-    return chosen
+    return real[0]
 
 
 def lenRoot(points, pixel_size=0.04):
@@ -661,10 +652,6 @@ def getAngles(conf, path):
     tracks = []
     next_id = 0
     frame_rows = []
-    _DBG_COUNT["C"] = 0
-    _DBG_COUNT["D"] = 0
-    _DBG_COUNT["E"] = 0
-    _DBG_COUNT["A"] = 0
 
     filepath = os.path.join(path, 'LateralRootsData.csv')
     metadata = load_result_metadata(path)
@@ -683,7 +670,7 @@ def getAngles(conf, path):
                 track["born"] = frame_index
             if not track["present"]:
                 continue
-            length_mm = float(lenRoot(track["points"], pixel_size))
+            length_mm = float(track["px"] * pixel_size)
             record = {
                 "img": imgname,
                 "points": [[int(p[0]), int(p[1])] for p in track["points"]],
