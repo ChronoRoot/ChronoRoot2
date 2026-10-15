@@ -259,8 +259,22 @@ def _finish_frame_read(window, generation, img):
 
 
 def _close_frame_thread(window):
+    """Stop the decode thread. Safe to call more than once.
+
+    Confirming a dialog calls done(), which hides the window and does not
+    deliver a close event. The thread must be stopped there too, or the next
+    click in the main window destroys it while it is still running and Qt
+    aborts the process.
+    """
+    if getattr(window, "_frame_thread_stopped", False):
+        return
+    window._frame_thread_stopped = True
     window._frame_closing = True
-    window._frame_generation += 1
+    window._frame_generation = getattr(window, "_frame_generation", 0) + 1
+    window._frame_on_image = None
+    worker = getattr(window, "_frame_worker", None)
+    if worker is not None:
+        worker.latest = window._frame_generation
     thread = getattr(window, "_frame_thread", None)
     if thread is None:
         return
@@ -524,6 +538,10 @@ class PlantROISelectorWindow(QDialog):
         _open_frame_thread(self)
         self._update_display(refit=True)
 
+    def done(self, result):
+        _close_frame_thread(self)
+        super().done(result)
+
     def closeEvent(self, event):
         _close_frame_thread(self)
         super().closeEvent(event)
@@ -725,6 +743,10 @@ class SeedSelectorWindow(QDialog):
         _open_frame_thread(self)
         self._update_display(refit=True)
 
+    def done(self, result):
+        _close_frame_thread(self)
+        super().done(result)
+
     def closeEvent(self, event):
         _close_frame_thread(self)
         super().closeEvent(event)
@@ -917,6 +939,10 @@ class GroupROISelectorWindow(QDialog):
         self._update_group_label()
         _open_frame_thread(self)
         self._update_display()
+
+    def done(self, result):
+        _close_frame_thread(self)
+        super().done(result)
 
     def closeEvent(self, event):
         _close_frame_thread(self)

@@ -301,6 +301,8 @@ class CalibrationHelper(QMainWindow):
             self.statusBar().showMessage('Please select two points first')
 
 def main():
+    from gui.error_report import install_gui_exception_hook
+    install_gui_exception_hook()
     parser = argparse.ArgumentParser(description='Video Calibration Helper')
     parser.add_argument('--video-dir', required=True, help='Directory containing video files')
     args = parser.parse_args()

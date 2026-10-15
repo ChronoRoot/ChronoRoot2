@@ -17,6 +17,8 @@ from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
 
 
 def _ensure_qapplication():
+    from gui.error_report import install_gui_exception_hook
+    install_gui_exception_hook()
     app = QApplication.instance()
     if app is not None:
         return app

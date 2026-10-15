@@ -11,6 +11,45 @@ from PyQt5 import QtCore, QtWidgets
 
 
 _SHOW_AFTER_MS = 300
+_kept_alive = []
+
+
+def _retire_thread(thread, worker):
+    """Stop a worker thread and delete it only after it has finished.
+
+    Destroying a QThread while its run() is still on the stack aborts the
+    process from C++. Python must keep the wrapper alive until then, because
+    deleteLater does not.
+    """
+    if thread is None:
+        return
+    _kept_alive.append(thread)
+    if worker is not None:
+        _kept_alive.append(worker)
+    thread.quit()
+    thread.wait()
+
+    def release():
+        if thread.isRunning():
+            thread.quit()
+            thread.wait()
+        if thread.isRunning():
+            QtCore.QTimer.singleShot(50, release)
+            return
+        if worker is not None:
+            worker.deleteLater()
+        thread.deleteLater()
+
+        def forget():
+            for obj in (worker, thread):
+                if obj is not None and obj in _kept_alive:
+                    _kept_alive.remove(obj)
+        QtCore.QTimer.singleShot(0, forget)
+
+    if thread.isRunning():
+        thread.finished.connect(release)
+    else:
+        QtCore.QTimer.singleShot(0, release)
 
 
 class _Job(QtCore.QObject):
@@ -124,12 +163,7 @@ def run_off_main_thread(parent, message, fn, then=None):
         if dialog is not None:
             dialog.close()
             dialog.deleteLater()
-        if thread is not None:
-            thread.quit()
-            thread.wait()
-            if worker is not None:
-                worker.deleteLater()
-            thread.deleteLater()
+        _retire_thread(thread, worker)
         if disabled_here and parent is not None:
             parent.setEnabled(True)
             parent.activateWindow()

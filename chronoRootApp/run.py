@@ -42,6 +42,7 @@ from analysis.utils.metadata_schema import (
 )
 from analysis.utils.report_utils import natural_key as natural_keys
 from gui.background import run_off_main_thread
+from gui.error_report import install_gui_exception_hook
 from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
 from gui import pipeline_runner
 from gui.stats_config_dialog import StatsConfigDialog
@@ -59,7 +60,7 @@ from analysis.utils.remap_identifiers import (
     apply_experiment_remap,
     collect_experiment_counts,
 )
-from analysis.utils.plant_inventory import scan_analysis_plants
+from analysis.utils.plant_inventory import read_log_summary, scan_analysis_plants
 
 TAB_HEIGHT = 630
 REPORT_PLOT_ROLE = QtCore.Qt.UserRole
@@ -109,6 +110,7 @@ class AspectRatioLabel(QLabel):
 
 class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def __init__(self):
+        install_gui_exception_hook()
         super().__init__()
         self.project_dir = None
         self.selected_plant = None
@@ -189,7 +191,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if hasattr(self, "tab_widget"):
             idx = self.tab_widget.currentIndex()
             if idx in (1, 2):
-                QtCore.QTimer.singleShot(0, lambda: self.ensure_plant_inventory(force=True))
+                QtCore.QTimer.singleShot(0, self._reload_visible_plant_list)
+
+    def _reload_visible_plant_list(self):
+        self.ensure_plant_inventory(force=True)
+        self._show_overlay_plant_after_list()
 
     def _set_inventory_loading(self, loading):
         for name in ("refresh_button", "refresh_button_tab3"):
@@ -257,6 +263,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._plants_dirty = True
         self._prefer_index_after_load = prefer_index
         self.ensure_plant_inventory(force=True)
+        self._show_overlay_plant_after_list()
+
+    def _show_overlay_plant_after_list(self):
+        """Load the selected picture only after the plant-list dialog has closed."""
+        if hasattr(self, "tab_widget") and self.tab_widget.currentIndex() == 2:
+            self.update_image_labels()
 
     def ensure_plant_inventory(self, force=False):
         """Scan Analysis/ off the GUI thread if the inventory is stale (or force=True)."""
@@ -316,6 +328,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         current_sort_order = self.table.horizontalHeader().sortIndicatorOrder()
         current_sort_column = self.table.horizontalHeader().sortIndicatorSection()
+        if not 0 <= current_sort_column < self.table.columnCount():
+            current_sort_column = 0
         self.table.setSortingEnabled(False)
         self.table.clearContents()
         self.table.setRowCount(len(rows))
@@ -359,9 +373,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._plants_dirty = False
         self._set_inventory_loading(False)
 
-        if hasattr(self, "tab_widget") and self.tab_widget.currentIndex() == 2:
-            self.update_image_labels()
-
     def refresh_table(self, prefer_index=None):
         """Backward-compatible entry: force a rescan (Refresh buttons / remap / remove)."""
         self.force_refresh_plant_inventory(prefer_index=prefer_index)
@@ -375,8 +386,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         # index 2: Plant Overlay
         elif index == 2:
             self.ensure_plant_inventory()
-            if not self.inventory_is_stale():
-                self.update_image_labels()
+            self._show_overlay_plant_after_list()
 
         # index 4: Report Viewer
         elif index == 4:
@@ -639,33 +649,95 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             item = self.table.item(selected_rows[0].row(), 0)
             self.universal_open(item.path)
 
+    def _move_plant_out(self, plant_slot, project):
+        """Move one plant slot into the project's Removed folder."""
+        project = os.path.abspath(project)
+        analysis = os.path.join(project, "Analysis")
+        plant_slot = os.path.abspath(plant_slot)
+        if os.path.commonpath([plant_slot, analysis]) != analysis:
+            raise RuntimeError("This plant is not inside the project Analysis folder.")
+        removed_path = os.path.join(project, "Removed", os.path.relpath(plant_slot, analysis))
+        if os.path.exists(removed_path):
+            shutil.rmtree(removed_path)
+        os.makedirs(os.path.dirname(removed_path), exist_ok=True)
+        shutil.move(plant_slot, removed_path)
+
+    def _drop_relaunch_watch(self, plant_slot):
+        watches = getattr(self, "_relaunch_watches", None)
+        if not watches or not plant_slot:
+            return
+        watches.pop(os.path.abspath(plant_slot), None)
+
+    def _forget_removed_plant(self, plant_slot):
+        """Drop one plant from the table and the overlay list. No rescan."""
+        plant_slot = os.path.abspath(plant_slot)
+        if hasattr(self, "plant_dropdown") and self.plant_dropdown is not None:
+            combo = self.plant_dropdown
+            remove_at = None
+            for i in range(combo.count()):
+                if self._slot_of_plant_path(combo.itemData(i)) == plant_slot:
+                    remove_at = i
+                    break
+            if remove_at is not None:
+                combo.blockSignals(True)
+                combo.removeItem(remove_at)
+                if combo.count():
+                    combo.setCurrentIndex(min(remove_at, combo.count() - 1))
+                combo.blockSignals(False)
+                self.selected_plant = self.current_plant_path()
+        if hasattr(self, "table") and self.table is not None:
+            table = self.table
+            sorting = table.isSortingEnabled()
+            table.setSortingEnabled(False)
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                slot = getattr(item, "plant_slot", None) if item is not None else None
+                if slot and os.path.abspath(slot) == plant_slot:
+                    table.removeRow(row)
+                    break
+            table.setSortingEnabled(sorting)
+
+    def _remove_plant_slot(self, plant_slot):
+        project = self.projectField.text().strip()
+        self._drop_relaunch_watch(plant_slot)
+        self._clear_overlay_cache_for_path(plant_slot)
+        try:
+            # A directory rename on this disk is immediate. Doing it here avoids
+            # starting a thread whose destruction was aborting the window.
+            self._move_plant_out(plant_slot, project)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Remove Plant", f"Could not move this plant.\n\n{exc}",
+            )
+            return
+        self._forget_removed_plant(plant_slot)
+        self._show_overlay_plant_after_list()
+
     def remove_selected_path(self):
         selected_rows = self.table.selectionModel().selectedRows()
-
         if not selected_rows:
             return
-
-        selected_row = selected_rows[0].row()
-        item = self.table.item(selected_row, 0)
-        path = getattr(item, 'plant_slot', os.path.dirname(item.path))
-
-        removed_path = os.path.join(self.projectField.text(), "Removed")
-        removed_path = os.path.join(
-            removed_path,
-            os.path.relpath(path, os.path.join(self.projectField.text(), "Analysis")),
+        item = self.table.item(selected_rows[0].row(), 0)
+        if item is None:
+            return
+        path = getattr(item, "plant_slot", None) or (
+            os.path.dirname(item.path)
+            if os.path.basename(getattr(item, "path", "")).startswith("Results_")
+            else getattr(item, "path", "")
         )
+        if not path:
+            return
+        self._remove_plant_slot(path)
 
-        def move_plant():
-            if not os.path.exists(os.path.dirname(removed_path)):
-                os.makedirs(os.path.dirname(removed_path))
-            if os.path.exists(removed_path):
-                shutil.rmtree(removed_path)
-            shutil.move(path, removed_path)
-
-        run_off_main_thread(self, "Moving plant…", move_plant)
-        self.refresh_table()
-        
-        return
+    def remove_selected_plant(self):
+        path = self.current_plant_path()
+        if not path:
+            return
+        plant_slot = self._slot_of_plant_path(path)
+        if not plant_slot:
+            return
+        self._clear_overlay_cache_for_path(path)
+        self._remove_plant_slot(plant_slot)
 
     def set_default_parameters(self):
         """Set default values for important fields"""
@@ -839,6 +911,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if not self.selected_plant:
             return
 
+        if self._hide_finished_view_while_relaunching():
+            return
+
         try:
             self._show_selected_plant()
         except Exception as exc:
@@ -961,37 +1036,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         return
 
-    def remove_selected_plant(self):
-        path = self.current_plant_path()
-        if not path:
-            return
-        idx = self.plant_dropdown.currentIndex()
-        plant_slot = os.path.dirname(path) if os.path.basename(path).startswith('Results_') else path
-
-        removed_path = os.path.join(
-            self.projectField.text(),
-            "Removed",
-            os.path.relpath(plant_slot, os.path.join(self.projectField.text(), "Analysis")),
-        )
-
-        def move_plant():
-            if not os.path.exists(os.path.dirname(removed_path)):
-                os.makedirs(os.path.dirname(removed_path))
-            if os.name == 'nt':
-                os.system(f'move "{plant_slot}" "{removed_path}"')
-            elif sys.platform == 'darwin':
-                os.system(f'mv "{plant_slot}" "{removed_path}"')
-            else:
-                os.system(f'mv "{plant_slot}" "{removed_path}"')
-
-        run_off_main_thread(self, "Moving plant…", move_plant)
-
-        self._clear_overlay_cache_for_path(path)
-        # Prefer the same list position (next plant) after the removed entry disappears
-        self.refresh_table(prefer_index=idx)
-
-        return
-    
     def analysis(self):
         """Run analysis with validation"""
 
@@ -1209,7 +1253,153 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             dump_json(pending_analysis_path(project), conf)
 
         run_off_main_thread(self, None, write_pending)
+        relaunch_slot = self._slot_of_plant_path(self.selected_plant)
+        relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         pipeline_runner.run_pending_analysis(project)
+        self._follow_relaunch(self.selected_plant, baseline=relaunch_baseline)
+
+    def _slot_of_plant_path(self, path):
+        if not path:
+            return ""
+        path = os.path.abspath(path)
+        if os.path.basename(path).startswith("Results_"):
+            return os.path.dirname(path)
+        return path
+
+    def _relaunch_in_progress(self, path):
+        slot = self._slot_of_plant_path(path)
+        return bool(slot) and slot in getattr(self, "_relaunch_watches", {})
+
+    def _hide_finished_view_while_relaunching(self):
+        """The dropdown still names the finished folder until the new one exists."""
+        slot = self._slot_of_plant_path(self.selected_plant)
+        info = getattr(self, "_relaunch_watches", {}).get(slot)
+        if not info:
+            return False
+        current = os.path.abspath(self.selected_plant)
+        baseline = info.get("baseline") or ""
+        if current == baseline or not os.path.isfile(os.path.join(current, "log.txt")):
+            self._show_relaunch_message()
+            return True
+        return False
+
+    def _show_relaunch_message(self):
+        """Replace the finished pictures while a redo of this plant is running."""
+        self._clear_overlay_cache_for_path(self.selected_plant)
+        for label in (getattr(self, "image_label1", None), getattr(self, "image_label2", None)):
+            if label is None:
+                continue
+            label.setText("Redo in progress…")
+            label.setAlignment(QtCore.Qt.AlignCenter)
+            label.show()
+
+    def _follow_relaunch(self, result_or_slot, baseline=None):
+        """Keep this plant selected on the run that the redo is about to create."""
+        slot = self._slot_of_plant_path(result_or_slot)
+        if not slot:
+            return
+        if baseline is None:
+            baseline = get_latest_result_dir(slot) or ""
+        token = getattr(self, "_relaunch_token", 0) + 1
+        self._relaunch_token = token
+        watches = getattr(self, "_relaunch_watches", None)
+        if watches is None:
+            watches = {}
+            self._relaunch_watches = watches
+        watches[slot] = {"token": token, "baseline": os.path.abspath(baseline) if baseline else "", "shown": ""}
+        self._set_plant_status(slot, "Running", "", "")
+        if self._slot_of_plant_path(self.current_plant_path()) == slot:
+            self._show_relaunch_message()
+        self._poll_relaunch(slot, token, 300)
+
+    def _set_plant_status(self, plant_slot, status, error_rate, date):
+        if not hasattr(self, "table") or self.table is None:
+            return
+        table = self.table
+        sorting = table.isSortingEnabled()
+        table.setSortingEnabled(False)
+        plant_slot = os.path.abspath(plant_slot)
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            slot = getattr(item, "plant_slot", None) if item is not None else None
+            if not slot or os.path.abspath(slot) != plant_slot:
+                continue
+            for col, text in ((6, error_rate), (7, status), (8, date)):
+                cell = table.item(row, col)
+                if cell is None:
+                    continue
+                cell.setText("" if text is None else str(text))
+            break
+        table.setSortingEnabled(sorting)
+
+    def _point_plant_at_result(self, plant_slot, result_dir):
+        plant_slot = os.path.abspath(plant_slot)
+        if hasattr(self, "plant_dropdown") and self.plant_dropdown is not None:
+            combo = self.plant_dropdown
+            for i in range(combo.count()):
+                if self._slot_of_plant_path(combo.itemData(i)) == plant_slot:
+                    combo.setItemData(i, result_dir)
+                    break
+        if hasattr(self, "table") and self.table is not None:
+            table = self.table
+            sorting = table.isSortingEnabled()
+            table.setSortingEnabled(False)
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                slot = getattr(item, "plant_slot", None) if item is not None else None
+                if not slot or os.path.abspath(slot) != plant_slot:
+                    continue
+                for col in range(table.columnCount()):
+                    cell = table.item(row, col)
+                    if cell is None:
+                        continue
+                    cell.path = result_dir
+                    cell.plant_slot = plant_slot
+                break
+            table.setSortingEnabled(sorting)
+        self._clear_overlay_cache_for_path(result_dir)
+        if self._slot_of_plant_path(self.current_plant_path()) == plant_slot:
+            self.selected_plant = result_dir
+            self.update_image_labels()
+
+    def _poll_relaunch(self, plant_slot, token, ticks_left):
+        watches = getattr(self, "_relaunch_watches", {})
+        info = watches.get(plant_slot)
+        if not info or info.get("token") != token:
+            return
+        latest = get_latest_result_dir(plant_slot) or ""
+        latest_abs = os.path.abspath(latest) if latest else ""
+        baseline = info.get("baseline") or ""
+        switched = bool(latest_abs) and latest_abs != baseline
+        if switched and info.get("shown") != latest_abs:
+            info["shown"] = latest_abs
+            self._point_plant_at_result(plant_slot, latest)
+        if switched and not info.get("waiting_for_log"):
+            info["waiting_for_log"] = True
+            ticks_left = 6 * 3600 // 2
+        if switched and os.path.isfile(os.path.join(latest, "log.txt")):
+            date, error_rate = read_log_summary(os.path.join(latest, "log.txt"))
+            self._set_plant_status(plant_slot, "Finished", error_rate, date)
+            watches.pop(plant_slot, None)
+            self._clear_overlay_cache_for_path(latest)
+            if self._slot_of_plant_path(self.current_plant_path()) == plant_slot:
+                self.update_image_labels()
+            return
+        if ticks_left <= 0:
+            watches.pop(plant_slot, None)
+            if not switched and baseline and os.path.isfile(os.path.join(baseline, "log.txt")):
+                date, error_rate = read_log_summary(os.path.join(baseline, "log.txt"))
+                self._set_plant_status(plant_slot, "Finished", error_rate, date)
+            elif switched:
+                self._set_plant_status(plant_slot, "Not finished", "", "")
+            if self._slot_of_plant_path(self.current_plant_path()) == plant_slot:
+                self.update_image_labels()
+            return
+        delay = 2000 if switched else 1000
+        QtCore.QTimer.singleShot(
+            delay,
+            lambda slot=plant_slot, tok=token, left=ticks_left - 1: self._poll_relaunch(slot, tok, left),
+        )
 
     def repeatAnalysis(self):
         selected_rows = self.table.selectionModel().selectedRows()
@@ -1222,7 +1412,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         path = item.path
 
         metadata_path = os.path.join(path, "metadata.json")
+        relaunch_slot = self._slot_of_plant_path(path)
+        relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         pipeline_runner.run_analysis_rerun(metadata_path)
+        self._follow_relaunch(path, baseline=relaunch_baseline)
 
     def reviewPlant(self):
         self.selected_plant = self.current_plant_path()
@@ -2662,6 +2855,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.update_btn.setEnabled(True)
 
 def main():
+    install_gui_exception_hook()
     app = QtWidgets.QApplication(sys.argv)
     window = Ui_ChronoRootAnalysis()
     window.show()

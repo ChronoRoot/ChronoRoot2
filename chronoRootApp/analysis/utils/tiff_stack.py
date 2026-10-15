@@ -56,7 +56,9 @@ def tiff_n_frames(path):
     try:
         with Image.open(path) as image:
             return int(getattr(image, "n_frames", 1) or 1)
-    except OSError:
+    except (OSError, TypeError, ValueError):
+        # A redo writes this file as it goes. A half-written stack has no
+        # dimensions yet; treat that as "no pages" instead of failing the view.
         return 0
 
 
@@ -68,15 +70,18 @@ def read_tiff_page(path, idx, bgr=False):
     """
     if not path or not os.path.isfile(path):
         return None
-    with Image.open(path) as image:
-        n_frames = int(getattr(image, "n_frames", 1) or 1)
-        if idx < 0:
-            idx += n_frames
-        if idx < 0 or idx >= n_frames:
-            return None
-        image.seek(idx)
-        image.load()
-        arr = np.array(image)
+    try:
+        with Image.open(path) as image:
+            n_frames = int(getattr(image, "n_frames", 1) or 1)
+            if idx < 0:
+                idx += n_frames
+            if idx < 0 or idx >= n_frames:
+                return None
+            image.seek(idx)
+            image.load()
+            arr = np.array(image)
+    except (OSError, TypeError, ValueError):
+        return None
     return _normalize_page(arr, bgr=bgr)
 
 
