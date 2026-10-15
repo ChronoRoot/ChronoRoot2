@@ -18,7 +18,6 @@ Dependencies:
 
 import xml.etree.ElementTree as ET
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import json
 import os
@@ -54,7 +53,6 @@ from .time_windows import (
     resolved_time_groups,
     snapshot_hours as conf_snapshot_hours,
 )
-from .plot_time_axis import draw_snapshot_day_axis
 from .utils.report_paths import (
     MODULE_ANGLES,
     angle_overlays_dir,
@@ -75,7 +73,6 @@ from .stats_utils import (
     _stratify_label,
 )
 from .report_plots import emit_interval_comparison_plots, emit_temporal_comparison_plots
-from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 import cv2
 import logging
 
@@ -809,14 +806,17 @@ def getFirstLateralRoots(conf, df):
     its tip angle over a 72-hour window. Data is synchronized so that
     time=0 corresponds to first LR emergence for each plant.
     """
-    columns = ['Time', 'First LR tip', 'Experiment', 'Plant_id', 'Real']
+    columns = [
+        'Time', 'First LR tip', 'Experiment', 'Plant_id', 'Real',
+        'PlateCondition', 'ExtraVariable',
+    ]
     empty = pd.DataFrame(columns=columns)
     output_path = data_file(conf, 'Synchronized_FirstLR.csv')
     if df is None or df.empty or 'First LR tip' not in df.columns or 'Plant_id' not in df.columns:
         empty.to_csv(output_path, index=False)
         return empty
 
-    df = df.copy()
+    df = ensure_factor_columns(df)
     df['Real'] = 1
     plant_key = df['Plant_id'].astype(str)
 
@@ -854,7 +854,7 @@ def makeLateralAnglesPlots(conf):
     Generate all lateral root angle analysis plots and statistics.
     
     Main entry point for angle analysis. Loads data from all experiments,
-    generates violin plots for emergence angles, tracks first lateral roots,
+    writes the comparison-mode figures for emergence angles and first lateral roots,
     and performs statistical comparisons between experiments.
     
     Args:
@@ -958,40 +958,26 @@ def makeLateralAnglesPlots(conf):
             if not aux.empty:
                 frame.append(aux)
     
-    # Generate emergence angle plots
+    # One value per plant at each snapshot hour. Each hourly row is already
+    # the mean emergence angle of that plant's laterals.
     if len(frame) > 0:
         frame = pd.concat(frame)
         if not frame.empty:
-            n_exp = len(frame['Experiment'].unique())
-            geno_palette = genotype_palette_for_data(frame)
-            geno_label = get_genotype_axis_label(conf)
-
-            fig, ax = plt.subplots(figsize=(8, 9), dpi=200, constrained_layout=True)
-            sns.violinplot(
-                x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
-                hue='Experiment', inner=None, zorder=1, legend=False,
-                palette=geno_palette, ax=ax,
+            frame = ensure_factor_columns(frame)
+            frame['Mean emergence angle'] = pd.to_numeric(
+                frame['Mean emergence angle'], errors='coerce',
             )
-            sns.swarmplot(
-                x='ElapsedTime (h)', y='Mean emergence angle', data=frame,
-                hue='Experiment', dodge=True, size=4, palette=geno_palette,
-                edgecolor='black', linewidth=0.5, zorder=3, ax=ax,
-            )
-            ax.set_ylim(-20, 120)
-            
-            # Fix legend to only show experiments once
-            handles, labels = ax.get_legend_handles_labels()
-            ax.legend(handles[0:n_exp], labels[0:n_exp], loc=4, title=geno_label)
+            frame = frame.groupby(
+                ['Plant_id', 'ElapsedTime (h)', 'Experiment', 'PlateCondition', 'ExtraVariable'],
+                as_index=False,
+            )['Mean emergence angle'].mean()
 
-            ax.set_title('Mean emergence angle — by genotype')
-            draw_snapshot_day_axis(ax)
+            emergence_dir = metric_dir(conf, MODULE_ANGLES, emergence_slug)
+            for retired in (f'{emergence_slug}_violin.png', f'{emergence_slug}_violin.svg'):
+                retired_path = os.path.join(emergence_dir, retired)
+                if os.path.isfile(retired_path):
+                    os.remove(retired_path)
 
-            plt.savefig(plot_file(conf, MODULE_ANGLES, emergence_slug, f'{emergence_slug}_violin.png'),
-                       dpi=300, bbox_inches='tight')
-            plt.savefig(plot_file(conf, MODULE_ANGLES, emergence_slug, f'{emergence_slug}_violin.svg'),
-                       dpi=300, bbox_inches='tight')
-            
-            # Perform statistical analysis
             performStatisticalAnalysisAngles(conf, frame, 'Mean emergence angle')
 
             # Generate summary table
@@ -1013,30 +999,16 @@ def makeLateralAnglesPlots(conf):
     if synchronized_data.empty:
         print("Warning: No data available for First Lateral Root plots. Skipping.")
     else:
-        # The separate decay figure is the same mean curve as the standard
-        # genotype timeline. It is no longer written.
+        # Standalone decay and count figures repeat the comparison-mode plots.
         decay_dir = metric_dir(conf, MODULE_ANGLES, first_lr_slug)
-        for retired in (f'{first_lr_slug}_decay.png', f'{first_lr_slug}_decay.svg'):
+        for retired in (
+            f'{first_lr_slug}_decay.png', f'{first_lr_slug}_decay.svg',
+            f'{first_lr_slug}_count.png', f'{first_lr_slug}_count.svg',
+        ):
             retired_path = os.path.join(decay_dir, retired)
             if os.path.isfile(retired_path):
                 os.remove(retired_path)
 
-        # Plot number of plants with first LR over time
-        plt.figure(figsize=(6, 4), dpi=200)
-        geno_palette = genotype_palette_for_data(synchronized_data)
-        geno_label = get_genotype_axis_label(conf)
-        sns.lineplot(y="Real", x='Time', hue="Experiment", data=synchronized_data,
-                    errorbar=None, estimator=np.count_nonzero, palette=geno_palette)
-        plt.title('First lateral root — number of plants per experiment')
-        plt.ylabel('Number of first LR')
-        plt.xlabel('Time elapsed since emergence (h)')
-        plt.legend(title=geno_label)
-        
-        plt.savefig(plot_file(conf, MODULE_ANGLES, first_lr_slug, f'{first_lr_slug}_count.png'),
-                   dpi=300, bbox_inches='tight')
-        plt.savefig(plot_file(conf, MODULE_ANGLES, first_lr_slug, f'{first_lr_slug}_count.svg'),
-                   dpi=300, bbox_inches='tight')
-        
         # Remove extended (non-real) data points for angle analysis
         synchronized_data.dropna(inplace=True)
 

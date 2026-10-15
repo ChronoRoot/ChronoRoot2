@@ -174,23 +174,11 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
     return kwargs
 
 
-def _violin_with_swarm(ax, data, x_col, y_col, hue_col, conf):
-    palette = _palette_kwargs(data, hue_col, conf)
+def _violin(ax, data, x_col, y_col, hue_col, conf):
+    """Distribution only. Plant counts are a separate figure, not points on the violin."""
     sns.violinplot(
         data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
-        inner=None, zorder=1, **palette,
-    )
-    sns.swarmplot(
-        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
-        dodge=True, size=3, zorder=3, legend=False, **palette,
-    )
-
-
-def _overlay_swarm(g, x_col, y_col, hue_col, conf):
-    palette = _palette_kwargs(g.data, hue_col, conf)
-    g.map_dataframe(
-        sns.swarmplot, x=x_col, y=y_col, hue=hue_col,
-        dodge=True, size=3, zorder=3, legend=False, **palette,
+        inner=None, **_palette_kwargs(data, hue_col, conf),
     )
 
 
@@ -490,7 +478,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
 def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
                                    x_col='Day', module=None, metric_slug_name=None,
                                    analysis_type='interval', metric_label=None):
-    """Violin/swarm plot for interval-based metrics (convex hull, angles)."""
+    """Violin for one comparison mode, plus a companion count of plants."""
     data = ensure_factor_columns(data)
 
     spec = _mode_spec(mode, conf=conf)
@@ -502,50 +490,50 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
     try:
         if mode == 'by_genotype':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-            _violin_with_swarm(ax, data, x_col, metric, 'Experiment', conf)
+            _violin(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
         elif mode == 'genotype_by_plate':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'PlateCondition', conf, 'violin'))
-            _overlay_swarm(g, x_col, metric, 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='PlateCondition')
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'genotype_by_extra':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'ExtraVariable', conf, 'violin'))
-            _overlay_swarm(g, x_col, metric, 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='ExtraVariable')
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'by_plate_condition':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-            _violin_with_swarm(ax, data, x_col, metric, 'PlateCondition', conf)
+            _violin(ax, data, x_col, metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='PlateCondition')
         elif mode == 'by_extra_variable':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-            _violin_with_swarm(ax, data, x_col, metric, 'ExtraVariable', conf)
+            _violin(ax, data, x_col, metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='ExtraVariable')
         elif mode == 'plate_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'PlateCondition', 'Experiment', conf, 'violin'))
-            _overlay_swarm(g, x_col, metric, 'PlateCondition', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='PlateCondition', facet_col='Experiment')
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'extra_within_genotype':
             g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'ExtraVariable', 'Experiment', conf, 'violin'))
-            _overlay_swarm(g, x_col, metric, 'ExtraVariable', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='ExtraVariable', facet_col='Experiment')
             _decorate_snapshot_grid(g, x_col, title=title)
             g.savefig(output_path, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         else:
             return False
@@ -553,6 +541,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
         _decorate_snapshot_grid(ax, x_col)
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close('all')
+        _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
     except Exception:
         plt.close('all')

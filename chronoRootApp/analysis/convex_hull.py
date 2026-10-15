@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 import os
 import numpy as np
@@ -20,7 +19,6 @@ from analysis.utils.tiff_stack import (
     result_frame_names,
     tiff_n_frames,
 )
-from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 from analysis.time_windows import (
     closest_timed_path,
     datetime_from_filename,
@@ -30,7 +28,6 @@ from analysis.time_windows import (
     resolved_time_groups,
     snapshot_hours as conf_snapshot_hours,
 )
-from analysis.plot_time_axis import draw_snapshot_day_axis
 from analysis.utils.report_paths import (
     MODULE_CONVEX,
     metric_slug,
@@ -552,7 +549,7 @@ def visualize_combined_atlases(conf):
 
 
 def plot_hull_metrics_summary(conf, frame):
-    """Generates per-metric violin plots and overview summary CSV."""
+    """Overview summary CSV. Comparison figures are written per metric afterwards."""
     plt.ioff()
 
     metrics_config = [
@@ -564,26 +561,11 @@ def plot_hull_metrics_summary(conf, frame):
         ('Convex Hull Height', 'Height', 'Height (mm)', False),
     ]
 
-    geno_palette = genotype_palette_for_data(frame)
-    geno_label = get_genotype_axis_label(conf)
-
-    for y_col, title, y_label, filter_zeros in metrics_config:
+    for y_col, _title, _y_label, _filter_zeros in metrics_config:
         slug = metric_slug(y_col)
-        plt.figure()
-        plot_data = frame.copy()
-        if filter_zeros:
-            plot_data = plot_data[plot_data[y_col] > 0].reset_index(drop=True)
-
-        sns.violinplot(x='ElapsedTime (h)', y=y_col, data=plot_data, hue='Experiment', inner='quartile',
-                       palette=geno_palette)
-        plt.title(f'{y_col} — {title}')
-        plt.ylabel(y_label)
-        draw_snapshot_day_axis(plt.gca())
-        leg = plt.gca().get_legend()
-        if leg is not None:
-            leg.set_title(geno_label)
-        plt.savefig(plot_file(conf, MODULE_CONVEX, slug, f'{slug}_violin.png'), dpi=300, bbox_inches='tight')
-        plt.close('all')
+        retired = plot_file(conf, MODULE_CONVEX, slug, f'{slug}_violin.png')
+        if os.path.isfile(retired):
+            os.remove(retired)
 
     numeric_cols = [c for c, *_ in metrics_config]
     summary = frame.groupby(['ElapsedTime (h)', 'Experiment'])[numeric_cols].agg(['mean', 'std']).round(3)
