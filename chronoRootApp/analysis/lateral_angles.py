@@ -323,51 +323,326 @@ def matching(new_starts, all_new_points, old_starts, all_old_points, old_names, 
     return matched_starts, matched_points, matched_names, num_roots
 
 
+# A lateral is the same root while its base stays within this distance.
+# The previous tip only decides which of those nearby lines is the continuation.
+BASE_MATCH_PX = 20.0
+SUFFIX_TOL_PX = 8.0
+CONFIRM_FRAMES = 3
+_DBG_COUNT = {"C": 0, "D": 0, "E": 0}
+
+
+def _dbg(hypothesis_id, message, data):
+    # region agent log
+    try:
+        import json
+        import time
+        if _DBG_COUNT.get(hypothesis_id, 0) >= 30:
+            return
+        _DBG_COUNT[hypothesis_id] = _DBG_COUNT.get(hypothesis_id, 0) + 1
+        record = {
+            "sessionId": "f465cf",
+            "runId": "post-fix",
+            "hypothesisId": hypothesis_id,
+            "location": "lateral_angles.py:update_lateral_tracks",
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(
+            "/home/IPS2/rgaggio/.local/chronoroot/ChronoRoot2/.cursor/debug-f465cf.log",
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+    # endregion
+
+
+def readPolyline(root_element):
+    """Points of one RSML root, ordered from its base toward its tip."""
+    if root_element is None:
+        return []
+    for child in root_element:
+        tag = child.tag.split("}", 1)[-1]
+        if tag != "geometry":
+            continue
+        for geometry in child:
+            if geometry.tag.split("}", 1)[-1] != "polyline":
+                continue
+            points = []
+            for point in geometry:
+                if point.tag.split("}", 1)[-1] != "point":
+                    continue
+                points.append([int(float(point.attrib["x"])), int(float(point.attrib["y"]))])
+            return points
+    return []
+
+
+def extendLateral(element, parent_points, previous_points, other_bases):
+    """Append one child when it is the forward piece of the same lateral.
+
+    A new junction splits yesterday's polyline. The part beyond the junction
+    is stored as a child, and it is a subset of the line we already followed.
+    That child is added only when it is the only one that continues toward
+    the previous tip, it does not fold back to its own base, and it does not
+    run through the base of another lateral.
+    """
+    if previous_points is None or parent_points is None or len(parent_points) < 2:
+        return parent_points
+    if len(previous_points) < 2:
+        return parent_points
+
+    # Which children start at the current end and then follow the old line forward?
+    continuing = []
+    parent_end = np.asarray(parent_points[-1], dtype=float)
+    previous = np.asarray(previous_points, dtype=float)
+    for child in element:
+        if child.tag.split("}", 1)[-1] != "root":
+            continue
+        child_points = readPolyline(child)
+        if len(child_points) < 2:
+            continue
+        if float(np.hypot(child_points[0][0] - parent_end[0], child_points[0][1] - parent_end[1])) > 3.0:
+            continue
+        end_distances = np.linalg.norm(previous - parent_end, axis=1)
+        split_at = int(np.argmin(end_distances))
+        if float(end_distances[split_at]) > SUFFIX_TOL_PX or split_at >= len(previous_points) - 1:
+            continue
+        # Walk the child along the old suffix. Growth past the old tip is allowed
+        # only after that suffix has been covered.
+        suffix = previous_points[split_at:]
+        cursor = 0
+        furthest = 0
+        follows = True
+        for point in child_points:
+            while cursor + 1 < len(suffix):
+                here = np.hypot(point[0] - suffix[cursor][0], point[1] - suffix[cursor][1])
+                nxt = np.hypot(point[0] - suffix[cursor + 1][0], point[1] - suffix[cursor + 1][1])
+                if nxt > here:
+                    break
+                cursor += 1
+            near_cursor = np.hypot(point[0] - suffix[cursor][0], point[1] - suffix[cursor][1]) <= SUFFIX_TOL_PX
+            if near_cursor:
+                furthest = max(furthest, cursor)
+            elif furthest < len(suffix) - 1:
+                follows = False
+                break
+        if not follows:
+            continue
+        covered = 0.0
+        for step in range(1, furthest + 1):
+            covered += float(np.hypot(
+                suffix[step][0] - suffix[step - 1][0],
+                suffix[step][1] - suffix[step - 1][1],
+            ))
+        if covered >= 5.0:
+            continuing.append(child_points)
+
+    # Two forward children means a real branch. Keep the order-1 piece only.
+    if len(continuing) != 1:
+        return parent_points
+    child_points = continuing[0]
+    own_base = parent_points[0]
+    # A line that returns to its own base, or that reaches another lateral, is a loop.
+    returns = False
+    for point in child_points[1:]:
+        if np.hypot(point[0] - own_base[0], point[1] - own_base[1]) <= 12.0:
+            returns = True
+            break
+    if returns:
+        return parent_points
+    if np.hypot(child_points[0][0] - parent_end[0], child_points[0][1] - parent_end[1]) <= 3.0:
+        merged = parent_points + child_points[1:]
+    else:
+        merged = parent_points + child_points
+    for base in other_bases:
+        if np.hypot(base[0] - own_base[0], base[1] - own_base[1]) <= 6.0:
+            continue
+        for point in merged:
+            if np.hypot(point[0] - base[0], point[1] - base[1]) <= 6.0:
+                return parent_points
+    return merged
+
+
+def update_lateral_tracks(elements, tracks, next_id):
+    """Follow each lateral from its base through the current frame.
+
+    Several order-1 lines can sit near the same base when the skeleton splits
+    one root. The line that still passes by the previous tip is the same root.
+    A line is refused when its base has moved up, its tip has moved up, or its
+    length jumps by more than 40 px. The refusal is forgotten if a later frame
+    reaches the tip again, so the note under the figure describes the event
+    that actually ended the series.
+    """
+    # Current order-1 laterals. Each polyline already runs from base to tip.
+    observations = []
+    for element in elements or []:
+        points = readPolyline(element)
+        if len(points) >= 2:
+            observations.append({"element": element, "points": points, "base": points[0]})
+    other_bases = [item["base"] for item in observations]
+
+    # Candidate pairs: base within 20 px. Sort so the line closest to the
+    # previous tip is tried first, and the closest base breaks a tie.
+    pairs = []
+    for track_index, track in enumerate(tracks):
+        remembered_points = track.get("points") or []
+        old_tip = remembered_points[-1] if remembered_points else None
+        for obs_index, obs in enumerate(observations):
+            base_distance = float(np.hypot(
+                obs["base"][0] - track["base"][0],
+                obs["base"][1] - track["base"][1],
+            ))
+            if base_distance > BASE_MATCH_PX:
+                continue
+            if old_tip is None:
+                tip_distance = 0.0
+            else:
+                arr = np.asarray(obs["points"], dtype=float)
+                tip_distance = float(np.min(np.linalg.norm(
+                    arr - np.asarray(old_tip, dtype=float), axis=1
+                )))
+            pairs.append((tip_distance, base_distance, track_index, obs_index))
+    pairs.sort()
+
+    used_tracks = set()
+    used_obs = set()
+    for _tip_distance, _base_distance, track_index, obs_index in pairs:
+        if track_index in used_tracks or obs_index in used_obs:
+            continue
+        used_tracks.add(track_index)
+        used_obs.add(obs_index)
+        track = tracks[track_index]
+        obs = observations[obs_index]
+        merged = extendLateral(obs["element"], obs["points"], track.get("points"), other_bases)
+        remembered = lenRoot(track.get("points"), pixel_size=1)
+        raw_len = lenRoot(obs["points"], pixel_size=1)
+        merged_len = lenRoot(merged, pixel_size=1)
+        # Image y grows downward, so a smaller y is higher on the plate.
+        moved_up = obs["base"][1] + 6 < track["base"][1]
+        jumped = remembered > 0.0 and merged_len > remembered + 40.0
+        shortened = remembered > 0.0 and merged_len < 0.8 * remembered
+        old_tip = (track.get("points") or [[0, 0]])[-1]
+        new_tip = merged[-1] if merged else old_tip
+        tip_up = new_tip[1] + 15 < old_tip[1]
+        # region agent log
+        if jumped:
+            _dbg("C", "length jump", {
+                "track": track["id"],
+                "remembered_px": round(remembered, 1),
+                "raw_px": round(raw_len, 1),
+                "merged_px": round(merged_len, 1),
+                "appended": len(merged) > len(obs["points"]) + 2,
+                "accepted": False,
+            })
+        if moved_up:
+            _dbg("D", "base moved up", {
+                "track": track["id"],
+                "track_y": track["base"][1],
+                "obs_y": obs["base"][1],
+                "accepted": False,
+            })
+        if tip_up:
+            _dbg("E", "tip moved up", {
+                "track": track["id"],
+                "old_tip_y": old_tip[1],
+                "new_tip_y": new_tip[1],
+                "accepted": False,
+            })
+        # endregion
+        if tip_up or moved_up:
+            track["present"] = False
+            track["stop_reason"] = "We cannot get to the last tip from the base."
+        elif jumped:
+            track["present"] = False
+            track["stop_reason"] = "The length changed too fast to be the same root."
+        elif shortened:
+            # A short fragment of the same root. Skip the frame and keep the last tip.
+            track["present"] = False
+        else:
+            track["points"] = merged
+            track["stop_reason"] = None
+            track["streak"] += 1
+            track["present"] = True
+            if track["streak"] >= CONFIRM_FRAMES:
+                track["real"] = True
+
+    # A missed frame breaks the confirmation streak. A root already confirmed
+    # is kept so a later frame can join it again.
+    for track_index, track in enumerate(tracks):
+        if track_index not in used_tracks:
+            track["present"] = False
+            track["streak"] = 0
+    kept = []
+    for track in tracks:
+        if track["present"] or track["real"]:
+            kept.append(track)
+    for obs_index, obs in enumerate(observations):
+        if obs_index in used_obs:
+            continue
+        kept.append({
+            "id": next_id,
+            "base": obs["base"],
+            "points": obs["points"],
+            "streak": 1,
+            "present": True,
+            "real": False,
+            "born": None,
+            "history": [],
+            "stop_reason": None,
+        })
+        next_id += 1
+    return kept, next_id
+
+
+def select_first_lateral(tracks):
+    """Earliest root present for three frames that reaches 1 mm. Higher base breaks a tie."""
+    real = []
+    for track in tracks:
+        if not track["real"]:
+            continue
+        max_mm = max((item["length_mm"] for item in track["history"]), default=0.0)
+        if max_mm < 1.0:
+            continue
+        real.append(track)
+    if not real:
+        return None
+    real.sort(key=lambda track: (track["born"], track["base"][1], track["id"]))
+    chosen = real[0]
+    # region agent log
+    max_mm = max((item["length_mm"] for item in chosen["history"]), default=0)
+    _dbg("A", "selected first lateral", {
+        "id": chosen["id"],
+        "born": chosen["born"],
+        "max_mm": max_mm,
+        "base_y": chosen["base"][1],
+        "n": len(chosen["history"]),
+        "stop": chosen.get("stop_reason"),
+    })
+    # endregion
+    return chosen
+
+
 def lenRoot(points, pixel_size=0.04):
-    """
-    Calculate the total length of a root polyline in millimeters.
-
-    Sums the Euclidean distances between consecutive points and converts
-    from pixels to millimeters using the pixel size.
-
-    Args:
-        points: List of [x, y] coordinate pairs defining the root
-        pixel_size: Size of each pixel in mm
-
-    Returns:
-        float: Total root length in mm
-    """
-    # Convert to numpy array for vectorized operations
-    points_array = np.array(points)
-    
-    # Calculate differences between consecutive points
-    diffs = np.diff(points_array, axis=0)
-    
-    # Calculate segment lengths and sum
-    segment_lengths = np.linalg.norm(diffs, axis=1)
-    total_length = np.sum(segment_lengths) * pixel_size
-    
-    return total_length
+    """Total length of a root polyline in millimeters."""
+    if points is None or len(points) < 2:
+        return 0.0
+    arr = np.asarray(points, dtype=float)
+    return float(np.sum(np.linalg.norm(np.diff(arr, axis=0), axis=1))) * pixel_size
 
 
 def getAngles(conf, path):
     """
     Extract and save angle measurements for all lateral roots in a time series.
-    
-    Reads the plant's RSML sequence (or legacy per-frame files), tracks lateral
-    roots across frames, and calculates tip and emergence angles. Laterals shorter than half
-    the configured emergence distance are left out of the mean angles. The first
-    tracked root is always measured, including while it is still short.
 
-    Results are saved to LateralRootsData.csv. The first root's polyline on each
-    frame is saved to FirstLRTrack.json for the 72-hour zoom figure.
+    Direct laterals are followed by their base. One child polyline is appended
+    only when it continues the previous root. The first lateral is the earliest
+    root present for three consecutive frames. A frame where that root is absent
+    does not repeat its old geometry.
 
-    Args:
-        conf: Configuration dictionary containing 'emergenceDistance' parameter
-        path: Path to the analysis results folder containing RSML subfolder
-
-    Returns:
-        None (writes LateralRootsData.csv and FirstLRTrack.json)
+    Results are saved to LateralRootsData.csv. The first root's observed
+    polylines are saved to FirstLRTrack.json.
     """
     images = pd.read_csv(os.path.join(path, "FilesAfterPostprocessing.csv"))
     images.dropna(inplace=True)
@@ -383,95 +658,97 @@ def getAngles(conf, path):
         if image_name in rsml_index:
             selected.append(image_name)
 
-    lateral_roots = []
-    lateral_root_starts = []
-    lateral_root_names = []
-    num_roots = 0
-    
-    filepath = os.path.join(path, 'LateralRootsData.csv')
+    tracks = []
+    next_id = 0
+    frame_rows = []
+    _DBG_COUNT["C"] = 0
+    _DBG_COUNT["D"] = 0
+    _DBG_COUNT["E"] = 0
+    _DBG_COUNT["A"] = 0
 
+    filepath = os.path.join(path, 'LateralRootsData.csv')
     metadata = load_result_metadata(path)
     pixel_size = metadata['pixel_size']
     emergence_mm = float(conf['emergenceDistance'])
     min_length_mm = 0.5 * emergence_mm
 
-    # Kept across frames so a picture with no lateral elements repeats the
-    # last measurement, as the tracker itself does.
-    measured_tips = []
-    measured_emergences = []
-    first_tip = None
-    first_emergence = None
-    first_lr_frames = []
-
-    with open(filepath, 'w+') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Img", "Number of lateral roots", "Mean tip angle", 
-                        "Mean emergence angle", "First LR tip", "First LR emergence"])
-
-        for imgname in selected:
-            main_root = main_root_of(rsml_index.get(imgname))
-            lateral_root_elements = direct_lateral_roots(main_root)
-
-            # Check if lateral roots exist (more than just primary root)
-            if lateral_root_elements:
-                
-                points_list = []
-                start_points = []
-
-                # First: perform tracking of lateral roots. Short roots stay
-                # in the track so they can be followed once they grow.
-                for lr_element in lateral_root_elements:
-                    points = traverse_root(lr_element, is_lateral_root=True)
-                    points_list.append(points)
-                    start_points.append(points[0])
-
-                lateral_root_starts, lateral_roots, lateral_root_names, num_roots = matching(
-                    start_points, points_list, 
-                    lateral_root_starts, lateral_roots, lateral_root_names, 
-                    num_roots
+    for frame_index, imgname in enumerate(selected):
+        main_root = main_root_of(rsml_index.get(imgname))
+        lateral_root_elements = direct_lateral_roots(main_root)
+        tracks, next_id = update_lateral_tracks(lateral_root_elements, tracks, next_id)
+        measured_tips = []
+        measured_emergences = []
+        for track in tracks:
+            if track["born"] is None:
+                track["born"] = frame_index
+            if not track["present"]:
+                continue
+            length_mm = float(lenRoot(track["points"], pixel_size))
+            record = {
+                "img": imgname,
+                "points": [[int(p[0]), int(p[1])] for p in track["points"]],
+                "length_mm": round(length_mm, 3),
+            }
+            track["history"].append(record)
+            if length_mm >= min_length_mm:
+                measured_tips.append(float(tipAngle(track["points"])))
+                measured_emergences.append(
+                    float(emergenceAngle(track["points"], emergence_mm, pixel_size))
                 )
-                
-                # Means use only laterals at least half the emergence distance.
-                # The first tracked root is always recorded, even while short.
-                measured_tips = []
-                measured_emergences = []
-                first_tip = None
-                first_emergence = None
+        frame_rows.append((imgname, measured_tips, measured_emergences))
 
-                for root in lateral_roots:
-                    length_mm = float(lenRoot(root, pixel_size))
-                    tip_angle = float(tipAngle(root))
-                    emergence_angle = float(emergenceAngle(root, emergence_mm, pixel_size))
-                    if first_tip is None:
-                        first_tip = tip_angle
-                        first_emergence = emergence_angle
-                        first_lr_frames.append({
-                            'img': imgname,
-                            'points': [[int(p[0]), int(p[1])] for p in root],
-                            'length_mm': round(length_mm, 3),
-                        })
-                    if length_mm >= min_length_mm:
-                        measured_tips.append(tip_angle)
-                        measured_emergences.append(emergence_angle)
+    first = select_first_lateral(tracks)
+    by_image = {}
+    if first is not None:
+        for record in first["history"]:
+            by_image[record["img"]] = record
 
-            if num_roots == 0 or first_tip is None:
-                measures = [imgname, 0, 0, 0, 0, 0]
+    with open(filepath, 'w+') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Img", "Number of lateral roots", "Mean tip angle",
+                         "Mean emergence angle", "First LR tip", "First LR emergence"])
+        for imgname, measured_tips, measured_emergences in frame_rows:
+            record = by_image.get(imgname)
+            if record is None:
+                first_tip = 0
+                first_emergence = 0
             else:
-                if measured_tips:
-                    mean_tip = round(float(np.mean(measured_tips)), 3)
-                    mean_emergence = round(float(np.mean(measured_emergences)), 3)
-                else:
-                    mean_tip = 0
-                    mean_emergence = 0
-                measures = [imgname, len(measured_tips), mean_tip, mean_emergence,
-                            round(first_tip, 3), round(first_emergence, 3)]
-            writer.writerow(measures)
+                first_tip = round(float(tipAngle(record["points"])), 3)
+                first_emergence = round(
+                    float(emergenceAngle(record["points"], emergence_mm, pixel_size)), 3
+                )
+            if measured_tips:
+                mean_tip = round(float(np.mean(measured_tips)), 3)
+                mean_emergence = round(float(np.mean(measured_emergences)), 3)
+            else:
+                mean_tip = 0
+                mean_emergence = 0
+            writer.writerow([
+                imgname, len(measured_tips), mean_tip, mean_emergence,
+                first_tip, first_emergence,
+            ])
 
     track_path = os.path.join(path, 'FirstLRTrack.json')
+    frames = [] if first is None else list(first["history"])
+    stop_reason = None
+    if first is not None and frames and selected:
+        born_time = datetime_from_filename(frames[0]["img"])
+        last_time = datetime_from_filename(frames[-1]["img"])
+        series_end = datetime_from_filename(selected[-1])
+        if born_time and last_time and series_end:
+            if last_time < born_time + pd.Timedelta(hours=72) and last_time + pd.Timedelta(hours=2) < series_end:
+                stop_reason = first.get("stop_reason") or "The root was no longer visible."
+            elif series_end < born_time + pd.Timedelta(hours=72):
+                stop_reason = "End of the recording."
     with open(track_path, 'w') as track_file:
-        json.dump({'frames': first_lr_frames}, track_file)
-
+        json.dump({
+            'root': None if first is None else first["id"],
+            'born': None if not frames else frames[0]["img"],
+            'stop_reason': stop_reason,
+            'frames': frames,
+        }, track_file)
     return
+
 
 
 def dataWork(df, t0, start=None, end=None):
@@ -964,25 +1241,6 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
     return ax
 
 
-def _overlay_tip_angle(ax, points):
-    """Draw the tip-angle chord on ax. Return degrees, or None if undefined."""
-    if points is None or len(points) < 2:
-        return None
-    start = np.asarray(points[0], dtype=float)
-    end = np.asarray(points[-1], dtype=float)
-    if start.shape != (2,) or end.shape != (2,):
-        return None
-    if not np.isfinite(start).all() or not np.isfinite(end).all():
-        return None
-    if float(np.hypot(end[0] - start[0], end[1] - start[1])) == 0.0:
-        return None
-    angle = float(tipAngle(points))
-    if not np.isfinite(angle):
-        return None
-    plotAngles(ax, points, angle, tip=True)
-    return angle
-
-
 def render_plant_angle_figures(job):
     """Draw one plant's angle overlays and first-lateral 72 h zoom.
 
@@ -1058,7 +1316,6 @@ def render_plant_angle_figures(job):
 
         bbox = get_bounding_box(metadata)
         crop = cv2.imread(overlay_image)[bbox[0]:bbox[1], bbox[2]:bbox[3]]
-
         last_name = os.path.basename(overlay_image).replace('.png', '.rsml')
         rsml_path = os.path.join(results_path, 'RSML', last_name)
         emergence_mm = float(conf['emergenceDistance'])
@@ -1105,12 +1362,14 @@ def render_plant_angle_figures(job):
             stamped.append((ts, entry))
 
         window = []
-        if stamped:
-            t0 = min(ts for ts, _entry in stamped)
+        record_start = datetime_from_filename(images[0])
+        if stamped and record_start is not None:
+            born_time = min(ts for ts, _entry in stamped)
             for ts, entry in stamped:
-                hours = (ts - t0).total_seconds() / 3600.0
-                if 0 <= hours <= 72:
-                    window.append((hours, entry))
+                hours_from_birth = (ts - born_time).total_seconds() / 3600.0
+                if 0 <= hours_from_birth <= 72:
+                    hours_from_start = (ts - record_start).total_seconds() / 3600.0
+                    window.append((hours_from_birth, hours_from_start, entry))
             window.sort(key=lambda item: item[0])
 
         chosen = []
@@ -1124,10 +1383,30 @@ def render_plant_angle_figures(job):
                     chosen.append(window[nearest])
 
         if chosen:
-            fig, axes = plt.subplots(2, 4, figsize=(12, 6), dpi=150, constrained_layout=True)
+            fig, axes = plt.subplots(2, 4, figsize=(12, 7), dpi=150, constrained_layout=True)
+            born_name = track.get("born") or chosen[0][1].get("img")
+            born_stamp = datetime_from_filename(born_name or "")
+            if born_stamp is not None and record_start is not None:
+                born_hours = (born_stamp - record_start).total_seconds() / 3600.0
+                born_text = born_stamp.strftime("%Y-%m-%d %H:%M") + f" ({born_hours:.0f} h)"
+            else:
+                born_text = born_name or ""
+            fig.suptitle(f"{label}\nFirst lateral born {born_text}", fontsize=12)
             axes_flat = list(np.ravel(axes))
             drawn = 0
-            for ax, (hours, entry) in zip(axes_flat, chosen):
+            # One wider crop for the whole series, so the surrounding plant stays visible.
+            all_pts = np.vstack([
+                np.asarray(entry['points'], dtype=float)
+                for _hours_from_birth, _hours, entry in chosen
+            ])
+            minx, miny = all_pts.min(axis=0)
+            maxx, maxy = all_pts.max(axis=0)
+            pad = max(280, int(round(2.0 * max(maxx - minx, maxy - miny, 1))))
+            x1 = max(0, int(np.floor(minx)) - pad)
+            y1 = max(0, int(np.floor(miny)) - pad)
+            x2 = int(np.ceil(maxx)) + pad + 1
+            y2 = int(np.ceil(maxy)) + pad + 1
+            for ax, (hours_from_birth, _hours_from_start, entry) in zip(axes_flat, chosen):
                 image_path = os.path.join(video_dir, os.path.basename(entry['img']))
                 full = cv2.imread(image_path)
                 if full is None:
@@ -1138,41 +1417,59 @@ def render_plant_angle_figures(job):
                 if panel.size == 0 or pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
                     ax.axis('off')
                     continue
-                minx, miny = pts.min(axis=0)
-                maxx, maxy = pts.max(axis=0)
-                pad = max(20, int(round(0.2 * max(maxx - minx, maxy - miny, 1))))
-                x1 = max(0, int(np.floor(minx)) - pad)
-                y1 = max(0, int(np.floor(miny)) - pad)
-                x2 = min(panel.shape[1], int(np.ceil(maxx)) + pad + 1)
-                y2 = min(panel.shape[0], int(np.ceil(maxy)) + pad + 1)
-                if x2 <= x1 or y2 <= y1:
+                cx1 = x1
+                cy1 = y1
+                cx2 = min(panel.shape[1], x2)
+                cy2 = min(panel.shape[0], y2)
+                if cx2 <= cx1 or cy2 <= cy1:
                     ax.axis('off')
                     continue
-                zoom = panel[y1:y2, x1:x2]
+                zoom = panel[cy1:cy2, cx1:cx2]
                 if zoom.size == 0:
                     ax.axis('off')
                     continue
                 ax.imshow(cv2.cvtColor(zoom, cv2.COLOR_BGR2RGB))
                 shifted = pts.copy()
-                shifted[:, 0] -= x1
-                shifted[:, 1] -= y1
+                shifted[:, 0] -= cx1
+                shifted[:, 1] -= cy1
                 ax.plot(shifted[:, 0], shifted[:, 1], color='#ff2d2d', linewidth=2)
-                angle = _overlay_tip_angle(ax, shifted)
+                # Tip chord on this panel. Hours here are since this lateral emerged.
+                angle = None
+                if len(shifted) >= 2:
+                    start = shifted[0]
+                    end = shifted[-1]
+                    if np.isfinite(start).all() and np.isfinite(end).all():
+                        if float(np.hypot(end[0] - start[0], end[1] - start[1])) > 0.0:
+                            angle = float(tipAngle(shifted))
+                            if np.isfinite(angle):
+                                plotAngles(ax, shifted, angle, tip=True)
+                            else:
+                                angle = None
                 length_mm = float(entry.get('length_mm', 0) or 0)
-                title = f'{hours:.1f} h\n{length_mm:.1f} mm'
-                if angle is not None:
-                    title = f'{title}\n{angle:.1f}°'
+                if angle is None:
+                    title = f'{hours_from_birth:.1f} h\n{length_mm:.1f} mm'
+                else:
+                    title = f'{hours_from_birth:.1f} h\n{length_mm:.1f} mm - {angle:.1f}°'
                 ax.set_title(title, fontsize=9)
                 ax.axis('off')
                 drawn += 1
             for ax in axes_flat[len(chosen):]:
                 ax.axis('off')
+            reason = track.get("stop_reason")
+            if drawn and reason:
+                fig.text(0.5, 0.01, reason, ha="center", fontsize=10)
             if drawn:
                 zoom_name = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h.png"
                 zoom_dir = job.get('first_lr_save_path') or save_path
                 os.makedirs(zoom_dir, exist_ok=True)
                 fig.savefig(os.path.join(zoom_dir, zoom_name), dpi=150, bbox_inches='tight')
             plt.close(fig)
+        else:
+            zoom_name = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h.png"
+            zoom_dir = job.get('first_lr_save_path') or save_path
+            stale = os.path.join(zoom_dir, zoom_name)
+            if os.path.isfile(stale):
+                os.remove(stale)
 
         return label, True, ''
     except Exception as exc:
