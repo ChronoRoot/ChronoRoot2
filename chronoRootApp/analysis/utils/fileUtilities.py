@@ -53,15 +53,28 @@ def convertFromPathSafe(name):
     return name
 
 
+def result_dir_index(path):
+    """Numeric suffix of a Results_<n> directory, or None."""
+    match = re.fullmatch(r'Results_(\d+)', os.path.basename(os.path.normpath(path or '')))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def list_result_dirs(plant_path):
-    """Return all Results_* directories under a plant slot, naturally sorted."""
+    """Return Results_<n> directories under a plant slot, lowest index first."""
     if not plant_path or not os.path.isdir(plant_path):
         return []
-    return loadPath(plant_path, 'Results_*')
+    found = []
+    for path in loadPath(plant_path, 'Results_*'):
+        if os.path.isdir(path) and result_dir_index(path) is not None:
+            found.append(path)
+    found.sort(key=result_dir_index)
+    return found
 
 
 def get_latest_result_dir(plant_path):
-    """Return the latest Results_* folder for a plant slot, or None."""
+    """Return the highest-numbered Results_<n> folder for a plant slot, or None."""
     results = list_result_dirs(plant_path)
     return results[-1] if results else None
 
@@ -158,12 +171,21 @@ def createSaveFolder(conf):
     plant_path = os.path.join(cam_path, plant)
     os.makedirs(plant_path, exist_ok=True)
     
-    # Create the folder for the results
-    for j in range(0, 50):
-        result_path = os.path.join(plant_path, 'Results_%s'%j)
+    # Always take the next index after the highest Results_<n> already
+    # present. Reusing a lower free number (Results_0 while Results_2 still
+    # exists) makes the new run invisible: the app treats the highest index
+    # as the current one.
+    next_index = 0
+    for result_dir in list_result_dirs(plant_path):
+        number = result_dir_index(result_dir)
+        if number is not None:
+            next_index = max(next_index, number + 1)
+    while True:
+        result_path = os.path.join(plant_path, 'Results_%s' % next_index)
         if not os.path.exists(result_path):
             os.makedirs(result_path)
             break
+        next_index += 1
     
     # create folders for outputs
     graphsPath = os.path.join(result_path, 'Graphs')

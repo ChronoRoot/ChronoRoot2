@@ -33,9 +33,7 @@ from analysis.utils.fileUtilities import (
     processing_limit_frame_count,
 )
 from analysis.utils.metadata_schema import (
-    SOURCE_SINGLE_PLANT,
     apply_load_aliases,
-    build_plant_record,
     dump_json,
     get_bounding_box,
     hydrate_run_config,
@@ -841,6 +839,15 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if not self.selected_plant:
             return
 
+        try:
+            self._show_selected_plant()
+        except Exception as exc:
+            # An exception in this slot aborts the whole Qt process.
+            self.image_label1.setText(f"Could not open this plant.\n{exc}")
+            self.image_label1.setAlignment(QtCore.Qt.AlignCenter)
+            self.image_label1.show()
+
+    def _show_selected_plant(self):
         overlay_on = self.overlay_checkbox.isChecked()
         project = self.current_project_key()
         cache_key = (project, self.selected_plant, overlay_on)
@@ -933,7 +940,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             rh, rw, _ = rgb.shape
             qimg = QtGui.QImage(
                 rgb.data.tobytes(), rw, rh, 3 * rw, QtGui.QImage.Format_RGB888
-            )
+            ).copy()
             pixmap1 = QtGui.QPixmap.fromImage(qimg)
             self.image_label1.set_pixmap(pixmap1)
             self.image_label1.show()
@@ -1187,12 +1194,22 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         conf['bounding_box'] = bbox
         conf['seed'] = seed
+        # Keep the finished Results_* metadata untouched. The new run writes
+        # its own metadata into the next Results folder. Overwriting this file
+        # first leaves the old masks paired with a box they were not built from.
+        project = (conf.get('MainFolder') or self.projectField.text() or '').strip()
+        if not project:
+            QtWidgets.QMessageBox.critical(
+                None, 'Error', 'Could not find the project folder for this plant.',
+            )
+            return
+        conf['MainFolder'] = project
 
-        def write_metadata():
-            dump_json(metadata_path, build_plant_record(conf, source=SOURCE_SINGLE_PLANT))
+        def write_pending():
+            dump_json(pending_analysis_path(project), conf)
 
-        run_off_main_thread(self, None, write_metadata)
-        pipeline_runner.run_analysis_config(metadata_path)
+        run_off_main_thread(self, None, write_pending)
+        pipeline_runner.run_pending_analysis(project)
 
     def repeatAnalysis(self):
         selected_rows = self.table.selectionModel().selectedRows()

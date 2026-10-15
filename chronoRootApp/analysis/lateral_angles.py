@@ -1287,7 +1287,15 @@ def render_plant_angle_figures(job):
             break
 
         bbox = get_bounding_box(metadata)
-        crop = cv2.imread(overlay_image)[bbox[0]:bbox[1], bbox[2]:bbox[3]]
+        image = cv2.imread(overlay_image)
+        if image is None or not bbox or len(bbox) != 4:
+            print(f'Warning: could not read the angle image for {label}', flush=True)
+            return label, True, ''
+        y1, y2, x1, x2 = [int(v) for v in bbox]
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            print(f'Warning: angle crop is empty for {label}', flush=True)
+            return label, True, ''
         last_name = os.path.basename(overlay_image).replace('.png', '.rsml')
         rsml_path = os.path.join(results_path, 'RSML', last_name)
         emergence_mm = float(conf['emergenceDistance'])
