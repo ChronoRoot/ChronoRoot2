@@ -96,28 +96,31 @@ class _FactorGroup(QtWidgets.QGroupBox):
 class ReportSubsetDialog(QtWidgets.QDialog):
     """Pick a folder name and the factor values included in that report."""
 
-    def __init__(self, choices, subsets, labels, parent=None):
+    def __init__(self, choices, reports, labels, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Review and Report")
         self.resize(520, 640)
         self._action = None
-        self._subsets = {item["name"]: item for item in subsets}
         self._loading = False
+        self._reports = {item["name"]: item for item in reports}
 
         self.name_box = QtWidgets.QComboBox()
         self.name_box.setEditable(True)
         self.name_box.addItem("Report")
-        for name in sorted(self._subsets, key=natural_keys):
+        for name in sorted(self._reports, key=natural_keys):
             if name != "Report":
                 self.name_box.addItem(name)
         self.name_box.setCurrentText("Report")
         self.name_box.activated[str].connect(self._load_named_subset)
 
         self.saved_list = QtWidgets.QListWidget()
-        self._add_saved_item("Report")
-        for name in sorted(self._subsets, key=natural_keys):
-            if name != "Report":
+        if self._reports:
+            for name in sorted(self._reports, key=natural_keys):
                 self._add_saved_item(name)
+        else:
+            placeholder = QtWidgets.QListWidgetItem("No reports yet")
+            placeholder.setFlags(QtCore.Qt.NoItemFlags)
+            self.saved_list.addItem(placeholder)
         self.saved_list.currentItemChanged.connect(self._load_current_item)
 
         self.experiments = _FactorGroup(labels.get("experiments") or "Genotype")
@@ -133,7 +136,8 @@ class ReportSubsetDialog(QtWidgets.QDialog):
         intro = QtWidgets.QLabel(
             "Choose who is compared in this report. "
             "A genotype includes every plant of that genotype. "
-            "Each saved report keeps the comparison it was given."
+            "Each row is a report folder on disk. "
+            "One that stopped early is marked so it can be generated again."
         )
         intro.setWordWrap(True)
         self.description = QtWidgets.QLabel("")
@@ -166,13 +170,10 @@ class ReportSubsetDialog(QtWidgets.QDialog):
         layout.addWidget(intro)
         layout.addLayout(name_row)
         layout.addWidget(self.description)
-        layout.addWidget(QtWidgets.QLabel("Saved reports"))
+        layout.addWidget(QtWidgets.QLabel("Reports on disk"))
         layout.addWidget(self.saved_list, 1)
         layout.addWidget(scroll, 3)
         layout.addLayout(buttons)
-
-        initial = subsets[-1]["name"] if subsets else "Report"
-        self._load_named_subset(initial)
 
     def action(self):
         return self._action
@@ -186,8 +187,8 @@ class ReportSubsetDialog(QtWidgets.QDialog):
         }
 
     def _add_saved_item(self, name):
-        saved = self._subsets.get(name)
-        text = subset_description(saved) if saved else "Compares all genotypes."
+        report = self._reports.get(name) or {}
+        text = report.get("description") or "Compares all genotypes."
         item = QtWidgets.QListWidgetItem(f"{name} — {text}")
         item.setData(QtCore.Qt.UserRole, name)
         self.saved_list.addItem(item)
@@ -205,7 +206,7 @@ class ReportSubsetDialog(QtWidgets.QDialog):
     def _load_named_subset(self, name):
         if self._loading:
             return
-        if not name or name not in self._subsets and name != "Report":
+        if not name or name not in self._reports:
             return
         self._loading = True
         try:
@@ -215,17 +216,12 @@ class ReportSubsetDialog(QtWidgets.QDialog):
                 if item.data(QtCore.Qt.UserRole) == name:
                     self.saved_list.setCurrentItem(item)
                     break
-            saved = self._subsets.get(name)
-            if saved is None:
-                self.experiments.apply_saved(None)
-                self.plates.apply_saved(None)
-                self.extras.apply_saved(None)
-            else:
-                self.experiments.apply_saved(saved.get("experiments"))
-                self.plates.apply_saved(saved.get("plates"))
-                self.extras.apply_saved(saved.get("extras"))
+            saved = self._reports.get(name) or {}
+            self.experiments.apply_saved(saved.get("experiments"))
+            self.plates.apply_saved(saved.get("plates"))
+            self.extras.apply_saved(saved.get("extras"))
             if hasattr(self, "description"):
-                self.description.setText(subset_description(self.subset()))
+                self.description.setText(saved.get("description") or subset_description(self.subset()))
         finally:
             self._loading = False
 

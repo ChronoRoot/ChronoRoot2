@@ -55,4 +55,4 @@ def run_report(project_dir, subset_name=""):
   ]
   if subset_name:
     command.extend(["--subset", subset_name])
-  subprocess.Popen(command)
+  return subprocess.Popen(command)

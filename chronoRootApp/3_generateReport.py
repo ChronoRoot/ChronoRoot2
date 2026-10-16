@@ -42,7 +42,10 @@ from analysis.time_windows import (
 from analysis.utils.report_subset import (
     apply_subset,
     experiment_in_report,
+    mark_report_status,
     plant_in_report,
+    running_status,
+    STATUS_COMPLETE,
     write_comparison_note,
 )
 from analysis.utils.report_paths import (
@@ -82,6 +85,7 @@ if __name__ == "__main__":
     experiments = utils.load_paths(analysis_folder, '*')
 
     utils.ensure_directory(report_root(conf))
+    mark_report_status(report_root(conf), running_status(os.getpid()))
     write_comparison_note(conf)
 
     print("Report generation began. This may take a while.")
@@ -284,4 +288,5 @@ if __name__ == "__main__":
         makeLateralAnglesPlots(conf)
         plotLateralAnglesOnTop(conf)
 
+    mark_report_status(report_root(conf), STATUS_COMPLETE)
     print("Report generation finished.")

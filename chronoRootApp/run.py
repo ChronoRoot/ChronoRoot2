@@ -62,7 +62,7 @@ from analysis.utils.remap_identifiers import (
     collect_experiment_counts,
 )
 from analysis.utils.plant_inventory import read_log_summary, scan_analysis_plants
-from analysis.utils.report_subset import normalize_subset_list, subset_description
+from analysis.utils.report_subset import list_reports, mark_report_status, running_status, write_subset_file
 
 TAB_HEIGHT = 630
 REPORT_PLOT_ROLE = QtCore.Qt.UserRole
@@ -269,8 +269,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                     print(f"Error reading analysis period from {path}: {exc}")
                     data = {}
         self.config_store.apply_analysis_period(self, data)
-        self.reportSubsets = normalize_subset_list(data.get("reportSubsets"))
-        self._viewing_report_name = "Report"
+        self._viewing_report_name = ""
         if hasattr(self, "report_folder_combo"):
             self._reload_report_folder_combo()
 
@@ -794,8 +793,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.timeSyncMode = 'clock'
         self.timeDurationHours = None
         self.reportFolderName = 'Report'
-        self.reportSubsets = []
-        self._viewing_report_name = "Report"
+        self._viewing_report_name = ""
+        self._report_processes = {}
         self.figureClockTicks = ['00:00']
         self.showFigureClockTicks = True
         self.snapshotHours = None
@@ -1754,15 +1753,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "extras": text(getattr(self, "reportExtraVariableAxisLabelField", None), "Extra variable"),
         }
 
-    def _upsert_report_subset(self, subset):
-        subsets = [
-            item for item in (getattr(self, "reportSubsets", None) or [])
-            if item.get("name") != subset["name"]
-        ]
-        subsets.append(subset)
-        self.reportSubsets = subsets
-
     def report(self):
+        project = self.projectField.text().strip()
         choices = run_off_main_thread(
             self,
             "Checking plants…",
@@ -1770,26 +1762,32 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         )
         dialog = ReportSubsetDialog(
             choices,
-            list(getattr(self, "reportSubsets", None) or []),
+            self._project_reports(),
             self._report_axis_labels(),
             self,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted or not dialog.action():
             return
         subset = dialog.subset()
-        self._upsert_report_subset(subset)
+        for existing in self._project_reports():
+            if existing["name"] == subset["name"] and existing.get("running"):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Report already running",
+                    f"{subset['name']} is already running.\n\n"
+                    "Wait for it to finish before generating it again.",
+                )
+                return
         self.saveFieldsIntoJson()
-        if dialog.action() == "save":
-            QtWidgets.QMessageBox.information(
-                self,
-                "Subset saved",
-                f"Saved {subset['name']}.\n\nThe report was not started.",
-            )
-            return
+        folder = os.path.join(project, subset["name"])
+        os.makedirs(folder, exist_ok=True)
+        write_subset_file(folder, subset)
+        process = pipeline_runner.run_report(project, subset["name"])
+        self._report_processes[subset["name"]] = process
+        mark_report_status(folder, running_status(process.pid))
         self._viewing_report_name = subset["name"]
         if hasattr(self, "report_folder_combo"):
             self._reload_report_folder_combo()
-        pipeline_runner.run_report(self.projectField.text(), subset["name"])
         QtWidgets.QMessageBox.information(
             self,
             "Report generation started",
@@ -2990,69 +2988,65 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         for i in range(self.report_tree.topLevelItemCount()):
             visit(self.report_tree.topLevelItem(i))
 
-    def _report_folder_names(self):
+    def _reap_report_processes(self):
+        """Drop finished report processes. A dead one still marked running did not finish."""
+        processes = getattr(self, "_report_processes", None)
+        if not processes:
+            return
         project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
-        names = []
-
-        def add(name):
-            safe = report_folder_name({"reportFolderName": name})
-            if safe not in names:
-                names.append(safe)
-
-        add("Report")
-        viewing = getattr(self, "_viewing_report_name", None)
-        if viewing:
-            add(viewing)
-        for subset in getattr(self, "reportSubsets", None) or []:
-            folder = os.path.join(project, report_folder_name({"reportFolderName": subset.get("name")}))
-            if os.path.isdir(folder):
-                add(subset.get("name"))
-        if project and os.path.isdir(project):
+        for name, process in list(processes.items()):
+            if process.poll() is None:
+                continue
+            processes.pop(name, None)
+            folder = os.path.join(project, name)
+            status_path = os.path.join(folder, "report_status.txt")
             try:
-                entries = sorted(os.listdir(project), key=natural_keys)
+                with open(status_path, encoding="utf-8") as handle:
+                    text = handle.read().strip()
             except OSError:
-                entries = []
-            for entry in entries:
-                if os.path.isfile(os.path.join(project, entry, "data", "Temporal_Data.csv")):
-                    add(entry)
-        return names
+                continue
+            if text.startswith("running "):
+                mark_report_status(folder, "incomplete")
+
+    def _project_reports(self):
+        self._reap_report_processes()
+        project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
+        return list_reports(project)
+
+    def _report_folder_names(self):
+        return [report["name"] for report in self._project_reports()]
 
     def _reload_report_folder_combo(self):
         if not hasattr(self, "report_folder_combo"):
             return
         names = self._report_folder_names()
-        current = getattr(self, "_viewing_report_name", None) or "Report"
+        current = getattr(self, "_viewing_report_name", None) or ""
         combo = self.report_folder_combo
         self._report_folder_combo_guard = True
         combo.blockSignals(True)
         combo.clear()
         combo.addItems(names)
-        index = combo.findText(current)
-        combo.setCurrentIndex(index if index >= 0 else 0)
+        index = combo.findText(current) if current else -1
+        if index < 0 and names:
+            index = 0
+        if index >= 0:
+            combo.setCurrentIndex(index)
         combo.blockSignals(False)
         self._report_folder_combo_guard = False
-        if combo.currentText():
-            self._viewing_report_name = combo.currentText()
+        self._viewing_report_name = combo.currentText()
         self._set_report_comparison_label()
 
     def _set_report_comparison_label(self):
         if not hasattr(self, "report_comparison_label"):
             return
-        name = getattr(self, "_viewing_report_name", None) or "Report"
+        project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
+        name = getattr(self, "_viewing_report_name", None) or ""
         text = ""
-        for subset in getattr(self, "reportSubsets", None) or []:
-            if subset.get("name") == name:
-                text = subset_description(subset)
+        for report in self._project_reports():
+            if report["name"] == name:
+                text = report["description"]
                 break
-        if not text:
-            note = os.path.join(self.current_report_dir(), "Comparison.txt")
-            try:
-                if os.path.isfile(note):
-                    with open(note, encoding="utf-8") as handle:
-                        text = handle.read().strip()
-            except OSError:
-                text = ""
-        self.report_comparison_label.setText(text or "Compares all genotypes.")
+        self.report_comparison_label.setText(text or "No report in this project yet.")
         self.report_comparison_label.setToolTip(self.report_comparison_label.text())
 
     def _fit_report_splitter(self):

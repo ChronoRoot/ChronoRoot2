@@ -1,10 +1,10 @@
-"""Which plants belong in one named report folder.
+"""Which plants belong in one report folder.
 
-A subset stores the genotype, plate-condition, and extra-variable values to
-keep. A missing list means every value of that factor. The report script reads
-the saved subset by name and does not change the project's default folder.
+The folder on disk is the record. subset.json says who was included.
+report_status.txt says whether generation finished.
 """
 
+import json
 import os
 
 from analysis.time_windows import report_folder_name
@@ -26,56 +26,189 @@ def _name_list(value):
     return [str(item) for item in value]
 
 
-def normalize_subset(entry):
-    """One subset record, or None when the entry is not usable."""
-    if not isinstance(entry, dict):
+SUBSET_FILE = "subset.json"
+STATUS_FILE = "report_status.txt"
+STATUS_INCOMPLETE = "incomplete"
+STATUS_COMPLETE = "complete"
+STATUS_RUNNING = "running"
+
+
+def process_is_running(pid):
+    """True when this process still exists."""
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def running_status(pid):
+    return f"{STATUS_RUNNING} {int(pid)}"
+
+
+def read_report_status(folder):
+    """Return complete, running for the status file in this folder."""
+    path = os.path.join(folder, STATUS_FILE)
+    if not os.path.isfile(path):
+        return False, False
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return False, False
+    if text == STATUS_COMPLETE:
+        return True, False
+    if text.startswith(STATUS_RUNNING + " "):
+        return False, process_is_running(text.split()[-1])
+    return False, False
+
+
+def write_subset_file(folder, subset):
+    """Store this run's filter inside the report folder."""
+    os.makedirs(folder, exist_ok=True)
+    payload = {
+        "experiments": subset.get("experiments"),
+        "plates": subset.get("plates"),
+        "extras": subset.get("extras"),
+    }
+    with open(os.path.join(folder, SUBSET_FILE), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+
+def read_subset_file(folder):
+    path = os.path.join(folder, SUBSET_FILE)
+    if not os.path.isfile(path):
         return None
-    name = report_folder_name({"reportFolderName": entry.get("name") or ""})
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
     return {
-        "name": name,
-        "experiments": _name_list(entry.get("experiments")),
-        "plates": _name_list(entry.get("plates")),
-        "extras": _name_list(entry.get("extras")),
+        "experiments": _name_list(loaded.get("experiments")),
+        "plates": _name_list(loaded.get("plates")),
+        "extras": _name_list(loaded.get("extras")),
     }
 
 
-def normalize_subset_list(raw):
-    """Drop broken entries and keep the first record for each folder name."""
-    if not isinstance(raw, list):
+def mark_report_status(folder, status):
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, STATUS_FILE), "w", encoding="utf-8") as handle:
+        handle.write(status + "\n")
+
+
+def mark_report_running(folder, pid):
+    mark_report_status(folder, f"{STATUS_RUNNING} {int(pid)}")
+
+
+def _report_process_alive(pid):
+    """True when this pid is still the report script, not a reused process."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return False
+    cmdline_path = os.path.join("/proc", str(int(pid)), "cmdline")
+    try:
+        with open(cmdline_path, "rb") as handle:
+            command = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    return "3_generateReport.py" in command
+
+
+def read_report_state(folder):
+    """Return complete, running, or incomplete for one report folder."""
+    path = os.path.join(folder, STATUS_FILE)
+    if not os.path.isfile(path):
+        temporal = os.path.join(folder, "data", "Temporal_Data.csv")
+        if os.path.isfile(temporal):
+            return "complete"
+        return "incomplete"
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return "incomplete"
+    if text == STATUS_COMPLETE:
+        return "complete"
+    if text.startswith(STATUS_RUNNING):
+        parts = text.split()
+        pid = parts[1] if len(parts) > 1 else ""
+        if _report_process_alive(pid):
+            return "running"
+    return "incomplete"
+
+
+def list_reports(project_dir):
+    """Report folders that exist. A missing folder is not a report."""
+    from analysis.utils.report_utils import natural_key as natural_keys
+
+    if not project_dir or not os.path.isdir(project_dir):
         return []
-    subsets = []
-    seen = set()
-    for entry in raw:
-        subset = normalize_subset(entry)
-        if subset is None or subset["name"] in seen:
+    try:
+        entries = sorted(os.listdir(project_dir), key=natural_keys)
+    except OSError:
+        return []
+    reports = []
+    for entry in entries:
+        folder = os.path.join(project_dir, entry)
+        if not os.path.isdir(folder):
             continue
-        seen.add(subset["name"])
-        subsets.append(subset)
-    return subsets
-
-
-def find_subset(conf, name):
-    """The saved subset with this folder name, or None."""
-    wanted = report_folder_name({"reportFolderName": name or ""})
-    for subset in normalize_subset_list((conf or {}).get("reportSubsets")):
-        if subset["name"] == wanted:
-            return subset
-    return None
+        status_path = os.path.join(folder, STATUS_FILE)
+        temporal = os.path.join(folder, "data", "Temporal_Data.csv")
+        subset_path = os.path.join(folder, SUBSET_FILE)
+        note_path = os.path.join(folder, "Comparison.txt")
+        has_status = os.path.isfile(status_path)
+        if not has_status and not os.path.isfile(temporal) and not os.path.isfile(subset_path):
+            continue
+        complete, running = read_report_status(folder)
+        if not has_status and not os.path.isfile(temporal):
+            complete, running = False, False
+        elif not has_status and os.path.isfile(temporal):
+            complete, running = True, False
+        description = ""
+        if os.path.isfile(note_path):
+            try:
+                with open(note_path, encoding="utf-8") as handle:
+                    description = handle.read().strip()
+            except OSError:
+                description = ""
+        include = read_subset_file(folder) or {}
+        if not description:
+            description = subset_description(include) if include else "Compares all genotypes."
+        if running:
+            description = description.rstrip(".") + ". Running."
+        elif not complete:
+            description = description.rstrip(".") + ". Not finished. Generate again."
+        reports.append({
+            "name": entry,
+            "description": description,
+            "complete": complete,
+            "running": running,
+            "experiments": include.get("experiments"),
+            "plates": include.get("plates"),
+            "extras": include.get("extras"),
+        })
+    return reports
 
 
 def apply_subset(conf, name):
-    """Point this run at the subset folder without editing the saved config.
-
-    An unknown name still writes that folder and includes every plant, which
-    is the same as the full report under a different directory.
-    """
+    """Point this run at a report folder and read its filter from that folder."""
     conf = dict(conf or {})
     if not name:
         conf.pop("reportInclude", None)
         return conf
-    folder = report_folder_name({"reportFolderName": name})
-    conf["reportFolderName"] = folder
-    subset = find_subset(conf, folder)
+    folder_name = report_folder_name({"reportFolderName": name})
+    conf["reportFolderName"] = folder_name
+    folder = os.path.join(conf.get("MainFolder") or "", folder_name)
+    subset = read_subset_file(folder)
     if subset is None:
         conf.pop("reportInclude", None)
         return conf
@@ -140,11 +273,20 @@ def subset_description(subset):
 
     def phrase(values):
         values = [str(value) for value in values]
+        if not values:
+            return ""
         if len(values) == 1:
             return values[0]
         if len(values) == 2:
             return f"{values[0]} and {values[1]}"
         return ", ".join(values[:-1]) + ", and " + values[-1]
+
+    if experiments is not None and not experiments:
+        return "No genotypes selected."
+    if plates is not None and not plates:
+        return "No plate condition selected."
+    if extras is not None and not extras:
+        return "No extra variable selected."
 
     parts = []
     if experiments is None:
