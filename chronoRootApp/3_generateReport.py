@@ -39,6 +39,12 @@ from analysis.time_windows import (
     snapshot_hours,
     subtract_initial_stage,
 )
+from analysis.utils.report_subset import (
+    apply_subset,
+    experiment_in_report,
+    plant_in_report,
+    write_comparison_note,
+)
 from analysis.utils.report_paths import (
     data_file,
     individual_plots_dir,
@@ -67,14 +73,16 @@ def _normalize_temporal_dataframe(all_data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ChronoRoot: Report Generation')
     parser.add_argument('--config', type=str, help='Path to the configuration file (default: config.json)')
+    parser.add_argument('--subset', type=str, default='', help='Saved report subset name')
 
     args = parser.parse_args()
-    conf = apply_load_aliases(load_json(args.config))
+    conf = apply_subset(apply_load_aliases(load_json(args.config)), args.subset)
 
     analysis_folder = os.path.join(conf['MainFolder'], 'Analysis')
     experiments = utils.load_paths(analysis_folder, '*')
 
     utils.ensure_directory(report_root(conf))
+    write_comparison_note(conf)
 
     print("Report generation began. This may take a while.")
 
@@ -96,6 +104,8 @@ if __name__ == "__main__":
 
     for exp_index, exp_dir in enumerate(experiments, start=1):
         exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
+        if not experiment_in_report(conf, real_exp_name):
+            continue
         print(f'Phase 1/3: experiment {exp_index}/{n_experiments}: {real_exp_name}')
 
         iplots_exp_folder = None
@@ -116,6 +126,13 @@ if __name__ == "__main__":
                         continue
 
                     meta = load_result_metadata(res_folder)
+                    if not plant_in_report(
+                        conf,
+                        real_exp_name,
+                        meta.get("PlateCondition", ""),
+                        meta.get("ExtraVariable", ""),
+                    ):
+                        continue
                     plant_id = build_plant_id(rpi_name, cam_name, plant_name)
                     file_csv = os.path.join(res_folder, 'PostProcess_Hour.csv')
 
@@ -142,6 +159,8 @@ if __name__ == "__main__":
                         iplots_exp_folder, data, plot_filename, conf, iplot_cache,
                     )
 
+    if not plant_frames:
+        print('No plants matched this report subset.', flush=True)
     all_data = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
     if not all_data.empty:
         if not hourly_covers_analysis_period(all_data, conf):
@@ -171,15 +190,19 @@ if __name__ == "__main__":
     # --- Phase 2: convex hull ---
     convex_hull_df = pd.DataFrame()
     if conf.get('doConvex') and not relative:
+        included = [
+            exp_dir for exp_dir in experiments
+            if experiment_in_report(conf, _experiment_display_name(exp_dir)[1])
+        ]
         print('Phase 2/3: convex hull analysis...')
-        global_shape, global_center = convex_hull.calculate_atlas_geometry(experiments, conf)
+        global_shape, global_center = convex_hull.calculate_atlas_geometry(included, conf)
         snapshot_h = snapshot_hours(conf, kind='convex')
         timestep = int(conf['timeStep'])
         convex_overview = overview_dir(conf, MODULE_CONVEX)
         convex_frames = []
-        n_experiments = len(experiments)
+        n_experiments = len(included)
 
-        for exp_index, exp_dir in enumerate(experiments, start=1):
+        for exp_index, exp_dir in enumerate(included, start=1):
             exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
             print(f'Phase 2/3: convex hull ({exp_index}/{n_experiments}): {real_exp_name}')
 

@@ -48,8 +48,11 @@ def run_postprocess(project_dir):
   ])
 
 
-def run_report(project_dir):
-  subprocess.Popen([
+def run_report(project_dir, subset_name=""):
+  command = [
       "python", "3_generateReport.py",
       "--config", project_config_path(project_dir),
-  ])
+  ]
+  if subset_name:
+    command.extend(["--subset", subset_name])
+  subprocess.Popen(command)

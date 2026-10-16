@@ -35,6 +35,7 @@ from .utils.fileUtilities import (
     attach_plant_metadata_columns,
     build_plant_id,
 )
+from .utils.report_subset import result_dir_in_report
 from .utils.metadata_schema import get_bounding_box, video_image_dir
 from .rsmlUtils.rsml import (
     direct_lateral_roots,
@@ -896,6 +897,8 @@ def makeLateralAnglesPlots(conf):
             results = get_latest_result_dir(plant)
             if results is None:
                 continue
+            if not result_dir_in_report(conf, results):
+                continue
 
             plant_name = plant.replace(exp, '').replace('/', '_')
             file = os.path.join(results, 'LateralRootsData.csv')
@@ -1505,6 +1508,8 @@ def plotLateralAnglesOnTop(conf):
                         continue
                     results_path = get_latest_result_dir(slot)
                     if results_path is None or not os.path.exists(results_path):
+                        continue
+                    if not result_dir_in_report(conf, results_path):
                         continue
                     if first_lr_save_path is None:
                         first_lr_save_path = first_lr_overlays_dir(conf, safe_exp)

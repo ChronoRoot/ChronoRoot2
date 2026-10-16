@@ -5,6 +5,8 @@ a nested event loop keeps painting. A loading dialog appears only when the
 call is still running after a short delay.
 """
 
+import threading
+
 import sys
 
 from PyQt5 import QtCore, QtWidgets
@@ -172,3 +174,35 @@ def run_off_main_thread(parent, message, fn, then=None):
         _exc_type, exc, tb = error
         raise exc.with_traceback(tb)
     return result
+
+
+def start_in_background(fn, on_done):
+    """Run fn() without blocking the window. on_done(result) runs on the GUI thread.
+
+    A camera file on a slow or sleeping mount must not hold a loading dialog
+    open. The worker is a daemon thread, so closing the window does not wait
+    for that read.
+    """
+    signal_owner = _BackgroundBridge()
+    _kept_alive.append(signal_owner)
+
+    def deliver(result):
+        if signal_owner in _kept_alive:
+            _kept_alive.remove(signal_owner)
+        if on_done is not None:
+            on_done(result)
+
+    signal_owner.finished.connect(deliver)
+
+    def run():
+        try:
+            result = fn()
+        except Exception as exc:
+            result = exc
+        signal_owner.finished.emit(result)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+class _BackgroundBridge(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object)

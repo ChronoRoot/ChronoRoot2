@@ -9,6 +9,7 @@ from analysis.utils.metadata_schema import (
     strip_roi_keys,
     widget_value,
 )
+from analysis.utils.report_subset import normalize_subset_list
 
 APP_NAME = "chronoroot"
 PROJECT_CONFIG_NAME = "project_config.json"
@@ -111,7 +112,7 @@ class ConfigStore:
     if getattr(host, 'advanced_group', None) is not None:
         data['advancedComparisonModes'] = host.advanced_group.isChecked()
     for key in (
-        'timeSyncMode', 'timeDurationHours', 'reportFolderName',
+        'timeSyncMode', 'timeDurationHours', 'reportFolderName', 'reportSubsets',
         'figureClockTicks', 'showFigureClockTicks', 'timeGroups', 'timePeriodSources',
     ):
       if hasattr(host, key):
@@ -204,6 +205,7 @@ class ConfigStore:
     # Period keys are always replaced. Leaving them in place when a file
     # omitted them kept the previous project's windows on the window.
     self.apply_analysis_period(host, data)
+    host.reportSubsets = normalize_subset_list(data.get("reportSubsets") if isinstance(data, dict) else None)
     if hasattr(host, '_sync_snapshot_hour_fields'):
       host._sync_snapshot_hour_fields()
 

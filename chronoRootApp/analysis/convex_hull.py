@@ -12,6 +12,7 @@ from typing import Tuple, List
 # Import shared utilities
 from analysis.utils import report_utils as utils
 from analysis.utils.fileUtilities import convertFromPathSafe, normalize_factor_value
+from analysis.utils.report_subset import result_dir_in_report
 from analysis.graphUtils.save import GRAPHS_FILENAME, loadGraph
 from analysis.utils.tiff_stack import (
     graph_path_for_name,
@@ -152,6 +153,8 @@ def calculate_atlas_geometry(experiment_paths: List[str], conf=None) -> Tuple[Tu
         result_paths = utils.load_paths(exp_path, '*/*/*/Results*')
         
         for r_path in result_paths:
+            if not result_dir_in_report(conf, r_path):
+                continue
             names = result_frame_names(r_path)
             chosen = period_frame_indices(names, conf) if names else []
             if chosen:
@@ -389,6 +392,7 @@ def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_sh
     atlas_root_density = np.zeros(canvas_shape, dtype='float64')
 
     result_paths = utils.load_paths(save_path, '*/*/*/Results*')
+    result_paths = [r_path for r_path in result_paths if result_dir_in_report(conf, r_path)]
     hours = list(snapshot_hours if snapshot_hours is not None else (days or []))
     groups, _mode = resolved_time_groups(conf, None) if conf else ([], 'clock')
     if not groups:

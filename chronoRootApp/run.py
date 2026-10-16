@@ -41,7 +41,7 @@ from analysis.utils.metadata_schema import (
     pending_analysis_path,
 )
 from analysis.utils.report_utils import natural_key as natural_keys
-from gui.background import run_off_main_thread
+from gui.background import run_off_main_thread, start_in_background
 from gui.error_report import install_gui_exception_hook
 from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
 from gui import pipeline_runner
@@ -49,6 +49,7 @@ from gui.stats_config_dialog import StatsConfigDialog
 from gui.remap_identifiers_dialog import RemapIdentifiersDialog
 from gui.time_window_dialog import TimeWindowDialog
 from gui.snapshot_hours_dialog import SnapshotHoursDialog
+from gui.report_subset_dialog import ReportSubsetDialog
 from analysis.time_windows import (
     PERIOD_GATE_MESSAGE,
     analysis_period_is_current,
@@ -61,6 +62,7 @@ from analysis.utils.remap_identifiers import (
     collect_experiment_counts,
 )
 from analysis.utils.plant_inventory import read_log_summary, scan_analysis_plants
+from analysis.utils.report_subset import normalize_subset_list, subset_description
 
 TAB_HEIGHT = 630
 REPORT_PLOT_ROLE = QtCore.Qt.UserRole
@@ -135,6 +137,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._overview_hidden_override = {}
         self._overview_user_widths = {}
         self._overview_applying_widths = False
+        self._report_folder_combo_guard = False
+        self._viewing_report_name = "Report"
         self.setupUi(self)
 
     def current_project_key(self):
@@ -265,6 +269,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                     print(f"Error reading analysis period from {path}: {exc}")
                     data = {}
         self.config_store.apply_analysis_period(self, data)
+        self.reportSubsets = normalize_subset_list(data.get("reportSubsets"))
+        self._viewing_report_name = "Report"
+        if hasattr(self, "report_folder_combo"):
+            self._reload_report_folder_combo()
 
     def force_refresh_plant_inventory(self, prefer_index=None):
         """Manual Refresh: always rescan the current project."""
@@ -420,9 +428,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.ensure_plant_inventory()
             self._show_overlay_plant_after_list()
 
-        # index 4: Report Viewer
+        # index 4: View Report
         elif index == 4:
             self.refresh_tab5()
+            QtCore.QTimer.singleShot(0, self._fit_report_splitter)
             self.update_report_labels()
 
     def openFileNameDialog(self):
@@ -663,9 +672,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(None, 'Manual Action', f'Auto-open failed. Path:\n{display}')
         
     def current_report_dir(self):
+        name = getattr(self, "_viewing_report_name", None) or getattr(self, "reportFolderName", "Report")
         return os.path.join(
             self.projectField.text(),
-            report_folder_name({'reportFolderName': getattr(self, 'reportFolderName', 'Report')}),
+            report_folder_name({"reportFolderName": name}),
         )
 
     def open_report_folder(self):
@@ -784,6 +794,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.timeSyncMode = 'clock'
         self.timeDurationHours = None
         self.reportFolderName = 'Report'
+        self.reportSubsets = []
+        self._viewing_report_name = "Report"
         self.figureClockTicks = ['00:00']
         self.showFigureClockTicks = True
         self.snapshotHours = None
@@ -1041,12 +1053,58 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             except Exception as exc:
                 return ('error', str(exc), summary)
 
-        self._overlay_load_guard = True
-        try:
-            kind, payload, summary = run_off_main_thread(self, "Loading plant…", load)
-        finally:
-            self._overlay_load_guard = False
+        self._overlay_load_token = getattr(self, "_overlay_load_token", 0) + 1
+        token = self._overlay_load_token
+        self.image_label1.setText("Reading the camera image…")
+        self.image_label1.setAlignment(QtCore.Qt.AlignCenter)
+        self.image_label1.show()
+        self._show_summary_bytes(self._local_summary_bytes(result_dir))
 
+        def apply(result):
+            if token != getattr(self, "_overlay_load_token", None):
+                return
+            if self.selected_plant != result_dir:
+                return
+            self._apply_loaded_plant(cache_key, result)
+
+        start_in_background(load, apply)
+        self._finish_deferred_loads()
+        return
+
+    def _local_summary_bytes(self, result_dir):
+        """The report picture stored next to the analysis. It is not the camera file."""
+        parts = os.path.abspath(result_dir or "").split(os.sep)
+        if len(parts) < 5:
+            return None
+        experiment, rpi, camera, plant = parts[-5], parts[-4], parts[-3], parts[-2]
+        path = os.path.join(result_dir, f"{experiment}_{rpi}_{camera}_{plant}.png")
+        try:
+            if not os.path.isfile(path):
+                return None
+            with open(path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def _show_summary_bytes(self, summary):
+        if summary:
+            pixmap = QtGui.QPixmap()
+            pixmap.loadFromData(summary)
+            self.image_label2.set_pixmap(pixmap)
+            self.image_label2.show()
+            return
+        self.image_label2.clear()
+        pixmap = QtGui.QPixmap("placeholder_figures/plant_report_placeholder.png")
+        self.image_label2.set_pixmap(pixmap)
+        self.image_label2.show()
+
+    def _apply_loaded_plant(self, cache_key, result):
+        if isinstance(result, Exception):
+            self.image_label1.setText(f"Could not open this plant.\n{result}")
+            self.image_label1.setAlignment(QtCore.Qt.AlignCenter)
+            self.image_label1.show()
+            return
+        kind, payload, summary = result
         pixmap1 = None
         pixmap2 = None
 
@@ -1083,16 +1141,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.image_label2.set_pixmap(pixmap2)
             self.image_label2.show()
         else:
-            self.image_label2.clear()
-            pixmap2 = QtGui.QPixmap("placeholder_figures/plant_report_placeholder.png")
-            self.image_label2.set_pixmap(pixmap2)
-            self.image_label2.show()
+            self._show_summary_bytes(None)
+            pixmap2 = self.image_label2._source_pixmap
 
         if pixmap1 is not None and pixmap2 is not None:
             self._overlay_pixmap_cache[cache_key] = (pixmap1, pixmap2)
-
-        self._finish_deferred_loads()
-        return
 
     def _finish_deferred_loads(self):
         """Run the one refresh or picture load that arrived during an image read."""
@@ -1667,13 +1720,81 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "It is running in the terminal. You do not need to press the button again.",
         )
 
+    def _report_factor_choices(self):
+        project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
+        rows = scan_analysis_plants(os.path.join(project, "Analysis")) if project else []
+
+        def unique(index):
+            values = []
+            seen = set()
+            for row in rows:
+                value = str(row[index])
+                if value in seen:
+                    continue
+                seen.add(value)
+                values.append(value)
+            return values
+
+        return {
+            "experiments": unique(0),
+            "plates": unique(4),
+            "extras": unique(5),
+        }
+
+    def _report_axis_labels(self):
+        def text(widget, fallback):
+            if widget is None:
+                return fallback
+            value = widget.text().strip()
+            return value or fallback
+
+        return {
+            "experiments": text(getattr(self, "reportGenotypeAxisLabelField", None), "Genotype"),
+            "plates": text(getattr(self, "reportPlateConditionAxisLabelField", None), "Plate condition"),
+            "extras": text(getattr(self, "reportExtraVariableAxisLabelField", None), "Extra variable"),
+        }
+
+    def _upsert_report_subset(self, subset):
+        subsets = [
+            item for item in (getattr(self, "reportSubsets", None) or [])
+            if item.get("name") != subset["name"]
+        ]
+        subsets.append(subset)
+        self.reportSubsets = subsets
+
     def report(self):
+        choices = run_off_main_thread(
+            self,
+            "Checking plants…",
+            self._report_factor_choices,
+        )
+        dialog = ReportSubsetDialog(
+            choices,
+            list(getattr(self, "reportSubsets", None) or []),
+            self._report_axis_labels(),
+            self,
+        )
+        if dialog.exec_() != QtWidgets.QDialog.Accepted or not dialog.action():
+            return
+        subset = dialog.subset()
+        self._upsert_report_subset(subset)
         self.saveFieldsIntoJson()
-        pipeline_runner.run_report(self.projectField.text())
+        if dialog.action() == "save":
+            QtWidgets.QMessageBox.information(
+                self,
+                "Subset saved",
+                f"Saved {subset['name']}.\n\nThe report was not started.",
+            )
+            return
+        self._viewing_report_name = subset["name"]
+        if hasattr(self, "report_folder_combo"):
+            self._reload_report_folder_combo()
+        pipeline_runner.run_report(self.projectField.text(), subset["name"])
         QtWidgets.QMessageBox.information(
             self,
             "Report generation started",
             "Report generation started.\n\n"
+            f"The report will be written to {subset['name']}.\n"
             "It is running in the terminal. You do not need to press the button again.",
         )
 
@@ -2694,12 +2815,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportGenerateButton = QtWidgets.QPushButton(self.tab4)
         self.reportGenerateButton.setGeometry(QtCore.QRect(500, 510, 131, 81))
         self.reportGenerateButton.setObjectName("reportGenerateButton")
-        self.reportGenerateButton.setText("Generate report")
+        self.reportGenerateButton.setText("Review and\nReport")
         self.reportGenerateButton.setToolTip(
-            "<b>Compile Results:</b><br>"
-            "Generate visual charts, CSV data, and perform statistical comparisons between varieties.<br>"
-            "Re-applies the current analysis period from hourly files (Postprocess is not required "
-            "when the period is already covered)."
+            "<b>Choose a comparison and compile it:</b><br>"
+            "Pick the genotypes, plate conditions, and extra values to include, "
+            "name that report, and write it to its own folder.<br>"
+            "The full set stays available under the name Report."
         )
         self.reportGenerateButton.clicked.connect(self.report)
 
@@ -2869,12 +2990,101 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         for i in range(self.report_tree.topLevelItemCount()):
             visit(self.report_tree.topLevelItem(i))
 
+    def _report_folder_names(self):
+        project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
+        names = []
+
+        def add(name):
+            safe = report_folder_name({"reportFolderName": name})
+            if safe not in names:
+                names.append(safe)
+
+        add("Report")
+        viewing = getattr(self, "_viewing_report_name", None)
+        if viewing:
+            add(viewing)
+        for subset in getattr(self, "reportSubsets", None) or []:
+            folder = os.path.join(project, report_folder_name({"reportFolderName": subset.get("name")}))
+            if os.path.isdir(folder):
+                add(subset.get("name"))
+        if project and os.path.isdir(project):
+            try:
+                entries = sorted(os.listdir(project), key=natural_keys)
+            except OSError:
+                entries = []
+            for entry in entries:
+                if os.path.isfile(os.path.join(project, entry, "data", "Temporal_Data.csv")):
+                    add(entry)
+        return names
+
+    def _reload_report_folder_combo(self):
+        if not hasattr(self, "report_folder_combo"):
+            return
+        names = self._report_folder_names()
+        current = getattr(self, "_viewing_report_name", None) or "Report"
+        combo = self.report_folder_combo
+        self._report_folder_combo_guard = True
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        index = combo.findText(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+        self._report_folder_combo_guard = False
+        if combo.currentText():
+            self._viewing_report_name = combo.currentText()
+        self._set_report_comparison_label()
+
+    def _set_report_comparison_label(self):
+        if not hasattr(self, "report_comparison_label"):
+            return
+        name = getattr(self, "_viewing_report_name", None) or "Report"
+        text = ""
+        for subset in getattr(self, "reportSubsets", None) or []:
+            if subset.get("name") == name:
+                text = subset_description(subset)
+                break
+        if not text:
+            note = os.path.join(self.current_report_dir(), "Comparison.txt")
+            try:
+                if os.path.isfile(note):
+                    with open(note, encoding="utf-8") as handle:
+                        text = handle.read().strip()
+            except OSError:
+                text = ""
+        self.report_comparison_label.setText(text or "Compares all genotypes.")
+        self.report_comparison_label.setToolTip(self.report_comparison_label.text())
+
+    def _fit_report_splitter(self):
+        """Keep the figure list narrow so the plot uses the rest of the window."""
+        splitter = getattr(self, "report_splitter", None)
+        if splitter is None:
+            return
+        if getattr(self, "_report_split_fitted", False):
+            return
+        width = splitter.width()
+        if width < 200:
+            return
+        tree = min(230, max(160, width // 4))
+        splitter.setSizes([tree, width - tree])
+        self._report_split_fitted = True
+
+    def _on_report_folder_changed(self, _index):
+        if getattr(self, "_report_folder_combo_guard", False):
+            return
+        name = self.report_folder_combo.currentText()
+        if not name or name == getattr(self, "_viewing_report_name", None):
+            return
+        self._viewing_report_name = name
+        self.refresh_tab5()
+
     def refresh_tab5(self):
         if not hasattr(self, 'report_tree'):
             return
 
         self.report_tree.clear()
         self._shown_report_plot = None
+        self._reload_report_folder_combo()
         report_path = self.current_report_dir()
         project_text = self.projectField.text()
 
@@ -2894,8 +3104,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         for branch in catalog:
             self._append_report_tree_item(None, branch)
-
-        self.report_tree.resizeColumnToContents(0)
 
         if self.report_tree.topLevelItemCount() == 0:
             self._show_report_placeholder()
@@ -2923,7 +3131,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         stats_file = current.data(0, REPORT_STATS_ROLE)
         if not stats_file:
             return
-        stats_path = os.path.join(self.projectField.text(), "Report", stats_file)
+        stats_path = os.path.join(self.current_report_dir(), stats_file)
 
         def stats_file_exists():
             return os.path.isfile(stats_path)
@@ -2934,23 +3142,24 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def setup_tab5_elements(self):
         self.tab5 = QtWidgets.QWidget()
         self.tab5.setObjectName("tab5")
-        self.tab_widget.addTab(self.tab5, "Report")
+        self.tab_widget.addTab(self.tab5, "View Report")
 
         self.report_label_1 = AspectRatioLabel()
         self.report_label_1.setObjectName("report_label_1")
         self.report_label_1.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding,
         )
-        self.report_label_1.setMinimumSize(200, 200)
+        self.report_label_1.setMinimumSize(120, 120)
 
         self.report_tree = QTreeWidget(self.tab5)
         self.report_tree.setHeaderHidden(True)
-        self.report_tree.setMinimumWidth(200)
-        self.report_tree.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        self.report_tree.setTextElideMode(QtCore.Qt.ElideNone)
-        self.report_tree.header().setStretchLastSection(False)
+        self.report_tree.setMinimumWidth(150)
+        self.report_tree.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.report_tree.setTextElideMode(QtCore.Qt.ElideRight)
+        self.report_tree.header().setStretchLastSection(True)
+        self.report_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.report_tree.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding,
         )
         self.report_tree.currentItemChanged.connect(
             lambda _current, _previous: self.update_report_labels()
@@ -2959,8 +3168,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.report_splitter = QSplitter(QtCore.Qt.Horizontal, self.tab5)
         self.report_splitter.addWidget(self.report_tree)
         self.report_splitter.addWidget(self.report_label_1)
-        self.report_splitter.setStretchFactor(0, 1)
-        self.report_splitter.setStretchFactor(1, 2)
+        self.report_splitter.setStretchFactor(0, 0)
+        self.report_splitter.setStretchFactor(1, 1)
+        self.report_splitter.setChildrenCollapsible(False)
         self.report_splitter.splitterMoved.connect(
             lambda _pos, _index: self.update_report_labels()
         )
@@ -2968,6 +3178,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.report_filter_field = QLineEdit(self.tab5)
         self.report_filter_field.setPlaceholderText("Filter figures...")
         self.report_filter_field.textChanged.connect(self._filter_report_tree)
+
+        self.report_folder_combo = QComboBox()
+        self.report_folder_combo.setToolTip("Open a saved report folder.")
+        self.report_folder_combo.currentIndexChanged.connect(self._on_report_folder_changed)
 
         self.refresh_button_tab5 = QPushButton(self.tab5)
         self.refresh_button_tab5.setObjectName("Refresh_5")
@@ -2985,24 +3199,45 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         self.open_path_button_tab5 = QPushButton(self.tab5)
         self.open_path_button_tab5.setObjectName("Open Path")
-        self.open_path_button_tab5.setText("Open Report Path")
+        self.open_path_button_tab5.setText("Open folder")
         self.open_path_button_tab5.setToolTip(
             "Open the directory where generated reports are stored.")
         self.open_path_button_tab5.clicked.connect(self.open_report_folder)
+
+        for button in (
+            self.open_stats_button_tab5,
+            self.open_path_button_tab5,
+            self.refresh_button_tab5,
+        ):
+            button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
 
         content_layout = QHBoxLayout()
         content_layout.addWidget(self.report_splitter, 1)
 
         controls_layout = QHBoxLayout()
-        controls_layout.addWidget(self.report_filter_field, 3)
-        controls_layout.addWidget(self.open_stats_button_tab5, 1)
-        controls_layout.addWidget(self.open_path_button_tab5, 1)
-        controls_layout.addWidget(self.refresh_button_tab5, 1)
+        controls_layout.addWidget(self.report_filter_field, 1)
+        controls_layout.addWidget(self.open_stats_button_tab5)
+        controls_layout.addWidget(self.open_path_button_tab5)
+        controls_layout.addWidget(self.refresh_button_tab5)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Report"))
+        folder_row.addWidget(self.report_folder_combo, 1)
+        self.report_comparison_label = QLabel("Compares all genotypes.")
+        self.report_comparison_label.setWordWrap(False)
+        self.report_comparison_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred,
+        )
 
         layout = QVBoxLayout()
-        layout.addLayout(content_layout)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+        layout.addLayout(folder_row)
+        layout.addWidget(self.report_comparison_label)
+        layout.addLayout(content_layout, 1)
         layout.addLayout(controls_layout)
         self.tab5.setLayout(layout)
+        self._reload_report_folder_combo()
     
     def setup_tab6_elements(self):        
         self.tab6.setAutoFillBackground(True)
