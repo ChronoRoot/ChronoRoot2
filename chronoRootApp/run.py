@@ -8,7 +8,7 @@ os.environ['LIBGL_ALWAYS_INDIRECT'] = '1'
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import (
-    QTableWidget, QTableWidgetItem, QPushButton, QTreeWidget, QTreeWidgetItem, QLineEdit,
+    QHeaderView, QTableWidget, QTableWidgetItem, QPushButton, QTreeWidget, QTreeWidgetItem, QLineEdit,
     QSplitter,
 )
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox
@@ -69,6 +69,15 @@ REPORT_STATS_ROLE = QtCore.Qt.UserRole + 1
 WINDOW_WIDTH = 811
 WINDOW_HEIGHT = TAB_HEIGHT + 20
 
+# Analysis Overview columns. Identity is one plant line so the row fits the window.
+OVERVIEW_PLANT = 0
+OVERVIEW_STATUS = 1
+OVERVIEW_ERROR = 2
+OVERVIEW_FINISHED = 3
+OVERVIEW_PLATE = 4
+OVERVIEW_EXTRA = 5
+OVERVIEW_COLUMNS = 6
+
 
 class AspectRatioLabel(QLabel):
     def __init__(self, *args, **kwargs):
@@ -123,6 +132,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._prefer_index_after_load = None
         self._inventory_busy = False
         self._shown_report_plot = None
+        self._overview_hidden_override = {}
+        self._overview_user_widths = {}
+        self._overview_applying_widths = False
         self.setupUi(self)
 
     def current_project_key(self):
@@ -342,23 +354,36 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.table.setRowCount(len(rows))
 
         for row, row_data in enumerate(rows):
-            for col, cell_data in enumerate(row_data[:-2]):
-                item = QTableWidgetItem(str(cell_data))
-                item.path = row_data[-2]
-                item.plant_slot = row_data[-1]
-                self.table.setItem(row, col, item)
-
             experiment, rpi, camera, plant = row_data[0], row_data[1], row_data[2], row_data[3]
-            active_path = row_data[-2]
+            plate, extra = row_data[4], row_data[5]
+            error_rate, status, date = row_data[6], row_data[7], row_data[8]
+            active_path, plant_slot = row_data[-2], row_data[-1]
+            label = f"{experiment} — {rpi} / {camera} / {plant}"
+            values = (
+                label,
+                status,
+                "" if error_rate in ("", None) else str(error_rate),
+                "" if date in ("", None) else str(date),
+                "" if self._factor_blank(plate) else str(plate),
+                "" if self._factor_blank(extra) else str(extra),
+            )
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                item.path = active_path
+                item.plant_slot = plant_slot
+                if col == OVERVIEW_STATUS:
+                    self._style_status_item(item, status)
+                self.table.setItem(row, col, item)
             if hasattr(self, "plant_dropdown") and self.plant_dropdown is not None:
-                label = f"{experiment} — {rpi} / {camera} / {plant}"
                 self.plant_dropdown.addItem(label, active_path)
             if row % 100 == 99:
                 QtWidgets.QApplication.processEvents()
 
-        self.table.resizeColumnsToContents()
+        self._apply_overview_headers()
+        self._apply_overview_column_visibility(rows)
+        self._layout_overview_columns()
         QtWidgets.QApplication.processEvents()
-        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True)
         self.table.sortItems(current_sort_column, current_sort_order)
 
@@ -1388,11 +1413,19 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             slot = getattr(item, "plant_slot", None) if item is not None else None
             if not slot or os.path.abspath(slot) != plant_slot:
                 continue
-            for col, text in ((6, error_rate), (7, status), (8, date)):
+            for col, text in (
+                (OVERVIEW_ERROR, error_rate),
+                (OVERVIEW_STATUS, status),
+                (OVERVIEW_FINISHED, date),
+            ):
                 cell = table.item(row, col)
                 if cell is None:
                     continue
-                cell.setText("" if text is None else str(text))
+                shown = "" if text is None else str(text)
+                cell.setText(shown)
+                cell.setToolTip(shown)
+                if col == OVERVIEW_STATUS:
+                    self._style_status_item(cell, shown)
             break
         table.setSortingEnabled(sorting)
 
@@ -2067,19 +2100,146 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "Error", f"Failed to launch calibration helper:\n{e}")
 
+    def _factor_blank(self, value):
+        text = str(value or "").strip().lower()
+        return text in ("", "unspecified", "none")
+
+    def _overview_header_labels(self):
+        plate = "Plate condition"
+        extra = "Extra variable"
+        plate_field = getattr(self, "reportPlateConditionAxisLabelField", None)
+        extra_field = getattr(self, "reportExtraVariableAxisLabelField", None)
+        if plate_field is not None and plate_field.text().strip():
+            plate = plate_field.text().strip()
+        if extra_field is not None and extra_field.text().strip():
+            extra = extra_field.text().strip()
+        return ["Plant", "Status", "Error", "Finished", plate, extra]
+
+    def _apply_overview_headers(self):
+        labels = self._overview_header_labels()
+        tips = [
+            "Experiment, device, camera, and plant",
+            "Finished, still running, or not finished",
+            "Error rate",
+            "When the analysis finished",
+            labels[OVERVIEW_PLATE],
+            labels[OVERVIEW_EXTRA],
+        ]
+        self.table.setHorizontalHeaderLabels(labels)
+        column_hint = " Right-click a column title to show or hide columns."
+        for col, tip in enumerate(tips):
+            item = self.table.horizontalHeaderItem(col)
+            if item is not None:
+                item.setToolTip(tip + column_hint)
+
+    def _style_status_item(self, item, status):
+        colors = {
+            "Finished": "#d9efd9",
+            "Running": "#d6e6f8",
+            "Not finished": "#f6ecd4",
+        }
+        color = colors.get(status)
+        if color is None:
+            item.setBackground(QtGui.QBrush())
+            item.setForeground(QtGui.QBrush())
+            return
+        item.setBackground(QtGui.QBrush(QtGui.QColor(color)))
+        item.setForeground(QtGui.QBrush(QtGui.QColor("#1a1a1a")))
+
+    def _apply_overview_column_visibility(self, rows):
+        plate_blank = not rows or all(self._factor_blank(row[4]) for row in rows)
+        extra_blank = not rows or all(self._factor_blank(row[5]) for row in rows)
+        auto = {
+            OVERVIEW_PLATE: plate_blank,
+            OVERVIEW_EXTRA: extra_blank,
+        }
+        self._overview_applying_widths = True
+        try:
+            for col in range(self.table.columnCount()):
+                if col == OVERVIEW_PLANT:
+                    hidden = False
+                elif col in self._overview_hidden_override:
+                    hidden = self._overview_hidden_override[col]
+                else:
+                    hidden = auto.get(col, False)
+                self.table.setColumnHidden(col, hidden)
+        finally:
+            self._overview_applying_widths = False
+
+    def _layout_overview_columns(self):
+        header = self.table.horizontalHeader()
+        defaults = {
+            OVERVIEW_STATUS: 118,
+            OVERVIEW_ERROR: 70,
+            OVERVIEW_FINISHED: 156,
+            OVERVIEW_PLATE: 130,
+            OVERVIEW_EXTRA: 110,
+        }
+        self._overview_applying_widths = True
+        try:
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(OVERVIEW_PLANT, QHeaderView.Stretch)
+            for col, width in defaults.items():
+                header.setSectionResizeMode(col, QHeaderView.Interactive)
+                header.resizeSection(col, self._overview_user_widths.get(col, width))
+        finally:
+            self._overview_applying_widths = False
+
+    def _remember_overview_width(self, logical, _old, new):
+        if self._overview_applying_widths or logical == OVERVIEW_PLANT or new <= 0:
+            return
+        self._overview_user_widths[logical] = new
+
+    def _expand_overview_column(self, logical):
+        if logical == OVERVIEW_PLANT:
+            return
+        self.table.resizeColumnToContents(logical)
+
+    def show_overview_column_menu(self, pos):
+        header = self.table.horizontalHeader()
+        menu = QtWidgets.QMenu(self.table)
+        actions = []
+        for col in range(self.table.columnCount()):
+            item = self.table.horizontalHeaderItem(col)
+            label = item.text() if item is not None else f"Column {col + 1}"
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(col))
+            action.setData(col)
+            if col == OVERVIEW_PLANT:
+                action.setEnabled(False)
+            actions.append(action)
+        chosen = menu.exec_(header.mapToGlobal(pos))
+        if chosen is None or not chosen.isEnabled():
+            return
+        col = chosen.data()
+        if col is None or col == OVERVIEW_PLANT:
+            return
+        hidden = not chosen.isChecked()
+        self._overview_hidden_override[col] = hidden
+        self.table.setColumnHidden(col, hidden)
+
     def setup_tab2_elements(self):
         # Create the table
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
-        self.table.setHorizontalHeaderLabels([
-            "Experiment", "Raspberry", "Camera", "Plant Number",
-            "Plate Condition", "Extra Variable",
-            "Error Rate", "Status", "Finish Date",
-        ])
+        self.table.setColumnCount(OVERVIEW_COLUMNS)
+        self.table.setHorizontalHeaderLabels(self._overview_header_labels())
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setTextElideMode(QtCore.Qt.ElideRight)
+        self.table.setWordWrap(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_overview_context_menu)
+        header = self.table.horizontalHeader()
+        header.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self.show_overview_column_menu)
+        header.sectionResized.connect(self._remember_overview_width)
+        header.sectionHandleDoubleClicked.connect(self._expand_overview_column)
+        header.setStretchLastSection(False)
+        self._layout_overview_columns()
 
         # Enable sorting
         self.table.setSortingEnabled(True)
@@ -2120,9 +2280,17 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         buttons_layout.addWidget(self.remap_identifiers_button)
         buttons_layout.addWidget(self.rerun_analysis_button_tab2)
 
+        self.overview_hint = QLabel(
+            "Right-click a plant to open it in Plant Overlay. "
+            "Right-click a column title to show or hide columns."
+        )
+        self.overview_hint.setWordWrap(True)
+        self.overview_hint.setStyleSheet("color: #5c5c5c;")
+
         # Set up the main layout
         layout = QVBoxLayout()
         layout.addWidget(self.table)
+        layout.addWidget(self.overview_hint)
         layout.addLayout(buttons_layout)
 
         # Create and set up the new tab
