@@ -273,6 +273,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def ensure_plant_inventory(self, force=False):
         """Scan Analysis/ off the GUI thread if the inventory is stale (or force=True)."""
         if self._inventory_busy:
+            if force:
+                self._inventory_deferred = True
+            return
+        if getattr(run_off_main_thread, "depth", 0):
+            if force or self.inventory_is_stale():
+                self._inventory_deferred = True
             return
         if not force and not self.inventory_is_stale():
             return
@@ -314,6 +320,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             )
         finally:
             self._inventory_busy = False
+        self._finish_deferred_loads()
 
     def apply_plant_inventory(self, project_path, rows):
         """Fill Overview table + Overlay combo on the UI thread."""
@@ -806,35 +813,34 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportCaptureIntervalField.editingFinished.connect(
             lambda: self.validate_numeric_input(self.reportCaptureIntervalField))
 
-    def get_image_paths(self):
-        if not os.path.exists(os.path.join(self.selected_plant, "log.txt")):
+    def get_image_paths(self, result_dir=None):
+        result_dir = result_dir or self.selected_plant
+        if not result_dir or not os.path.exists(os.path.join(result_dir, "log.txt")):
             return None, None, None, None, None
         
-        metadata = load_result_metadata(self.selected_plant)
+        metadata = load_result_metadata(result_dir)
         bbox = get_bounding_box(metadata)
         
-        experiment = self.selected_plant.split(os.path.sep)[-5]
-        rpi = self.selected_plant.split(os.path.sep)[-4]
-        camera = self.selected_plant.split(os.path.sep)[-3]
-        plant = self.selected_plant.split(os.path.sep)[-2]
+        experiment = result_dir.split(os.path.sep)[-5]
+        rpi = result_dir.split(os.path.sep)[-4]
+        camera = result_dir.split(os.path.sep)[-3]
+        plant = result_dir.split(os.path.sep)[-2]
 
         filename = experiment + "_" + rpi + "_" + camera + "_" + plant + ".png"
-        image2_path = os.path.join(self.selected_plant, filename)
+        image2_path = os.path.join(result_dir, filename)
         
         if not os.path.exists(image2_path):
             image2_path = None
 
-        from analysis.utils.fileUtilities import list_video_pngs
         from analysis.utils.tiff_stack import mask_stack_paths, result_frame_names, tiff_n_frames
 
-        layout = mask_stack_paths(self.selected_plant)
-        origs, _video_dir = list_video_pngs(metadata)
-        names = result_frame_names(self.selected_plant)
+        layout = mask_stack_paths(result_dir)
+        names = result_frame_names(result_dir)
         # The last picture follows postprocess. FilesAfterPostprocessing is
         # written there and already stops at the analysis period. Before
         # that file exists, show the last frame analysis actually tracked.
         frame_index = None
-        post_csv = os.path.join(self.selected_plant, "FilesAfterPostprocessing.csv")
+        post_csv = os.path.join(result_dir, "FilesAfterPostprocessing.csv")
         if names and os.path.isfile(post_csv):
             posted = []
             try:
@@ -861,15 +867,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if frame_index is None:
                 frame_index = n_pages - 1
             frame_index = max(0, min(frame_index, n_pages - 1))
-            image1_path = None
             wanted = os.path.basename(names[frame_index]) if names and frame_index < len(names) else ''
-            if wanted and origs:
-                for candidate in origs:
-                    if os.path.basename(candidate) == wanted:
-                        image1_path = candidate
-                        break
-            if image1_path is None and origs:
-                image1_path = origs[min(frame_index, len(origs) - 1)]
+            image1_path = self._original_frame(metadata, wanted, frame_index)
             return image1_path, image2_path, overlay, bbox, frame_index
 
         overlayPath = layout["seg_multi"]
@@ -892,19 +891,37 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                     overlay = candidate
                     break
         last_name = os.path.basename(overlay)
-        image1_path = None
-        for candidate in origs or []:
-            if os.path.basename(candidate) == last_name:
-                image1_path = candidate
-                break
-        if image1_path is None and origs:
-            image1_path = origs[min(frame_index, len(origs) - 1)]
+        image1_path = self._original_frame(metadata, last_name, frame_index)
 
         return image1_path, image2_path, overlay, bbox, frame_index
+
+    def _original_frame(self, metadata, wanted_name, frame_index):
+        """The camera PNG for one frame. Check that file name before listing the folder."""
+        from analysis.utils.fileUtilities import find_named_video_png, list_video_pngs
+
+        named = find_named_video_png(metadata, wanted_name) if wanted_name else ""
+        if named:
+            return named
+        origs, _video_dir = list_video_pngs(metadata)
+        if wanted_name and origs:
+            for candidate in origs:
+                if os.path.basename(candidate) == os.path.basename(wanted_name):
+                    return candidate
+        if origs and frame_index is not None:
+            return origs[min(frame_index, len(origs) - 1)]
+        return None
 
     def update_image_labels(self):
         # Add safety check
         if not hasattr(self, 'plant_dropdown') or self.plant_dropdown is None:
+            return
+
+        # The plant load runs a nested event loop while the camera PNG is read.
+        # Tab changes are delivered inside that loop. Starting
+        # another load there stacks "Loading plant…" dialogs until every read
+        # finishes. Remember that a newer view was requested and do it once.
+        if getattr(self, "_overlay_load_guard", False) or getattr(run_off_main_thread, "depth", 0):
+            self._overlay_reload_pending = True
             return
 
         self.selected_plant = self.current_plant_path()
@@ -912,6 +929,15 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         if self._hide_finished_view_while_relaunching():
+            return
+
+        # An analysis still writing this folder has no completion log. Do not
+        # open its TIFF from a worker thread; that races the writer and the
+        # plant-list refresh and aborts the window.
+        if os.path.basename(self.selected_plant).startswith("Results_") and not os.path.isfile(
+            os.path.join(self.selected_plant, "log.txt")
+        ):
+            self._show_analysis_in_progress()
             return
 
         try:
@@ -935,10 +961,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.image_label2.show()
             return
 
+        result_dir = self.selected_plant
+
         def load():
-            # get_image_paths reads the plant selected above. The window is
-            # disabled for the duration of this call, so that path stays put.
-            image1_path, image2_path, overlay, bbox, frame_index = self.get_image_paths()
+            # Paths were chosen on the GUI thread. Read that folder even if a
+            # tab event changes the dropdown before this worker finishes.
+            image1_path, image2_path, overlay, bbox, frame_index = self.get_image_paths(result_dir)
             summary = None
             if image2_path is not None and os.path.exists(image2_path):
                 with open(image2_path, 'rb') as handle:
@@ -988,7 +1016,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             except Exception as exc:
                 return ('error', str(exc), summary)
 
-        kind, payload, summary = run_off_main_thread(self, "Loading plant…", load)
+        self._overlay_load_guard = True
+        try:
+            kind, payload, summary = run_off_main_thread(self, "Loading plant…", load)
+        finally:
+            self._overlay_load_guard = False
 
         pixmap1 = None
         pixmap2 = None
@@ -1034,7 +1066,30 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if pixmap1 is not None and pixmap2 is not None:
             self._overlay_pixmap_cache[cache_key] = (pixmap1, pixmap2)
 
+        self._finish_deferred_loads()
         return
+
+    def _finish_deferred_loads(self):
+        """Run the one refresh or picture load that arrived during an image read."""
+        if getattr(self, "_draining_loads", False):
+            return
+        if getattr(run_off_main_thread, "depth", 0) or getattr(self, "_overlay_load_guard", False):
+            return
+        if not getattr(self, "_inventory_deferred", False) and not getattr(self, "_overlay_reload_pending", False):
+            return
+        self._draining_loads = True
+        try:
+            if getattr(self, "_inventory_deferred", False):
+                self._inventory_deferred = False
+                self.ensure_plant_inventory(force=True)
+            if getattr(self, "_overlay_reload_pending", False):
+                self._overlay_reload_pending = False
+                if hasattr(self, "tab_widget") and self.tab_widget.currentIndex() == 2:
+                    self.update_image_labels()
+        finally:
+            self._draining_loads = False
+        if getattr(self, "_inventory_deferred", False) or getattr(self, "_overlay_reload_pending", False):
+            self._finish_deferred_loads()
 
     def analysis(self):
         """Run analysis with validation"""
@@ -1293,6 +1348,15 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             label.setAlignment(QtCore.Qt.AlignCenter)
             label.show()
 
+    def _show_analysis_in_progress(self):
+        self._clear_overlay_cache_for_path(self.selected_plant)
+        for label in (getattr(self, "image_label1", None), getattr(self, "image_label2", None)):
+            if label is None:
+                continue
+            label.setText("Analysis in progress…")
+            label.setAlignment(QtCore.Qt.AlignCenter)
+            label.show()
+
     def _follow_relaunch(self, result_or_slot, baseline=None):
         """Keep this plant selected on the run that the redo is about to create."""
         slot = self._slot_of_plant_path(result_or_slot)
@@ -1366,6 +1430,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         watches = getattr(self, "_relaunch_watches", {})
         info = watches.get(plant_slot)
         if not info or info.get("token") != token:
+            return
+        if getattr(self, "_inventory_busy", False) or getattr(run_off_main_thread, "depth", 0):
+            QtCore.QTimer.singleShot(
+                500,
+                lambda slot=plant_slot, tok=token, left=ticks_left: self._poll_relaunch(slot, tok, left),
+            )
             return
         latest = get_latest_result_dir(plant_slot) or ""
         latest_abs = os.path.abspath(latest) if latest else ""
@@ -1551,14 +1621,28 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         return False
 
     def PostProcess(self):
+        # The analysis-period dialog can cancel this. Say the job started only
+        # after that prompt is finished and the process is actually launched.
         if not self._ensure_analysis_period():
             return
         self.saveFieldsIntoJson()
         pipeline_runner.run_postprocess(self.projectField.text())
-    
+        QtWidgets.QMessageBox.information(
+            self,
+            "Postprocessing started",
+            "Postprocessing started.\n\n"
+            "It is running in the terminal. You do not need to press the button again.",
+        )
+
     def report(self):
         self.saveFieldsIntoJson()
         pipeline_runner.run_report(self.projectField.text())
+        QtWidgets.QMessageBox.information(
+            self,
+            "Report generation started",
+            "Report generation started.\n\n"
+            "It is running in the terminal. You do not need to press the button again.",
+        )
 
     def syncProjectFolderField(self):
         projectFolder = self.projectField.text()

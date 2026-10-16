@@ -207,23 +207,14 @@ def createSaveFolder(conf):
     return paths
 
 def resolve_existing_dir(path):
-    """Directory that exists for a stored path.
+    """Stored directory path with a leading ~ expanded.
 
-    Metadata written on one machine often uses ``/home/<user>/net/NetScratch/...``.
-    Other machines mount the same files at ``/net/NetScratch/...``.
+    The path is whatever the project metadata recorded. Nothing here rewrites
+    it for a particular machine or mount.
     """
     if not path:
         return ""
-    path = os.path.expanduser(str(path))
-    if os.path.isdir(path):
-        return path
-    marker = "/net/"
-    index = path.find(marker)
-    if index > 0:
-        shared = path[index:]
-        if os.path.isdir(shared):
-            return shared
-    return path
+    return os.path.expanduser(str(path))
 
 
 def _candidate_dirs(conf):
@@ -233,6 +224,43 @@ def _candidate_dirs(conf):
         if folder and folder not in folders:
             folders.append(folder)
     return folders
+
+
+def find_named_video_png(conf, filename):
+    """One camera PNG, without listing the whole directory.
+
+    Listing every PNG is slow when the camera folder is on another disk,
+    and the overlay only needs the frame named in the local results.
+    """
+    name = os.path.basename(str(filename or ""))
+    if not name:
+        return ""
+    for folder in _candidate_dirs(conf):
+        candidate = os.path.join(folder, name)
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    for folder in _candidate_dirs(conf):
+        metadata_path = os.path.join(folder, "Segmentation", "segmentation_metadata.json")
+        if not os.path.isfile(metadata_path):
+            continue
+        try:
+            with open(metadata_path, "r") as handle:
+                metadata = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            continue
+        images_path = resolve_existing_dir(metadata.get("input_path") or "")
+        if not images_path:
+            continue
+        candidate = os.path.join(images_path, name)
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    return ""
 
 
 def list_video_pngs(conf):
