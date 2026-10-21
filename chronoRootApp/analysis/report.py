@@ -37,6 +37,7 @@ plt.switch_backend('agg')
 
 from .utils.fileUtilities import convertFromPathSafe, convertToPathSafe
 from .utils.report_paths import (
+    FIGURE_FORMATS,
     GERMINATION_TIME_SLUG,
     MODULE_TEMPORAL,
     REPLICAS_DIR,
@@ -45,6 +46,7 @@ from .utils.report_paths import (
     data_file,
     metric_dir,
     overview_dir,
+    save_report_figure,
     table_file,
     temporal_metric_slug,
 )
@@ -339,7 +341,11 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
         dataframe.plot(x='ElapsedTime (h)', y='LateralRootsLength (mm)', ax=ax1, color='b', label='Lateral Roots Length')
     dataframe.plot(x='ElapsedTime (h)', y='HypocotylLength (mm)', ax=ax1, color='r', label='Hypocotyl Length')
     
-    ax1.set_title('%s' % convertFromPathSafe(name), fontsize=TITLE_SIZE)
+    title_name = name
+    title_root, title_ext = os.path.splitext(name)
+    if title_ext.lower() in FIGURE_FORMATS:
+        title_name = title_root
+    ax1.set_title('%s' % convertFromPathSafe(title_name), fontsize=TITLE_SIZE)
     ax1.set_ylabel('Length (mm)', fontsize=LABEL_SIZE)
     ax1.tick_params(axis='y', which='major', labelsize=TICK_SIZE)
     ax1.legend(fontsize=LEGEND_SIZE, loc='upper left')
@@ -359,8 +365,10 @@ def plot_individual_plant(savepath, dataframe, name, conf=None):
             ax2, dataframe, conf, day_axis=False, annotate=True,
         )
 
-    fig.savefig(os.path.join(savepath, name), dpi=150, bbox_inches='tight')
-        
+    root, ext = os.path.splitext(name)
+    png_name = root + '.png' if ext.lower() in FIGURE_FORMATS or ext == '' else name
+    save_report_figure(fig, os.path.join(savepath, png_name), conf, dpi=150, bbox_inches='tight')
+
     plt.cla()
     plt.clf()
     plt.close('all')
@@ -379,27 +387,29 @@ def individual_plot_stamp(dataframe, conf):
     conf = conf or {}
     text += '|' + '|'.join(str(conf.get(key)) for key in (
         'includeLateralRootPlots', 'figureClockTicks', 'showFigureClockTicks',
-        'timeDurationHours',
+        'timeDurationHours', 'exportSvg', 'exportPdf',
     ))
     return hashlib.sha256(text.encode()).hexdigest()
 
 
 def save_individual_plant_plot(savepath, dataframe, name, conf, cache_path):
-    """Draw the plant figure, or copy the stored one when the series is unchanged."""
+    """Draw the plant figure, or copy the stored PNG when the series is unchanged."""
     os.makedirs(savepath, exist_ok=True)
-    dest = os.path.join(savepath, name)
+    root, ext = os.path.splitext(name)
+    png_name = root + '.png' if ext.lower() in FIGURE_FORMATS or ext == '' else name
+    dest = os.path.join(savepath, png_name)
+    cache_png = os.path.splitext(cache_path)[0] + '.png'
     stamp = individual_plot_stamp(dataframe, conf)
-    stamp_path = cache_path + '.stamp'
-    if os.path.isfile(cache_path) and os.path.isfile(stamp_path):
+    stamp_path = cache_png + '.stamp'
+    if os.path.isfile(cache_png) and os.path.isfile(stamp_path) and os.path.isfile(dest):
         with open(stamp_path, encoding='utf-8') as handle:
             stored = handle.read()
         if stored == stamp:
-            if not os.path.isfile(dest) or os.path.getsize(dest) != os.path.getsize(cache_path):
-                shutil.copy(cache_path, dest)
             return False
-    plot_individual_plant(savepath, dataframe, name, conf)
-    if os.path.isfile(dest):
-        shutil.copy(dest, cache_path)
+    plot_individual_plant(savepath, dataframe, png_name, conf)
+    if os.path.isfile(dest) and os.path.abspath(dest) != os.path.abspath(cache_png):
+        shutil.copy(dest, cache_png)
+    if os.path.isfile(cache_png):
         with open(stamp_path, 'w', encoding='utf-8') as handle:
             handle.write(stamp)
     return True
@@ -622,7 +632,11 @@ def plot_info_all(conf, dataframe):
         ax.set_ylabel(_overview_ylabel(col), fontsize=12)
     decorate_elapsed_time_axes(axes, dataframe, conf)
 
-    plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_subplots.png'), dpi=300, bbox_inches='tight')
+    save_report_figure(
+        plt,
+        os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_subplots.png'),
+        conf, dpi=300, bbox_inches='tight',
+    )
 
     plt.cla()
     plt.clf()
@@ -642,7 +656,11 @@ def plot_info_all(conf, dataframe):
         ax.set_ylabel('Number of plants', fontsize=12)
         ax.legend(loc='best', title=geno_label)
     decorate_elapsed_time_axes(axes_n, dataframe, conf)
-    plt.savefig(os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_n.png'), dpi=300, bbox_inches='tight')
+    save_report_figure(
+        plt,
+        os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_n.png'),
+        conf, dpi=300, bbox_inches='tight',
+    )
 
     plt.cla()
     plt.clf()

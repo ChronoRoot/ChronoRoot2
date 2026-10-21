@@ -48,6 +48,47 @@ ANGLE_METRICS = {
 
 GERMINATION_TIME_SLUG = 'germination_time'
 
+FIGURE_FORMATS = ('.png', '.svg', '.pdf')
+
+
+def _flag(conf, key):
+    value = (conf or {}).get(key)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes')
+    return bool(value)
+
+
+def optional_figure_extensions(conf=None):
+    """Extra suffixes besides the PNG that is always written."""
+    conf = conf or {}
+    if 'exportSvg' in conf or 'exportPdf' in conf:
+        extras = []
+        if _flag(conf, 'exportSvg'):
+            extras.append('.svg')
+        if _flag(conf, 'exportPdf'):
+            extras.append('.pdf')
+        return extras
+    legacy = str(conf.get('figureFormat') or '').strip().lower()
+    if legacy and not legacy.startswith('.'):
+        legacy = '.' + legacy
+    if legacy in ('.svg', '.pdf'):
+        return [legacy]
+    return []
+
+
+def save_report_figure(target, path, conf=None, **kwargs):
+    """Write a PNG, plus .svg and .pdf when those options are on.
+
+    Existing files in the other formats are left in place.
+    """
+    root, ext = os.path.splitext(path)
+    if ext.lower() not in FIGURE_FORMATS and ext != '':
+        target.savefig(path, **kwargs)
+        return
+    for suffix in ['.png', *optional_figure_extensions(conf)]:
+        target.savefig(root + suffix, **kwargs)
+
+
 def metric_slug(display_name: str) -> str:
     """Convert a display metric name to a filesystem-safe folder slug."""
     text = str(display_name).strip().lower()
@@ -177,7 +218,7 @@ def temporal_metric_slug(metric_column: str) -> str:
 
 
 def purge_disabled_comparison_outputs(conf, effective_modes):
-    """Remove comparison PNG/stats for modes not in the effective list.
+    """Remove comparison figures and stats for modes not in the effective list.
 
     Only touches directories that already exist so unused modules
     (angles, convex hull, unselected temporal slugs) are not created.
@@ -211,7 +252,11 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
                     continue
                 for mode in disabled:
                     stem = f'{slug}_{mode}'
-                    for filename in (f'{stem}.png', f'{stem}_stats.txt', f'{stem}_count.png'):
+                    names = [f'{stem}_stats.txt']
+                    for ext in FIGURE_FORMATS:
+                        names.append(f'{stem}{ext}')
+                        names.append(f'{stem}_count{ext}')
+                    for filename in names:
                         path = os.path.join(out_dir, filename)
                         if os.path.isfile(path):
                             os.remove(path)
@@ -222,7 +267,11 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
             continue
         for mode in disabled:
             stem = f'{parent_slug}_{mode}'
-            for filename in (f'{stem}.png', f'{stem}_stats.txt', f'{stem}_count.png'):
+            names = [f'{stem}_stats.txt']
+            for ext in FIGURE_FORMATS:
+                names.append(f'{stem}{ext}')
+                names.append(f'{stem}_count{ext}')
+            for filename in names:
                 path = os.path.join(growth_dir, filename)
                 if os.path.isfile(path):
                     os.remove(path)

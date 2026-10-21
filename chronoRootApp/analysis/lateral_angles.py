@@ -60,6 +60,7 @@ from .utils.report_paths import (
     data_file,
     first_lr_overlays_dir,
     plot_file,
+    save_report_figure,
     table_file,
     metric_dir,
 )
@@ -1221,8 +1222,8 @@ def render_plant_angle_figures(job):
 
     Top-level so a spawn process pool can call it. Tracking is not repeated
     here: the zoom reads FirstLRTrack.json written by getAngles.
-    The all-lateral folder gets the two incrusted SVGs. The first-lateral
-    montage, with the tip angle drawn, is saved beside the decay figure.
+    The all-lateral folder gets the two angle figures in the selected format.
+    The first-lateral montage, with the tip angle drawn, is saved beside the decay figure.
     """
     conf = job['conf']
     exp = job['exp']
@@ -1311,8 +1312,11 @@ def render_plant_angle_figures(job):
             emergence_distance=emergence_mm,
         )
         plt.title(f"Emergence Angles — {when}")
-        save = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_emergence_angles.svg"
-        plt.savefig(os.path.join(save_path, save), bbox_inches="tight", dpi=200)
+        save_report_figure(
+            plt,
+            os.path.join(save_path, f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_emergence_angles.png"),
+            conf, bbox_inches="tight", dpi=200,
+        )
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
@@ -1321,8 +1325,11 @@ def render_plant_angle_figures(job):
             emergence_distance=emergence_mm,
         )
         plt.title(f"Tip Angles — {when}")
-        filename = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_tip_angles.svg"
-        plt.savefig(os.path.join(save_path, filename), bbox_inches="tight", dpi=200)
+        save_report_figure(
+            plt,
+            os.path.join(save_path, f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_tip_angles.png"),
+            conf, bbox_inches="tight", dpi=200,
+        )
         plt.close(fig)
 
         track_path = os.path.join(results_path, 'FirstLRTrack.json')
@@ -1441,16 +1448,24 @@ def render_plant_angle_figures(job):
             reason = track.get("stop_reason")
             if drawn and reason:
                 fig.text(0.5, 0.01, reason, ha="center", fontsize=10)
+            zoom_stem = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h"
+            zoom_dir = job.get('first_lr_save_path') or save_path
+            os.makedirs(zoom_dir, exist_ok=True)
             if drawn:
-                zoom_name = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h.png"
-                zoom_dir = job.get('first_lr_save_path') or save_path
-                os.makedirs(zoom_dir, exist_ok=True)
-                fig.savefig(os.path.join(zoom_dir, zoom_name), dpi=150, bbox_inches='tight')
+                save_report_figure(
+                    fig,
+                    os.path.join(zoom_dir, zoom_stem + '.png'),
+                    conf, dpi=150, bbox_inches='tight',
+                )
+            else:
+                stale = os.path.join(zoom_dir, zoom_stem + '.png')
+                if os.path.isfile(stale):
+                    os.remove(stale)
             plt.close(fig)
         else:
-            zoom_name = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h.png"
+            zoom_stem = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_first_lr_72h"
             zoom_dir = job.get('first_lr_save_path') or save_path
-            stale = os.path.join(zoom_dir, zoom_name)
+            stale = os.path.join(zoom_dir, zoom_stem + '.png')
             if os.path.isfile(stale):
                 os.remove(stale)
 

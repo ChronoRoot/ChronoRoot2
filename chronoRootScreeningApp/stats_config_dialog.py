@@ -34,6 +34,7 @@ class ScreeningStatsConfigDialog(StatsConfigDialog):
 
         self.everyXhourFieldAngles[0].hide()
         self.everyXhourFieldAngles[1].hide()
+        self.skipIndividualAnglePlots.hide()
 
         for object_name, label in MODE_LABELS.items():
             checkbox = self._mode_checkboxes.get(object_name)

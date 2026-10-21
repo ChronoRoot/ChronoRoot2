@@ -21,6 +21,7 @@ from .utils.report_paths import (
     clear_replicas_subdir,
     comparison_plot_path,
     metric_dir,
+    save_report_figure,
 )
 from .plot_time_axis import (
     decorate_elapsed_time_axes,
@@ -264,7 +265,7 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
         _decorate_temporal_grid(g, count_data, conf, x_col, title=title)
         g.set_ylabels('Number of plants')
-        g.savefig(count_path, dpi=300, bbox_inches='tight')
+        save_report_figure(g, count_path, conf, dpi=300, bbox_inches='tight')
     except Exception:
         pass
     finally:
@@ -321,7 +322,7 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
             g.set_xlabels(xlabel)
         if ylabel:
             g.set_ylabels(ylabel)
-        g.savefig(output_path, dpi=300, bbox_inches='tight')
+        save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
         plt.close('all')
         _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
@@ -417,7 +418,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             g.fig.suptitle(title, y=1.02)
             if show_mean:
                 _mark_boxplot_means(g, data, 'Experiment', metric)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'genotype_by_extra':
@@ -426,7 +427,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             g.fig.suptitle(title, y=1.02)
             if show_mean:
                 _mark_boxplot_means(g, data, 'Experiment', metric)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'by_plate_condition':
@@ -451,7 +452,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             g.fig.suptitle(title, y=1.02)
             if show_mean:
                 _mark_boxplot_means(g, data, 'PlateCondition', metric)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'extra_within_genotype':
@@ -460,14 +461,14 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             g.fig.suptitle(title, y=1.02)
             if show_mean:
                 _mark_boxplot_means(g, data, 'ExtraVariable', metric)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         else:
             return False
 
         plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        save_report_figure(plt, output_path, conf, dpi=300, bbox_inches='tight')
         plt.close('all')
         return True
     except Exception:
@@ -508,7 +509,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='PlateCondition')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
@@ -517,7 +518,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='ExtraVariable')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
@@ -538,7 +539,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='PlateCondition', facet_col='Experiment')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
@@ -547,7 +548,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='ExtraVariable', facet_col='Experiment')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
@@ -555,7 +556,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             return False
 
         _decorate_snapshot_grid(ax, x_col)
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        save_report_figure(plt, output_path, conf, dpi=300, bbox_inches='tight')
         plt.close('all')
         _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
@@ -567,7 +568,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
 def emit_temporal_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
                                    analysis_type='temporal', metric_label=None,
                                    x_col='ElapsedTime (h)', xlabel=None, ylabel=None):
-    """Generate paired {metric}_{mode}.png for every enabled comparison mode."""
+    """Generate paired comparison figures for every enabled comparison mode."""
     for mode in comparison_modes_for_run(conf, data):
         output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name)
         plot_comparison_mode(

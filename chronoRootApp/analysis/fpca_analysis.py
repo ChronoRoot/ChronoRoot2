@@ -14,6 +14,7 @@ from .utils.report_paths import (
     MODULE_TEMPORAL,
     analysis_dir,
     plot_file,
+    save_report_figure,
     temporal_data_file,
     temporal_metric_slug,
 )
@@ -181,11 +182,11 @@ def performFPCA(conf_path):
             ax.legend(handles, labels, title=f'PC{fpc1} Value', bbox_to_anchor=(1.05, 1), loc='upper left')
 
         plt.tight_layout()
-        for ext in ('png', 'svg'):
-            plt.savefig(
-                plot_file(conf, MODULE_TEMPORAL, mag_slug, f'{mag_slug}_overview.{ext}', 'fpca'),
-                dpi=300, bbox_inches='tight',
-            )
+        save_report_figure(
+            plt,
+            plot_file(conf, MODULE_TEMPORAL, mag_slug, f'{mag_slug}_overview.png', 'fpca'),
+            conf, dpi=300, bbox_inches='tight',
+        )
         plt.close()
         plt.cla()
         plt.clf()
@@ -205,14 +206,14 @@ def performFPCA(conf_path):
                     plt.ylabel(f'PC{j}', fontsize=12)
                     plt.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
                     plt.tight_layout()
-                    for ext in ('png', 'svg'):
-                        plt.savefig(
-                            plot_file(
-                                conf, MODULE_TEMPORAL, mag_slug,
-                                f'{mag_slug}_pc{i}_vs_pc{j}.{ext}', 'fpca',
-                            ),
-                            dpi=300, bbox_inches='tight',
-                        )
+                    save_report_figure(
+                        plt,
+                        plot_file(
+                            conf, MODULE_TEMPORAL, mag_slug,
+                            f'{mag_slug}_pc{i}_vs_pc{j}.png', 'fpca',
+                        ),
+                        conf, dpi=300, bbox_inches='tight',
+                    )
                     plt.close()
                     plt.cla()
                     plt.clf()

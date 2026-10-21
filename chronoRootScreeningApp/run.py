@@ -873,6 +873,9 @@ class AnalysisTab(QWidget):
             'everyXhourFieldFourier': self._int_field(self.everyXhourFieldFourier, 6),
             'everyXhourFieldAngles': self._int_field(self.everyXhourFieldAngles, 6),
             'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
+            'exportSvg': self.exportSvg.isChecked(),
+            'exportPdf': self.exportPdf.isChecked(),
+            'skipIndividualAnglePlots': self.skipIndividualAnglePlots.isChecked(),
             'measureRelativeToInitial': self.measureRelativeToInitial.isChecked(),
             'doFPCA': self.fpca_checkbox.isChecked() and self.plant_growth_checkbox.isChecked(),
             'normFPCA': self.fpca_normalize_checkbox.isChecked(),
@@ -1410,6 +1413,7 @@ class ReportsTab(QWidget):
         scaled = pixmap.scaled(
             self.scroll_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
+        self.image_label.setText('')
         self.image_label.setPixmap(scaled)
 
     def resizeEvent(self, event):

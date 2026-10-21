@@ -38,7 +38,9 @@ from analysis.time_windows import (
     load_hourly_tables,
     subtract_initial_stage,
 )
-from analysis.utils.report_paths import analysis_dir, temporal_data_file
+from analysis.utils.report_paths import (
+    analysis_dir, optional_figure_extensions, save_report_figure, temporal_data_file,
+)
 from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
 from analysis.report_plots import relative_title, emit_replica_scalar_comparisons
 from skfda import FDataGrid
@@ -252,11 +254,11 @@ def _run_fpca_for_metrics(conf, columns):
         ax.set_title(relative_title('PC1 vs PC2', conf))
         ax.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
-        for ext in ('png', 'svg'):
-            plt.savefig(
-                plot_file(conf, MODULE_TEMPORAL, mag_slug, f'{mag_slug}_overview.{ext}', 'fpca'),
-                dpi=300, bbox_inches='tight',
-            )
+        save_report_figure(
+            plt,
+            plot_file(conf, MODULE_TEMPORAL, mag_slug, f'{mag_slug}_overview.png', 'fpca'),
+            conf, dpi=300, bbox_inches='tight',
+        )
         plt.close('all')
 
         for fpc1 in range(1, number_of_components + 1):
@@ -426,6 +428,7 @@ def run_report(conf, combined, all_data):
             add_time_before_photo=conf.get('addTimeBeforePhoto', 0),
             store_for_each_video=conf.get('germinationEachVideo', False),
             time_cut=conf.get('germinationTimeCut', 0),
+            extra_formats=optional_figure_extensions(conf),
         )
         germ_analyzer.analyze()
         if 'GerminationTime' in selected:

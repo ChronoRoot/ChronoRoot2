@@ -89,6 +89,9 @@ class ConfigStore:
         "doLateralAngles": host.doLateralAngles.isChecked(),
         "doFPCA": host.doFPCA.isChecked(),
         "normFPCA": host.normFPCA.isChecked(),
+        "exportSvg": host.exportSvg.isChecked(),
+        "exportPdf": host.exportPdf.isChecked(),
+        "skipIndividualAnglePlots": host.skipIndividualAnglePlots.isChecked(),
         "averagePerPlantStats": host.averagePerPlantStats.isChecked(),
         "measureRelativeToInitial": host.measureRelativeToInitial.isChecked(),
         "statsByGenotype": host.statsByGenotype.isChecked(),
@@ -158,6 +161,9 @@ class ConfigStore:
         host.doLateralAngles,
         host.doFPCA,
         host.normFPCA,
+        host.exportSvg,
+        host.exportPdf,
+        host.skipIndividualAnglePlots,
         host.averagePerPlantStats,
         host.measureRelativeToInitial,
         host.statsByGenotype,
@@ -176,6 +182,15 @@ class ConfigStore:
       val = self.config_value(data, 'advancedComparisonModes')
       if val is not None:
         host.advanced_group.setChecked(bool(val))
+
+    if 'exportSvg' not in data and 'exportPdf' not in data and hasattr(host, 'exportSvg'):
+      legacy = str(self.config_value(data, 'figureFormat') or '').strip().lower()
+      if legacy and not legacy.startswith('.'):
+        legacy = '.' + legacy
+      if legacy == '.svg':
+        host.exportSvg.setChecked(True)
+      elif legacy == '.pdf':
+        host.exportPdf.setChecked(True)
 
     known = self.config_value(data, 'knownDistance')
     if known is not None:

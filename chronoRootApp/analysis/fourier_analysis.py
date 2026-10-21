@@ -24,6 +24,7 @@ from .utils.report_paths import (
     analysis_dir,
     clear_replicas_subdir,
     comparison_plot_path,
+    save_report_figure,
     data_file,
     plot_file,
     stats_file,
@@ -420,11 +421,11 @@ class Visualizer:
 
         plt.suptitle(f"Joint Plot - {metric_config['title']}", fontsize=16, y=1.02)
 
-        for ext in ['png', 'svg']:
-            plt.savefig(
-                plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_overview_joint.{ext}', 'growth_speed'),
-                dpi=300, bbox_inches='tight',
-            )
+        save_report_figure(
+            plt,
+            plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_overview_joint.png', 'growth_speed'),
+            self.conf, dpi=300, bbox_inches='tight',
+        )
         plt.close()
 
 
@@ -476,11 +477,11 @@ class Visualizer:
         plt.suptitle(f"{metric_config['title']} Analysis - Original", fontsize=16, y=1.02)
         
         # Save original plots
-        for ext in ['png', 'svg']:
-            plt.savefig(
-                plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_individual_original.{ext}', 'growth_speed'),
-                dpi=300, bbox_inches='tight',
-            )
+        save_report_figure(
+            plt,
+            plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_individual_original.png', 'growth_speed'),
+            self.conf, dpi=300, bbox_inches='tight',
+        )
         plt.close()
         
         # Second Figure: Normalized Signals
@@ -514,11 +515,11 @@ class Visualizer:
         plt.suptitle(f"{metric_config['title']} Analysis - Normalized", fontsize=16, y=1.02)
         
         # Save normalized plots
-        for ext in ['png', 'svg']:
-            plt.savefig(
-                plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_individual_normalized.{ext}', 'growth_speed'),
-                dpi=300, bbox_inches='tight',
-            )
+        save_report_figure(
+            plt,
+            plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_individual_normalized.png', 'growth_speed'),
+            self.conf, dpi=300, bbox_inches='tight',
+        )
         plt.close()
 
     def _plot_time_series(self, ax, data: pd.DataFrame, time: np.ndarray, 

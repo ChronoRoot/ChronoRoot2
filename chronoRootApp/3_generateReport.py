@@ -286,7 +286,8 @@ if __name__ == "__main__":
     if not relative and conf.get('doLateralAngles'):
         print('Phase 3/3: lateral angles analysis')
         makeLateralAnglesPlots(conf)
-        plotLateralAnglesOnTop(conf)
+        if not conf.get('skipIndividualAnglePlots'):
+            plotLateralAnglesOnTop(conf)
 
     mark_report_status(report_root(conf), STATUS_COMPLETE)
     print("Report generation finished.")

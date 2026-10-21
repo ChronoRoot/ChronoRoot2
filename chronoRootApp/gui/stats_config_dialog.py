@@ -22,9 +22,24 @@ HELP_TEXT = (
 class StatsConfigDialog(QtWidgets.QDialog):
   def __init__(self, parent=None):
     super().__init__(parent)
-    self.setWindowTitle("Configure Statistical Analysis")
+    self.setWindowTitle("Configure Report Parameters")
     self.setModal(True)
-    self.resize(520, 480)
+    self.resize(520, 560)
+
+    self.exportSvg = QtWidgets.QCheckBox("Also export .svg")
+    self.exportSvg.setObjectName("exportSvg")
+    self.exportSvg.setToolTip("PNG is always written. This adds an editable .svg copy.")
+
+    self.exportPdf = QtWidgets.QCheckBox("Also export .pdf")
+    self.exportPdf.setObjectName("exportPdf")
+    self.exportPdf.setToolTip("PNG is always written. This adds a .pdf copy.")
+
+    self.skipIndividualAnglePlots = QtWidgets.QCheckBox("Do not draw individual angle plots")
+    self.skipIndividualAnglePlots.setObjectName("skipIndividualAnglePlots")
+    self.skipIndividualAnglePlots.setToolTip(
+        "Skip the angle overlays and the first-lateral zoom figures so a report "
+        "can be remade faster. Angle comparison statistics are still written."
+    )
 
     self.averagePerPlantStats = QtWidgets.QCheckBox("Average intervals before testing")
     self.averagePerPlantStats.setObjectName("averagePerPlantStats")
@@ -74,6 +89,12 @@ class StatsConfigDialog(QtWidgets.QDialog):
     buttons.rejected.connect(self.reject)
 
     layout = QtWidgets.QVBoxLayout(self)
+    format_label = QtWidgets.QLabel("Figures are always saved as .png.")
+    format_label.setWordWrap(True)
+    layout.addWidget(format_label)
+    layout.addWidget(self.exportSvg)
+    layout.addWidget(self.exportPdf)
+    layout.addWidget(self.skipIndividualAnglePlots)
     layout.addWidget(self.averagePerPlantStats)
     layout.addWidget(self.measureRelativeToInitial)
     layout.addLayout(self._field_row(self.everyXhourField[0], self.everyXhourField[1]))
@@ -100,6 +121,9 @@ class StatsConfigDialog(QtWidgets.QDialog):
 
   def register_on_host(self, host):
     """Expose dialog widgets on the main window for config save/load."""
+    host.exportSvg = self.exportSvg
+    host.exportPdf = self.exportPdf
+    host.skipIndividualAnglePlots = self.skipIndividualAnglePlots
     host.averagePerPlantStats = self.averagePerPlantStats
     host.measureRelativeToInitial = self.measureRelativeToInitial
     host.everyXhourField = self.everyXhourField[1]
@@ -110,6 +134,9 @@ class StatsConfigDialog(QtWidgets.QDialog):
       setattr(host, object_name, checkbox)
 
   def set_defaults(self):
+    self.exportSvg.setChecked(False)
+    self.exportPdf.setChecked(False)
+    self.skipIndividualAnglePlots.setChecked(False)
     self.averagePerPlantStats.setChecked(False)
     self.measureRelativeToInitial.setChecked(False)
     self.everyXhourField[1].setText("6")
@@ -124,6 +151,9 @@ class StatsConfigDialog(QtWidgets.QDialog):
 
   def snapshot_values(self):
     values = {
+        'exportSvg': self.exportSvg.isChecked(),
+        'exportPdf': self.exportPdf.isChecked(),
+        'skipIndividualAnglePlots': self.skipIndividualAnglePlots.isChecked(),
         'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
         'measureRelativeToInitial': self.measureRelativeToInitial.isChecked(),
         'everyXhourField': self.everyXhourField[1].text(),
@@ -140,6 +170,17 @@ class StatsConfigDialog(QtWidgets.QDialog):
   def restore_values(self, values):
     if not values:
       return
+    if 'exportSvg' in values or 'exportPdf' in values:
+      self.exportSvg.setChecked(bool(values.get('exportSvg')))
+      self.exportPdf.setChecked(bool(values.get('exportPdf')))
+    else:
+      legacy = str(values.get('figureFormat') or '').strip().lower()
+      if legacy and not legacy.startswith('.'):
+        legacy = '.' + legacy
+      self.exportSvg.setChecked(legacy == '.svg')
+      self.exportPdf.setChecked(legacy == '.pdf')
+    if 'skipIndividualAnglePlots' in values:
+      self.skipIndividualAnglePlots.setChecked(bool(values.get('skipIndividualAnglePlots')))
     self.averagePerPlantStats.setChecked(bool(values.get('averagePerPlantStats')))
     self.measureRelativeToInitial.setChecked(bool(values.get('measureRelativeToInitial')))
     if values.get('everyXhourField') is not None:

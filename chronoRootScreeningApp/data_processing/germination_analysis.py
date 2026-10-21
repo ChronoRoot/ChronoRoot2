@@ -8,7 +8,7 @@ from scipy.optimize import curve_fit
 class GerminationAnalyzer:
     """Analyzes seed germination data and generates plots."""
     
-    def __init__(self, data=None, output_dir='.', dt=15, store_for_each_video=False, add_time_before_photo=0, time_cut=0):
+    def __init__(self, data=None, output_dir='.', dt=15, store_for_each_video=False, add_time_before_photo=0, time_cut=0, extra_formats=()):
         self.data = self._prepare_data(data)
         self.base_dir = output_dir
         self.plot_dirs = self._setup_directories()
@@ -20,6 +20,14 @@ class GerminationAnalyzer:
         self.store_for_each_video = store_for_each_video
         self.add_time_before_photo = add_time_before_photo
         self.time_cut = time_cut
+        extras = []
+        for fmt in extra_formats or ():
+            text = str(fmt).strip().lower()
+            if text and not text.startswith('.'):
+                text = '.' + text
+            if text in ('.svg', '.pdf') and text not in extras:
+                extras.append(text)
+        self.extra_formats = tuple(extras)
         
         self.germination_data = None
         self.statistics = None
@@ -490,9 +498,13 @@ class GerminationAnalyzer:
                                            f'Kaplan Meier - {group1} vs {group2}')
                     self._save_plot(plot_name)
 
-    def _save_plot(self, name, formats=('.png', '.pdf')):
-        """Save plot in multiple formats."""
-        for fmt in formats:
+    def _save_plot(self, name, formats=None):
+        """Save a PNG, plus any optional extra formats. Other copies are kept."""
+        chosen = ['.png']
+        for fmt in (formats if formats is not None else self.extra_formats):
+            if fmt not in chosen:
+                chosen.append(fmt)
+        for fmt in chosen:
             plt.savefig(name + fmt, bbox_inches='tight', dpi=300)
         plt.close()
 
