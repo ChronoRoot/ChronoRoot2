@@ -2807,7 +2807,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportConfigureStatsButton.setObjectName("reportConfigureStatsButton")
         self.reportConfigureStatsButton.setText("Configure\nReport\nParameters")
         self.reportConfigureStatsButton.setToolTip(
-            "Set statistical testing intervals, averaging, comparison modes, and figure format.")
+            "Set the testing interval, comparison modes, and figure format.")
         self.reportConfigureStatsButton.clicked.connect(self.open_stats_config_dialog)
 
         self.reportGenerateButton = QtWidgets.QPushButton(self.tab4)

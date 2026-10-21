@@ -288,7 +288,7 @@ class DataProcessor:
             f.write('=' * 60 + '\n')
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n')
+            f.write(f'{_describe_averaging()}\n')
             f.write('PART 1: HOURLY GROWTH SPEED COMPARISONS (Original Data)\n')
 
             for start, end in elapsed_hour_windows(time_data, dt, hour_col='Time'):
@@ -641,7 +641,6 @@ if __name__ == "__main__":
     # Example usage
     conf = {
         'MainFolder': '/path/to/main/folder',
-        'everyXhourFieldFourier': 24,
-        'averagePerPlantStats': True
+        'everyXhourFieldFourier': 24
     }
     makeFourierPlots(conf)

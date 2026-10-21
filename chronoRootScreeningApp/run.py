@@ -872,7 +872,6 @@ class AnalysisTab(QWidget):
             'everyXhourField': self._int_field(self.everyXhourField, 6),
             'everyXhourFieldFourier': self._int_field(self.everyXhourFieldFourier, 6),
             'everyXhourFieldAngles': self._int_field(self.everyXhourFieldAngles, 6),
-            'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
             'exportSvg': self.exportSvg.isChecked(),
             'exportPdf': self.exportPdf.isChecked(),
             'skipIndividualAnglePlots': self.skipIndividualAnglePlots.isChecked(),

@@ -128,8 +128,7 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         rpi, cam = analysis_tab.current_rpi_cam()
         payload['rpi'] = rpi
         payload['cam'] = cam
-    if hasattr(analysis_tab, 'averagePerPlantStats'):
-        payload['averagePerPlantStats'] = analysis_tab.averagePerPlantStats.isChecked()
+    if hasattr(analysis_tab, 'everyXhourField'):
         if hasattr(analysis_tab, 'exportSvg'):
             payload['exportSvg'] = analysis_tab.exportSvg.isChecked()
             payload['exportPdf'] = analysis_tab.exportPdf.isChecked()
@@ -262,8 +261,7 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
         _set_checkbox_from_keys(analysis_tab.fpca_checkbox, data, ('do_fpca',))
         _set_checkbox_from_keys(analysis_tab.fpca_normalize_checkbox, data, ('normalize_fpca',))
 
-        if hasattr(analysis_tab, 'averagePerPlantStats'):
-            _set_checkbox_from_keys(analysis_tab.averagePerPlantStats, data, ('averagePerPlantStats',))
+        if hasattr(analysis_tab, 'everyXhourField'):
             if hasattr(analysis_tab, 'exportSvg'):
                 if 'exportSvg' in data or 'exportPdf' in data:
                     _set_checkbox_from_keys(analysis_tab.exportSvg, data, ('exportSvg',))

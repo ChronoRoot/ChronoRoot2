@@ -213,10 +213,8 @@ def _stratify_label(spec, conf):
     return spec['stratify_col']
 
 
-def _describe_averaging(conf):
-    if conf.get('averagePerPlantStats', False):
-        return 'Test values: mean per plant within each time interval, then compared across plants.'
-    return 'Test values: all hourly observations in each interval (no per-plant averaging).'
+def _describe_averaging():
+    return 'Test values: mean per plant within each time interval, then compared across plants.'
 
 
 def _resolve_stats_path(conf, module, metric_slug_name, mode, output_dir=None, metric=None,
@@ -248,10 +246,14 @@ def _usable_groups(values, min_groups=2):
     return groups if len(groups) >= min_groups else []
 
 
-def _average_per_plant(subdata, group_cols, plant_id_col, metric, conf):
-    if not conf.get('averagePerPlantStats', False):
+def _average_per_plant(subdata, group_cols, plant_id_col, metric):
+    """One mean per plant inside the rows already limited to one window."""
+    if plant_id_col not in subdata.columns:
         return subdata
     cols = [c for c in group_cols + [plant_id_col] if c in subdata.columns]
+    if metric in subdata.columns and not pd.api.types.is_numeric_dtype(subdata[metric]):
+        subdata = subdata.copy()
+        subdata[metric] = pd.to_numeric(subdata[metric], errors='coerce')
     return subdata.groupby(cols).mean(numeric_only=True).reset_index()
 
 
@@ -287,7 +289,7 @@ def run_pairwise_comparisons(f, subdata, metric, group_col, stratify_col=None,
     if stratify_col:
         group_cols = [stratify_col, group_col]
 
-    subdata = _average_per_plant(subdata, group_cols, plant_id_col, metric, conf)
+    subdata = _average_per_plant(subdata, group_cols, plant_id_col, metric)
 
     if stratify_col:
         strata = _usable_groups(subdata[stratify_col].unique())
@@ -326,7 +328,7 @@ def perform_temporal_pairwise_stats(conf, data, metric, output_dir=None, plant_i
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
 
             for start, end in elapsed_hour_windows(data, dt):
                 hours = np.arange(start, end)
@@ -363,7 +365,7 @@ def perform_interval_pairwise_stats(conf, data, metric, output_dir, interval_col
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
 
             for interval in intervals:
                 subdata = data[data[interval_col].astype(str) == str(interval)]
@@ -397,7 +399,7 @@ def perform_scalar_pairwise_stats(conf, data, metric, output_dir, plant_id_col='
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
             run_pairwise_comparisons(
                 f, data, metric,
                 group_col=spec['group_col'],
@@ -453,7 +455,7 @@ def perform_fourier_pairwise_stats(conf, subdata, metric, f, plant_id_col='i', t
         cols = [compare_col]
         if spec['stratify_col']:
             cols = [spec['stratify_col'], compare_col]
-        if conf.get('averagePerPlantStats', False) and plant_id_col in subdata.columns:
+        if plant_id_col in subdata.columns:
             subdata = subdata.groupby(cols + [plant_id_col]).mean(numeric_only=True).reset_index()
 
         if spec['stratify_col']:

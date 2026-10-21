@@ -863,8 +863,7 @@ def makeLateralAnglesPlots(conf):
         conf: Configuration dictionary containing:
               - 'MainFolder': Root path for analysis
               - 'daysAngles': Comma-separated days to analyze
-              - 'everyXhourFieldAngles': Interval for statistical analysis
-              - 'averagePerPlantStats': Whether to average per plant before stats
+              - 'everyXhourFieldAngles': Interval for statistical analysis. Each plant contributes its mean in that interval.
     
     Returns:
         None (generates plots and CSV files in Report folder)
@@ -1112,18 +1111,12 @@ def performStatisticalAnalysisFirstLR(conf, data, metric):
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
             for hour in range(0, 73 - dt, dt):
                 end = min(hour + dt, 72)
                 f.write(f'Hour: {hour}-{end}\n')
                 hours = np.arange(hour, end)
                 subdata = data[data['Time'].isin(hours)].copy()
-                if conf.get('averagePerPlantStats', False):
-                    subdata[metric] = subdata[metric].astype(float)
-                    cols = ['Experiment', 'Plant_id']
-                    if spec['stratify_col'] and spec['stratify_col'] in subdata.columns:
-                        cols = [spec['stratify_col']] + cols
-                    subdata = subdata.groupby(cols).mean(numeric_only=True).reset_index()
                 run_pairwise_comparisons(
                     f, subdata, metric,
                     group_col=spec['group_col'],

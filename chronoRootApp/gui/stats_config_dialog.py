@@ -14,8 +14,8 @@ STATS_MODE_WIDGETS = [
 
 HELP_TEXT = (
     "Hypothesis testing uses the Mann-Whitney U test at each dt interval. "
-    "When \"Average intervals before testing\" is checked, each plant contributes "
-    "one mean value per interval; otherwise all hourly observations in the interval are used."
+    "Each plant contributes one mean value per interval. "
+    "The dt fields set the length of that interval."
 )
 
 
@@ -40,9 +40,6 @@ class StatsConfigDialog(QtWidgets.QDialog):
         "Skip the angle overlays and the first-lateral zoom figures so a report "
         "can be remade faster. Angle comparison statistics are still written."
     )
-
-    self.averagePerPlantStats = QtWidgets.QCheckBox("Average intervals before testing")
-    self.averagePerPlantStats.setObjectName("averagePerPlantStats")
 
     self.measureRelativeToInitial = QtWidgets.QCheckBox(
         "Measure each plant relative to initial stage"
@@ -95,7 +92,6 @@ class StatsConfigDialog(QtWidgets.QDialog):
     layout.addWidget(self.exportSvg)
     layout.addWidget(self.exportPdf)
     layout.addWidget(self.skipIndividualAnglePlots)
-    layout.addWidget(self.averagePerPlantStats)
     layout.addWidget(self.measureRelativeToInitial)
     layout.addLayout(self._field_row(self.everyXhourField[0], self.everyXhourField[1]))
     layout.addLayout(self._field_row(self.everyXhourFieldFourier[0], self.everyXhourFieldFourier[1]))
@@ -124,7 +120,6 @@ class StatsConfigDialog(QtWidgets.QDialog):
     host.exportSvg = self.exportSvg
     host.exportPdf = self.exportPdf
     host.skipIndividualAnglePlots = self.skipIndividualAnglePlots
-    host.averagePerPlantStats = self.averagePerPlantStats
     host.measureRelativeToInitial = self.measureRelativeToInitial
     host.everyXhourField = self.everyXhourField[1]
     host.everyXhourFieldFourier = self.everyXhourFieldFourier[1]
@@ -137,7 +132,6 @@ class StatsConfigDialog(QtWidgets.QDialog):
     self.exportSvg.setChecked(False)
     self.exportPdf.setChecked(False)
     self.skipIndividualAnglePlots.setChecked(False)
-    self.averagePerPlantStats.setChecked(False)
     self.measureRelativeToInitial.setChecked(False)
     self.everyXhourField[1].setText("6")
     self.everyXhourFieldFourier[1].setText("6")
@@ -154,7 +148,6 @@ class StatsConfigDialog(QtWidgets.QDialog):
         'exportSvg': self.exportSvg.isChecked(),
         'exportPdf': self.exportPdf.isChecked(),
         'skipIndividualAnglePlots': self.skipIndividualAnglePlots.isChecked(),
-        'averagePerPlantStats': self.averagePerPlantStats.isChecked(),
         'measureRelativeToInitial': self.measureRelativeToInitial.isChecked(),
         'everyXhourField': self.everyXhourField[1].text(),
         'everyXhourFieldFourier': self.everyXhourFieldFourier[1].text(),
@@ -181,7 +174,6 @@ class StatsConfigDialog(QtWidgets.QDialog):
       self.exportPdf.setChecked(legacy == '.pdf')
     if 'skipIndividualAnglePlots' in values:
       self.skipIndividualAnglePlots.setChecked(bool(values.get('skipIndividualAnglePlots')))
-    self.averagePerPlantStats.setChecked(bool(values.get('averagePerPlantStats')))
     self.measureRelativeToInitial.setChecked(bool(values.get('measureRelativeToInitial')))
     if values.get('everyXhourField') is not None:
       self.everyXhourField[1].setText(str(values['everyXhourField']))
