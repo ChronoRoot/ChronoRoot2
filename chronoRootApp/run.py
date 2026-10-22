@@ -1201,9 +1201,13 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 return ('no_seg', len(images))
             return ('ok', None)
 
-        file_status, file_info = run_off_main_thread(
-            self, "Checking images…", check_video_files,
-        )
+        try:
+            file_status, file_info = run_off_main_thread(
+                self, "Checking images…", check_video_files,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         if file_status == 'missing_folder':
             QtWidgets.QMessageBox.warning(None, 'Error', 'Video folder does not exist!\nPlease check the path.')
             return
@@ -1278,9 +1282,13 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 warnings_text = ''
             return conf, already, image_paths, seg_paths, warnings_text
 
-        conf, already, image_paths, seg_paths, warnings_text = run_off_main_thread(
-            self, "Checking images…", prepare_analysis,
-        )
+        try:
+            conf, already, image_paths, seg_paths, warnings_text = run_off_main_thread(
+                self, "Checking images…", prepare_analysis,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
 
         if already:
             reply = QtWidgets.QMessageBox.question(
@@ -1307,14 +1315,24 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
-        loaded = self._load_roi_viewer(conf, image_paths, seg_paths)
+        try:
+            loaded = self._load_roi_viewer(conf, image_paths, seg_paths)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         if loaded is None:
             return
         previous_rois, first = loaded
-        bbox, seed = select_roi_and_seed(
-            conf, image_paths, seg_paths,
-            first_frame=first, previous_rois=previous_rois,
-        )
+
+        try:
+            import plant_viewer
+            bbox, seed = select_roi_and_seed(
+                conf, image_paths, seg_paths,
+                first_frame=first, previous_rois=previous_rois,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         if seed is None:
             return
 
@@ -1328,9 +1346,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             saved['seed'] = seed
             dump_json(pending_analysis_path(project_text), saved)
 
-        run_off_main_thread(self, None, write_pending)
-        pipeline_runner.run_pending_analysis(project_text)
-        
+        try:
+            run_off_main_thread(self, None, write_pending)
+            pipeline_runner.run_pending_analysis(project_text)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+
     def redoAnalysis(self):
         select_roi_and_seed = self._import_roi_selection()
         if select_roi_and_seed is None:
@@ -1361,7 +1382,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
                 seg_paths = seg_paths[:limit_frames]
             return ('ok', (conf, image_paths, seg_paths, own_previous_roi))
 
-        status, payload = run_off_main_thread(self, "Checking images…", prepare_redo)
+        try:
+            status, payload = run_off_main_thread(self, "Checking images…", prepare_redo)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         if status == 'missing':
             return
         if status == 'error':
@@ -1369,16 +1394,26 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
         conf, image_paths, seg_paths, own_previous_roi = payload
 
-        loaded = self._load_roi_viewer(
-            conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
-        )
+        try:
+            loaded = self._load_roi_viewer(
+                conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         if loaded is None:
             return
         previous_rois, first = loaded
-        bbox, seed = select_roi_and_seed(
-            conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
-            first_frame=first, previous_rois=previous_rois,
-        )
+
+        try:
+            import plant_viewer
+            bbox, seed = select_roi_and_seed(
+                conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
+                first_frame=first, previous_rois=previous_rois,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         if seed is None:
             return
 
@@ -1398,7 +1433,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         def write_pending():
             dump_json(pending_analysis_path(project), conf)
 
-        run_off_main_thread(self, None, write_pending)
+        try:
+            run_off_main_thread(self, None, write_pending)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+            return
         relaunch_slot = self._slot_of_plant_path(self.selected_plant)
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         pipeline_runner.run_pending_analysis(project)
@@ -1588,26 +1627,26 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
     def _load_roi_viewer(self, conf, image_paths, seg_paths, own_previous_roi=None):
         def load():
-            import plant_viewer
+            import cv2
+            from analysis.imageUtils.plot import draw_labeled_roi
             from analysis.utils.roi_selection import collect_previous_rois_and_warnings
             previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
             experiment = conf.get('Experiment', '')
             plant_num = conf.get('plant', '?')
             plant_label = f"plant_{plant_num} - {experiment}"
-            idx = len(image_paths) - 1 if image_paths else 0
             first = None
             if image_paths:
-                first = plant_viewer.PlantROISelectorWindow._load_frame(
-                    None, idx, image_paths, seg_paths,
-                    previous_rois, own_previous_roi, plant_label, False,
-                )
+                first = cv2.imread(image_paths[-1])
+                if first is not None:
+                    for label, x1, y1, x2, y2 in previous_rois:
+                        draw_labeled_roi(first, x1, y1, x2, y2, label, color=(255, 0, 0))
+                    if own_previous_roi:
+                        x1, y1, x2, y2 = own_previous_roi
+                        label = plant_label or "current plant"
+                        draw_labeled_roi(first, x1, y1, x2, y2, label, color=(0, 0, 255))
             return previous_rois, first
 
-        try:
-            return run_off_main_thread(self, "Opening plant…", load)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to open the plant viewer:\n{str(e)}")
-            return None
+        return run_off_main_thread(self, "Loading preview…", load)
 
     def reviewPlant(self):
         self.selected_plant = self.current_plant_path()
