@@ -5,7 +5,7 @@ import sys
 import pathlib
 from collections import defaultdict
 
-from PyQt5.QtWidgets import QApplication, QDialog
+from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox
 
 from analysis.utils.fileUtilities import (
     plant_slot_path,
@@ -32,28 +32,13 @@ def _ensure_qapplication():
         return None
 
 
-def _load_opencv_off_gui_thread(images):
-    """Import cv2 away from the GUI thread, as Preview video does.
-
-    This OpenCV build carries its own Qt. Importing it for the first time on
-    the thread that already owns QApplication kills the process.
-    """
-    from gui.background import run_off_main_thread
-
-    def load():
-        import cv2
-        if images:
-            cv2.imread(images[0])
-        return cv2
-
-    run_off_main_thread(None, None, load)
-
-
-def _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=None):
-    _load_opencv_off_gui_thread(images)
+def _run_roi_seed_dialogs(
+    conf, images, seg_files, own_previous_roi=None, first_frame=None, previous_rois=None,
+):
     import plant_viewer
 
-    previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
+    if previous_rois is None:
+        previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
 
     experiment = conf.get('Experiment', '')
     plant_num = conf.get('plant', '?')
@@ -66,6 +51,7 @@ def _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=None):
         time_delta=conf.get('timeStep', 15),
         plant_label=plant_label,
         own_previous_roi=own_previous_roi,
+        first_frame=first_frame,
     )
     if roi_dialog.exec_() != QDialog.Accepted:
         return None, None
@@ -77,7 +63,26 @@ def _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=None):
     x1, y1, x2, y2 = roi
     bbox = [y1, y2, x1, x2]
 
-    seed_dialog = plant_viewer.SeedSelectorWindow(images, seg_files, bbox, conf)
+    def load():
+        import cv2
+        import plant_viewer
+        idx = len(images) - 1 if images else 0
+        if not images:
+            return None
+        return plant_viewer.SeedSelectorWindow._load_frame(
+            None, idx, images, seg_files, bbox, False, None,
+        )
+
+    from gui.background import run_off_main_thread
+    try:
+        seed_frame = run_off_main_thread(QApplication.activeWindow(), "Opening plant…", load)
+    except Exception as exc:
+        QMessageBox.critical(None, "Error", f"Failed to open the plant viewer:\n{exc}")
+        return None, None
+
+    seed_dialog = plant_viewer.SeedSelectorWindow(
+        images, seg_files, bbox, conf, first_frame=seed_frame,
+    )
     if seed_dialog.exec_() != QDialog.Accepted:
         return None, None
 
@@ -238,14 +243,19 @@ def video_path_warnings(conf):
     return warnings_text
 
 
-def select_roi_and_seed(conf, images, seg_files, own_previous_roi=None):
+def select_roi_and_seed(
+    conf, images, seg_files, own_previous_roi=None, first_frame=None, previous_rois=None,
+):
     """
     Interactive ROI and seed selection. Requires an existing QApplication (run.py).
     Returns (bbox, seed) or (None, None) on cancel.
     """
     if QApplication.instance() is None:
         return try_select_roi_and_seed(conf, images, seg_files, own_previous_roi=own_previous_roi)
-    return _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=own_previous_roi)
+    return _run_roi_seed_dialogs(
+        conf, images, seg_files, own_previous_roi=own_previous_roi,
+        first_frame=first_frame, previous_rois=previous_rois,
+    )
 
 
 def try_select_roi_and_seed(conf, images, seg_files, own_previous_roi=None):

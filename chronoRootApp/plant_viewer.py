@@ -473,6 +473,7 @@ class PlantROISelectorWindow(QDialog):
         plant_label=None,
         own_previous_roi=None,
         parent=None,
+        first_frame=None,
     ):
         super().__init__(parent)
         self.images = images
@@ -536,7 +537,23 @@ class PlantROISelectorWindow(QDialog):
         layout.addLayout(action_layout)
 
         _open_frame_thread(self)
-        self._update_display(refit=True)
+        if first_frame is not None:
+            self._show_prepared_frame(first_frame)
+        else:
+            self._update_display(refit=True)
+
+    def _show_prepared_frame(self, img):
+        """Show a frame that was already decoded off the GUI thread."""
+        self.image_height, self.image_width = img.shape[:2]
+        self.pixmap_item.setPixmap(_cv2_to_qpixmap(img))
+        self.scene.setSceneRect(QRectF(self.pixmap_item.pixmap().rect()))
+        self.lbl_frame.setText(self._frame_time_text())
+        self.slider.blockSignals(True)
+        if self.images:
+            self.slider.setRange(0, len(self.images) - 1)
+            self.slider.setValue(self.idx)
+        self.slider.blockSignals(False)
+        QTimer.singleShot(0, self._fit_image)
 
     def done(self, result):
         _close_frame_thread(self)
@@ -686,7 +703,7 @@ class PlantROISelectorWindow(QDialog):
 class SeedSelectorWindow(QDialog):
     """Pick root origin inside the selected plant ROI."""
 
-    def __init__(self, images, seg_files, bbox, conf, parent=None):
+    def __init__(self, images, seg_files, bbox, conf, parent=None, first_frame=None):
         super().__init__(parent)
         self.images = images
         self.seg_files = seg_files
@@ -741,7 +758,28 @@ class SeedSelectorWindow(QDialog):
         layout.addLayout(action_layout)
 
         _open_frame_thread(self)
-        self._update_display(refit=True)
+        if first_frame is not None:
+            self._show_prepared_frame(first_frame)
+        else:
+            self._update_display(refit=True)
+
+    def _show_prepared_frame(self, img):
+        """Show a frame that was already decoded and cropped off the GUI thread."""
+        self.pixmap_item.setPixmap(_cv2_to_qpixmap(img))
+        self.scene.setSceneRect(QRectF(self.pixmap_item.pixmap().rect()))
+        idx = self.idx
+        minutes = (idx * self.time_delta) % 60
+        hours = int((idx * self.time_delta / 60) % 24)
+        days = int(idx * self.time_delta // 1440)
+        self.lbl_frame.setText(
+            f"Frame {idx + 1}/{len(self.images)}  |  Day {days}  Time {hours:02d}:{int(minutes):02d}"
+        )
+        self.slider.blockSignals(True)
+        if self.images:
+            self.slider.setRange(0, len(self.images) - 1)
+            self.slider.setValue(idx)
+        self.slider.blockSignals(False)
+        QTimer.singleShot(0, self._fit_image)
 
     def done(self, result):
         _close_frame_thread(self)

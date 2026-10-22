@@ -1307,7 +1307,14 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
-        bbox, seed = select_roi_and_seed(conf, image_paths, seg_paths)
+        loaded = self._load_roi_viewer(conf, image_paths, seg_paths)
+        if loaded is None:
+            return
+        previous_rois, first = loaded
+        bbox, seed = select_roi_and_seed(
+            conf, image_paths, seg_paths,
+            first_frame=first, previous_rois=previous_rois,
+        )
         if seed is None:
             return
 
@@ -1362,8 +1369,15 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
         conf, image_paths, seg_paths, own_previous_roi = payload
 
+        loaded = self._load_roi_viewer(
+            conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
+        )
+        if loaded is None:
+            return
+        previous_rois, first = loaded
         bbox, seed = select_roi_and_seed(
             conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
+            first_frame=first, previous_rois=previous_rois,
         )
         if seed is None:
             return
@@ -1571,6 +1585,29 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         pipeline_runner.run_analysis_rerun(metadata_path)
         self._follow_relaunch(path, baseline=relaunch_baseline)
+
+    def _load_roi_viewer(self, conf, image_paths, seg_paths, own_previous_roi=None):
+        def load():
+            import plant_viewer
+            from analysis.utils.roi_selection import collect_previous_rois_and_warnings
+            previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
+            experiment = conf.get('Experiment', '')
+            plant_num = conf.get('plant', '?')
+            plant_label = f"plant_{plant_num} - {experiment}"
+            idx = len(image_paths) - 1 if image_paths else 0
+            first = None
+            if image_paths:
+                first = plant_viewer.PlantROISelectorWindow._load_frame(
+                    None, idx, image_paths, seg_paths,
+                    previous_rois, own_previous_roi, plant_label, False,
+                )
+            return previous_rois, first
+
+        try:
+            return run_off_main_thread(self, "Opening plant…", load)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to open the plant viewer:\n{str(e)}")
+            return None
 
     def reviewPlant(self):
         self.selected_plant = self.current_plant_path()
