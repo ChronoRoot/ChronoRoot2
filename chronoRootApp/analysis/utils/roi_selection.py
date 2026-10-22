@@ -32,7 +32,25 @@ def _ensure_qapplication():
         return None
 
 
+def _load_opencv_off_gui_thread(images):
+    """Import cv2 away from the GUI thread, as Preview video does.
+
+    This OpenCV build carries its own Qt. Importing it for the first time on
+    the thread that already owns QApplication kills the process.
+    """
+    from gui.background import run_off_main_thread
+
+    def load():
+        import cv2
+        if images:
+            cv2.imread(images[0])
+        return cv2
+
+    run_off_main_thread(None, None, load)
+
+
 def _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=None):
+    _load_opencv_off_gui_thread(images)
     import plant_viewer
 
     previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
