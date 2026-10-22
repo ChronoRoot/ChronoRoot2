@@ -440,16 +440,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def _config_value(self, data, key, default=None):
         return self.config_store.config_value(data, key, default)
 
-    def _import_roi_selection(self):
-        try:
-            from analysis.utils.roi_selection import select_roi_and_seed
-            return select_roi_and_seed
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Error", f"Failed to import ROI selection:\n{e}",
-            )
-            return None
-
     def saveFieldsIntoJson(self):
         self.config_store.save(self)
 
@@ -1171,124 +1161,116 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
     def analysis(self):
         """Run analysis with validation"""
 
-        select_roi_and_seed = self._import_roi_selection()
-        if select_roi_and_seed is None:
-            return
+        # 1. Save fields
+        self.saveFieldsIntoJson()
 
-        # Get and validate video folder
         video_folder = self.videoField.text()
+        project_text = self.projectField.text()
+        rpi = self.rpiField.text()
+        cam = self.cameraField.text()
+        plant = self.plantField.text()
+        has_qr = self.videoHasQRbutton.isChecked()
+        known_text = self.knownDistanceField.text()
+        pixel_text = self.pixelDistanceField.text()
 
-        if not video_folder:
-            QtWidgets.QMessageBox.warning(None, 'Error', 'Please specify a video folder first!')
-            return
-
-        def check_video_files():
-            if not os.path.exists(video_folder):
-                return ('missing_folder', None)
-            images = glob.glob(os.path.join(video_folder, "*.png"))
-            # Check if there is no images, then look for a file called "segmentation_metadata.json"
-            if not images:
-                metadata_path = os.path.join(video_folder, 'Segmentation', 'segmentation_metadata.json')
-                if os.path.exists(metadata_path):
-                    with open(metadata_path, 'r') as f:
-                        metadata = json.load(f)
-                    images = glob.glob(os.path.join(metadata["input_path"], "*.png"))
+        def load():
+            if not video_folder or not os.path.exists(video_folder):
+                return ('bad_folder', None)
+            if not has_qr:
+                if not known_text or not pixel_text:
+                    return ('bad_calibration', None)
+                try:
+                    known_dist = float(known_text)
+                    pixel_dist = int(pixel_text)
+                    if known_dist <= 0 or pixel_dist <= 0:
+                        return ('bad_calibration_sign', None)
+                except ValueError:
+                    return ('bad_calibration_type', None)
+            config_path = os.path.join(project_text, PROJECT_CONFIG_NAME)
+            try:
+                conf = apply_load_aliases(load_json(config_path))
+            except Exception as exc:
+                return ('bad_config', exc)
+            import cv2
+            from analysis.imageUtils.plot import draw_labeled_roi
+            from analysis.utils.roi_selection import (
+                collect_previous_rois_and_warnings,
+                select_roi_and_seed,
+                video_path_warnings,
+            )
+            conf['Experiment'] = conf.get('Experiment', '')
+            conf['MainFolder'] = project_text
+            conf['rpi'] = rpi
+            conf['cam'] = cam
+            conf['plant'] = plant
+            images, seg_files = getImages(conf)
+            limit_frames = processing_limit_frame_count(conf)
+            if limit_frames is not None:
+                images = images[:limit_frames]
+                seg_files = seg_files[:limit_frames]
             if not images:
                 return ('no_images', None)
-            seg_folder = os.path.join(video_folder, "Segmentation", "Ensemble")
-            seg_files = glob.glob(os.path.join(seg_folder, "*.png")) if os.path.exists(seg_folder) else []
             if not seg_files:
                 return ('no_seg', len(images))
-            return ('ok', None)
+            already = plant_slot_has_finished_analysis(conf)
+            try:
+                warnings_text = video_path_warnings(conf)
+            except Exception:
+                warnings_text = ''
+            previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
+            plant_label = f"plant_{conf.get('plant', '?')} - {conf.get('Experiment', '')}"
+            first = cv2.imread(images[-1])
+            if first is not None:
+                for label, x1, y1, x2, y2 in previous_rois:
+                    draw_labeled_roi(first, x1, y1, x2, y2, label, color=(255, 0, 0))
+            return ('ok', (
+                select_roi_and_seed, conf, images, seg_files,
+                already, warnings_text, previous_rois, first,
+            ))
 
         try:
-            file_status, file_info = run_off_main_thread(
-                self, "Checking images…", check_video_files,
-            )
+            status, payload = run_off_main_thread(self, "Loading preview…", load)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
             return
-        if file_status == 'missing_folder':
-            QtWidgets.QMessageBox.warning(None, 'Error', 'Video folder does not exist!\nPlease check the path.')
+        if status == 'bad_folder':
+            QtWidgets.QMessageBox.warning(None, 'Error', 'Please specify a valid video folder.')
             return
-        if file_status == 'no_images':
+        if status == 'bad_calibration':
             QtWidgets.QMessageBox.warning(
                 None, 'Error',
-                'No images found in the video folder!\nPlease check the path to the folder where the images are located.'
+                'Please provide both known distance and pixel distance for manual calibration,\n'
+                'or enable "Video has QR codes"!'
             )
             return
-        if file_status == 'no_seg':
+        if status == 'bad_calibration_sign':
+            QtWidgets.QMessageBox.warning(None, 'Error', 'Calibration values must be positive numbers!')
+            return
+        if status == 'bad_calibration_type':
             QtWidgets.QMessageBox.warning(
                 None, 'Error',
-                f'Found {file_info} images but no segmentation files!\n\n'
+                'Invalid calibration values!\nKnown distance must be a number, pixel distance must be an integer.'
+            )
+            return
+        if status == 'bad_config':
+            QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load config:\n{payload}')
+            return
+        if status == 'no_images':
+            QtWidgets.QMessageBox.warning(None, 'Error', 'No images found.')
+            return
+        if status == 'no_seg':
+            QtWidgets.QMessageBox.warning(
+                None, 'Error',
+                f'Found {payload} images but no segmentation files!\n\n'
                 'Segmentation is required for analysis.\n'
                 'Please ensure the images have been properly segmented first.'
             )
             return
 
-        # Validate calibration settings
-        if not self.videoHasQRbutton.isChecked():
-            if not self.knownDistanceField.text() or not self.pixelDistanceField.text():
-                QtWidgets.QMessageBox.warning(
-                    None, 'Error',
-                    'Please provide both known distance and pixel distance for manual calibration,\n'
-                    'or enable "Video has QR codes"!'
-                )
-                return
-
-            try:
-                known_dist = float(self.knownDistanceField.text())
-                pixel_dist = int(self.pixelDistanceField.text())
-                if known_dist <= 0 or pixel_dist <= 0:
-                    QtWidgets.QMessageBox.warning(None, 'Error', 'Calibration values must be positive numbers!')
-                    return
-            except ValueError:
-                QtWidgets.QMessageBox.warning(
-                    None, 'Error',
-                    'Invalid calibration values!\nKnown distance must be a number, pixel distance must be an integer.'
-                )
-                return
-
-        # All validations passed, run analysis
-        self.saveFieldsIntoJson()
-
-        project_text = self.projectField.text()
-        rpi = self.rpiField.text()
-        cam = self.cameraField.text()
-        plant = self.plantField.text()
-        config_path = os.path.join(project_text, PROJECT_CONFIG_NAME)
-
-        def prepare_analysis():
-            try:
-                conf = apply_load_aliases(load_json(config_path))
-                conf['Experiment'] = conf.get('Experiment', '')
-                conf['MainFolder'] = project_text
-                conf['rpi'] = rpi
-                conf['cam'] = cam
-                conf['plant'] = plant
-            except (OSError, json.JSONDecodeError):
-                conf = {}
-
-            already = plant_slot_has_finished_analysis(conf)
-            image_paths, seg_paths = getImages(conf)
-            limit_frames = processing_limit_frame_count(conf)
-            if limit_frames is not None:
-                image_paths = image_paths[:limit_frames]
-                seg_paths = seg_paths[:limit_frames]
-            try:
-                from analysis.utils.roi_selection import video_path_warnings
-                warnings_text = video_path_warnings(conf)
-            except Exception:
-                warnings_text = ''
-            return conf, already, image_paths, seg_paths, warnings_text
-
-        try:
-            conf, already, image_paths, seg_paths, warnings_text = run_off_main_thread(
-                self, "Checking images…", prepare_analysis,
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
-            return
+        (
+            select_roi_and_seed, conf, image_paths, seg_paths,
+            already, warnings_text, previous_rois, first,
+        ) = payload
 
         if already:
             reply = QtWidgets.QMessageBox.question(
@@ -1315,17 +1297,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
+        import plant_viewer
         try:
-            loaded = self._load_roi_viewer(conf, image_paths, seg_paths)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
-            return
-        if loaded is None:
-            return
-        previous_rois, first = loaded
-
-        try:
-            import plant_viewer
             bbox, seed = select_roi_and_seed(
                 conf, image_paths, seg_paths,
                 first_frame=first, previous_rois=previous_rois,
@@ -1337,6 +1310,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         def write_pending():
+            config_path = os.path.join(project_text, PROJECT_CONFIG_NAME)
             try:
                 saved = apply_load_aliases(load_json(config_path))
             except (OSError, json.JSONDecodeError):
@@ -1353,20 +1327,22 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
 
     def redoAnalysis(self):
-        select_roi_and_seed = self._import_roi_selection()
-        if select_roi_and_seed is None:
-            return
-
         self.selected_plant = self.current_plant_path()
         metadata_path = os.path.join(self.selected_plant, "metadata.json")
 
-        def prepare_redo():
+        def load():
             if not os.path.exists(metadata_path):
                 return ('missing', None)
             try:
                 conf = hydrate_run_config(load_json(metadata_path), metadata_path)
             except (OSError, json.JSONDecodeError) as exc:
                 return ('error', exc)
+            import cv2
+            from analysis.imageUtils.plot import draw_labeled_roi
+            from analysis.utils.roi_selection import (
+                collect_previous_rois_and_warnings,
+                select_roi_and_seed,
+            )
             own_previous_roi = None
             old_bbox = get_bounding_box(conf)
             if old_bbox and len(old_bbox) == 4:
@@ -1375,15 +1351,31 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             conf.pop('bounding_box', None)
             conf.pop('bounding box', None)
             conf.pop('seed', None)
-            image_paths, seg_paths = getImages(conf)
+            images, seg_files = getImages(conf)
             limit_frames = processing_limit_frame_count(conf)
             if limit_frames is not None:
-                image_paths = image_paths[:limit_frames]
-                seg_paths = seg_paths[:limit_frames]
-            return ('ok', (conf, image_paths, seg_paths, own_previous_roi))
+                images = images[:limit_frames]
+                seg_files = seg_files[:limit_frames]
+            if not images:
+                return ('no_images', None)
+            previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
+            plant_label = f"plant_{conf.get('plant', '?')} - {conf.get('Experiment', '')}"
+            first = cv2.imread(images[-1])
+            if first is not None:
+                for label, x1, y1, x2, y2 in previous_rois:
+                    draw_labeled_roi(first, x1, y1, x2, y2, label, color=(255, 0, 0))
+                if own_previous_roi:
+                    x1, y1, x2, y2 = own_previous_roi
+                    draw_labeled_roi(
+                        first, x1, y1, x2, y2, plant_label or "current plant", color=(0, 0, 255),
+                    )
+            return ('ok', (
+                select_roi_and_seed, conf, images, seg_files,
+                own_previous_roi, previous_rois, first,
+            ))
 
         try:
-            status, payload = run_off_main_thread(self, "Checking images…", prepare_redo)
+            status, payload = run_off_main_thread(self, "Loading preview…", load)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
             return
@@ -1392,21 +1384,17 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if status == 'error':
             QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load metadata:\n{payload}')
             return
-        conf, image_paths, seg_paths, own_previous_roi = payload
-
-        try:
-            loaded = self._load_roi_viewer(
-                conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
+        if status == 'no_images':
+            QtWidgets.QMessageBox.warning(None, 'Error', 'No images found.')
             return
-        if loaded is None:
-            return
-        previous_rois, first = loaded
 
+        (
+            select_roi_and_seed, conf, image_paths, seg_paths,
+            own_previous_roi, previous_rois, first,
+        ) = payload
+
+        import plant_viewer
         try:
-            import plant_viewer
             bbox, seed = select_roi_and_seed(
                 conf, image_paths, seg_paths, own_previous_roi=own_previous_roi,
                 first_frame=first, previous_rois=previous_rois,
@@ -1624,29 +1612,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         pipeline_runner.run_analysis_rerun(metadata_path)
         self._follow_relaunch(path, baseline=relaunch_baseline)
-
-    def _load_roi_viewer(self, conf, image_paths, seg_paths, own_previous_roi=None):
-        def load():
-            import cv2
-            from analysis.imageUtils.plot import draw_labeled_roi
-            from analysis.utils.roi_selection import collect_previous_rois_and_warnings
-            previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
-            experiment = conf.get('Experiment', '')
-            plant_num = conf.get('plant', '?')
-            plant_label = f"plant_{plant_num} - {experiment}"
-            first = None
-            if image_paths:
-                first = cv2.imread(image_paths[-1])
-                if first is not None:
-                    for label, x1, y1, x2, y2 in previous_rois:
-                        draw_labeled_roi(first, x1, y1, x2, y2, label, color=(255, 0, 0))
-                    if own_previous_roi:
-                        x1, y1, x2, y2 = own_previous_roi
-                        label = plant_label or "current plant"
-                        draw_labeled_roi(first, x1, y1, x2, y2, label, color=(0, 0, 255))
-            return previous_rois, first
-
-        return run_off_main_thread(self, "Loading preview…", load)
 
     def reviewPlant(self):
         self.selected_plant = self.current_plant_path()
