@@ -99,7 +99,11 @@ def plant_slot_has_finished_analysis(conf):
 
 
 def processing_limit_frame_count(conf):
-    """First-N-days tracking cap as a frame count, using capture interval."""
+    """Frame cap for an N-day limit, including the closing hour.
+
+    N days of frames end one capture hour early, because hour 0 uses a full
+    hour of pictures. The extra hour of frames is what reaches hour N*24.
+    """
     limit = (conf or {}).get('processingLimit', None)
     if limit in (None, '', 0, '0'):
         return None
@@ -116,7 +120,8 @@ def processing_limit_frame_count(conf):
     if time_step <= 0:
         time_step = 15
     frames_per_day = (24 * 60) // time_step
-    return days * frames_per_day
+    frames_per_hour = max(1, int(round(60.0 / float(time_step))))
+    return days * frames_per_day + frames_per_hour
 
 
 def expected_hourly_rows(n_frames, time_step):

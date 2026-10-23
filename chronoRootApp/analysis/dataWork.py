@@ -281,7 +281,7 @@ def dataWork(conf, pfile, folder, N_exp = None, debug=False, time_tolerance=0.5)
         expected_hour_count = expected_hourly_rows(N_exp, timeStep)
         if expected_hour_count is not None and len(hour_data) > expected_hour_count:
             hour_data = hour_data.iloc[:expected_hour_count]
-    
+
     data = hour_data.reset_index()
     
     if 'Date' not in data.columns and 'index' in data.columns:

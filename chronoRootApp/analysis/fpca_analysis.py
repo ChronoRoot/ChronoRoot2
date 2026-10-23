@@ -68,19 +68,29 @@ def performFPCA(conf_path):
         print('FPCA skipped: selected metrics are not in Temporal_Data.csv')
         return
 
-    # A plant with any missing hour is left out of FPCA. Dropping the hour
-    # instead would delete that time for every plant that was photographed.
-    # The line plot below still uses every observed hour.
+    # A missing hour copies the previous hour, so the shared grid can be
+    # longer than one plant's photos without removing that plant from FPCA.
+    # Dropping the hour instead would delete that time for every plant.
+    # A gap before the first measurement has nothing to copy.
     magnitudes_dict = {}
     for magnitude in COLUMNS:
         wide = temporal_data_df.pivot(
             columns='Plant_id', values=magnitude, index='ElapsedTime (h)',
         )
-        complete = wide.dropna(axis=1)
+        wide = wide.apply(pd.to_numeric, errors='coerce').sort_index()
+        filled = wide.ffill()
+        still_missing = int(filled.isna().any(axis=0).sum())
+        complete = filled.dropna(axis=1)
+        if still_missing:
+            print(
+                f'FPCA {magnitude}: {still_missing} plants still start with a '
+                'missing hour and were left out',
+                flush=True,
+            )
         if complete.shape[1] < 2 or complete.shape[0] < 2:
             print(
-                f'FPCA skipped for {magnitude}: fewer than 2 plants are finite '
-                'at every hour',
+                f'FPCA skipped for {magnitude}: fewer than 2 plants have a '
+                'usable series',
                 flush=True,
             )
             continue

@@ -12,7 +12,7 @@ from PyQt5.QtCore import Qt, QTimer, QRect, QRectF, QSize, pyqtSignal, QPointF, 
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont, QBrush
 
 from analysis.imageUtils.plot import draw_labeled_roi, draw_seed_marker
-from analysis.utils.fileUtilities import list_video_pngs
+from analysis.utils.fileUtilities import list_video_pngs, processing_limit_frame_count
 from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
 from analysis.time_windows import elapsed_day_clock
 from analysis.utils.tiff_stack import (
@@ -298,18 +298,9 @@ class ChronoViewWindow(QMainWindow):
         self.use_seg = False
 
         self.timeStep = conf.get('timeStep', 15)
-        if conf.get('processingLimit', 0) not in (None, '', 0, '0'):
-            try:
-                limit_days = int(conf['processingLimit'])
-            except (TypeError, ValueError):
-                limit_days = 0
-            try:
-                step = int(self.timeStep)
-            except (TypeError, ValueError):
-                step = 15
-            if limit_days > 0 and step > 0:
-                frames_per_day = (24 * 60) // step
-                self.n = min(self.n, limit_days * frames_per_day)
+        limit_frames = processing_limit_frame_count(conf)
+        if limit_frames is not None:
+            self.n = min(self.n, limit_frames)
 
         # Preview and analysis playback stop at the processing limit only.
         # The analysis period is applied later, when postprocess writes the
