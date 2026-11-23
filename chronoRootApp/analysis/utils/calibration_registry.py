@@ -39,9 +39,36 @@ STATUS_REGISTRY_ONLY = "registry_only"
 
 
 def normalize_image_path(path):
+    """Absolute path; prefer realpath so symlink aliases (home/net) share one key."""
     if not path:
         return ""
-    return os.path.abspath(os.path.expanduser(str(path)))
+    expanded = os.path.abspath(os.path.expanduser(str(path)))
+    if os.path.exists(expanded):
+        try:
+            return os.path.realpath(expanded)
+        except OSError:
+            return expanded
+    return expanded
+
+
+def resolve_calibration_image_path(image_path):
+    """
+    Canonical video folder for ``calibrations.json`` keys.
+
+    Uses the same PNG discovery as preview: if the selected folder only has
+    Segmentation on a read-write disk, ``input_path`` in
+    ``segmentation_metadata.json`` points at the read-only image folder, and
+    that image folder is the registry key. Data vs Experiments are not treated
+    as path aliases; metadata bridges them.
+    """
+    from .fileUtilities import list_video_pngs
+
+    if not image_path:
+        return ""
+    _images, resolved = list_video_pngs({"Images": image_path})
+    if resolved and os.path.isdir(resolved):
+        return normalize_image_path(resolved)
+    return normalize_image_path(image_path)
 
 
 def registry_path(project_dir):
@@ -79,12 +106,47 @@ def save_registry(project_dir, registry):
     dump_json(registry_path(project_dir), payload)
 
 
+def _lookup_registry_entry(by_path, image_path, *, resolve_cache=None):
+    """Match by resolved PNG folder (and legacy keys that resolve to it)."""
+    if not isinstance(by_path, dict) or not image_path:
+        return None, ""
+
+    def resolve(path):
+        if resolve_cache is not None and path in resolve_cache:
+            return resolve_cache[path]
+        value = resolve_calibration_image_path(path)
+        if resolve_cache is not None:
+            resolve_cache[path] = value
+        return value
+
+    key = resolve(image_path)
+    if key and key in by_path and isinstance(by_path[key], dict):
+        return dict(by_path[key]), key
+
+    raw = str(image_path).strip()
+    raw_key = normalize_image_path(raw)
+    if raw_key and raw_key in by_path and isinstance(by_path[raw_key], dict):
+        return dict(by_path[raw_key]), key or raw_key
+    if raw and raw in by_path and isinstance(by_path[raw], dict):
+        return dict(by_path[raw]), key or raw_key or raw
+
+    # Legacy entries saved under a RW video folder whose PNGs live elsewhere.
+    if key:
+        for stored_key, entry in by_path.items():
+            if not isinstance(entry, dict):
+                continue
+            if resolve(stored_key) == key:
+                return dict(entry), key
+    return None, key
+
+
 def get_calibration(project_dir, image_path):
-    key = normalize_image_path(image_path)
-    if not key:
+    if not image_path:
         return None
-    entry = load_registry(project_dir).get("by_image_path", {}).get(key)
-    return dict(entry) if isinstance(entry, dict) else None
+    entry, _matched = _lookup_registry_entry(
+        load_registry(project_dir).get("by_image_path", {}), image_path,
+    )
+    return entry
 
 
 def compute_pixel_size(known_distance, pixel_distance):
@@ -104,7 +166,7 @@ def upsert_calibration(
     known_distance=None,
     pixel_distance=None,
 ):
-    key = normalize_image_path(image_path)
+    key = resolve_calibration_image_path(image_path)
     if not key or not project_dir:
         return None
     registry = load_registry(project_dir)
@@ -117,7 +179,14 @@ def upsert_calibration(
         entry["knownDistance"] = float(known_distance)
     if pixel_distance is not None and str(pixel_distance).strip() != "":
         entry["pixelDistance"] = int(float(pixel_distance))
-    registry.setdefault("by_image_path", {})[key] = entry
+    by_path = registry.setdefault("by_image_path", {})
+    # Drop legacy keys that resolve to the same PNG folder so Review stays clean.
+    for stored_key in list(by_path.keys()):
+        if stored_key == key:
+            continue
+        if resolve_calibration_image_path(stored_key) == key:
+            by_path.pop(stored_key, None)
+    by_path[key] = entry
     save_registry(project_dir, registry)
     return entry
 
@@ -363,6 +432,8 @@ def list_plate_statuses(project_dir, current_image_path=None):
     analysis_root = os.path.join(project_dir, "Analysis")
     groups = collect_plate_groups(analysis_root, require_raw_csv=False)
     registry = load_registry(project_dir)
+    by_path = registry.get("by_image_path") or {}
+    resolve_cache = {}
     rows = []
     seen_paths = set()
     for plate_key in sorted(groups.keys(), key=lambda k: str(k)):
@@ -371,14 +442,20 @@ def list_plate_statuses(project_dir, current_image_path=None):
             image_path, rpi, cam = plate_key[0], plate_key[1], plate_key[2]
         else:
             image_path, rpi, cam = plate_key[0], "", ""
-        nkey = normalize_image_path(image_path)
-        registry_entry = registry.get("by_image_path", {}).get(nkey)
-        rows.append(_row_from_parts(image_path, rpi, cam, plant_paths, registry_entry))
-        if nkey:
-            seen_paths.add(nkey)
+        nkey = resolve_calibration_image_path(image_path) or normalize_image_path(image_path)
+        registry_entry, matched = _lookup_registry_entry(
+            by_path, image_path, resolve_cache=resolve_cache,
+        )
+        rows.append(_row_from_parts(
+            matched or nkey or image_path, rpi, cam, plant_paths, registry_entry,
+        ))
+        for candidate in (nkey, matched, normalize_image_path(image_path)):
+            if candidate:
+                seen_paths.add(candidate)
 
-    for key, entry in sorted((registry.get("by_image_path") or {}).items()):
-        nkey = normalize_image_path(key)
+    for key, entry in sorted(by_path.items()):
+        resolved = resolve_calibration_image_path(key)
+        nkey = resolved or normalize_image_path(key)
         if not nkey or nkey in seen_paths:
             continue
         if not isinstance(entry, dict):
@@ -389,21 +466,28 @@ def list_plate_statuses(project_dir, current_image_path=None):
         seen_paths.add(nkey)
 
     if current_image_path:
-        nkey = normalize_image_path(current_image_path)
+        nkey = resolve_calibration_image_path(current_image_path) or normalize_image_path(
+            current_image_path,
+        )
         if nkey and nkey not in seen_paths:
-            entry = registry.get("by_image_path", {}).get(nkey)
+            entry, matched = _lookup_registry_entry(
+                by_path, current_image_path, resolve_cache=resolve_cache,
+            )
             rows.append(
                 _row_from_parts(
-                    nkey, "", "", [], entry,
+                    matched or nkey, "", "", [], entry,
                     force_registry_only=bool(entry),
                 )
             )
     return rows
 
 
-def try_qr_pixel_size(image_path, max_frames=20):
+def try_qr_pixel_size(image_path, max_frames=1):
     """
     Scan the first N frames for a QR scale marker (same logic as postprocess).
+
+    Default is one frame: QR decode with gamma sweeps is expensive on large
+    network-backed PNGs, and scanning many frames felt like a hang.
 
     Uses the same PNG discovery as preview (``list_video_pngs``), including
     ``Segmentation/segmentation_metadata.json`` → ``input_path`` when frames
@@ -419,7 +503,7 @@ def try_qr_pixel_size(image_path, max_frames=20):
     images, resolved = list_video_pngs({"Images": image_path})
     if not images:
         return None, f"No PNG frames in {image_path}"
-    n = min(int(max_frames), len(images))
+    n = min(max(1, int(max_frames)), len(images))
     for image in images[:n]:
         qr = qr_detect(image)
         if qr is not None:
@@ -429,4 +513,5 @@ def try_qr_pixel_size(image_path, max_frames=20):
                 float(pixel_size),
                 f"QR detected in {os.path.basename(image)} ({where})",
             )
-    return None, f"QR not detected in first {n} frames of {image_path}"
+    label = "frame" if n == 1 else f"{n} frames"
+    return None, f"QR not detected in first {label} of {image_path}"

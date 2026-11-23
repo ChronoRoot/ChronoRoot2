@@ -17,13 +17,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 from analysis.dataWork import dataWork
-from analysis.qr import qr_detect, get_pixel_size, load_path
+from analysis.qr import load_path
 from analysis.report import plot_individual_plant
 from analysis.lateral_angles import getAngles
 from analysis.utils.fileUtilities import (
     convertFromPathSafe,
     get_latest_result_dir,
-    list_video_pngs,
     processing_limit_frame_count,
 )
 from analysis.utils.metadata_schema import (
@@ -44,6 +43,7 @@ from analysis.utils.calibration_registry import (
     get_calibration,
     normalize_image_path,
     plate_key_from_meta,
+    try_qr_pixel_size,
     upsert_calibration,
 )
 import json
@@ -145,22 +145,19 @@ def resolve_plate_pixel_size(conf, plants):
     if not image_path:
         return DEFAULT_PIXEL_SIZE, SOURCE_DEFAULT, "no ImagePath for QR scan"
 
-    # Same discovery as preview: local PNGs, else segmentation_metadata input_path.
-    images, _resolved = list_video_pngs({"Images": image_path})
-    for image in images[:20]:
-        qr = qr_detect(image)
-        if qr is not None:
-            pixel_size = 10 / get_pixel_size(qr[0])
-            if project_dir:
-                upsert_calibration(
-                    project_dir, image_path, pixel_size=pixel_size, source=SOURCE_QR,
-                )
-            return pixel_size, SOURCE_QR, "QR detected"
+    # Same discovery / first-frame default as Review → Test QR (avoid long hangs).
+    pixel_size, detail = try_qr_pixel_size(image_path, max_frames=1)
+    if pixel_size is not None:
+        if project_dir:
+            upsert_calibration(
+                project_dir, image_path, pixel_size=pixel_size, source=SOURCE_QR,
+            )
+        return pixel_size, SOURCE_QR, detail or "QR detected"
 
     return (
         DEFAULT_PIXEL_SIZE,
         SOURCE_DEFAULT,
-        f"QR not detected in first {min(20, len(images))} frames of {image_path}",
+        detail or f"QR not detected for {image_path}",
     )
 
 
