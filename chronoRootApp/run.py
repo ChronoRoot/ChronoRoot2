@@ -1318,11 +1318,13 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             saved['MainFolder'] = project_text
             saved['bounding_box'] = bbox
             saved['seed'] = seed
-            dump_json(pending_analysis_path(project_text), saved)
+            pending_path = pending_analysis_path(project_text)
+            dump_json(pending_path, saved)
+            return pending_path
 
         try:
-            run_off_main_thread(self, None, write_pending)
-            pipeline_runner.run_pending_analysis(project_text)
+            pending_path = run_off_main_thread(self, None, write_pending)
+            pipeline_runner.run_pending_analysis(pending_path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
 
@@ -1419,16 +1421,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         conf['MainFolder'] = project
 
         def write_pending():
-            dump_json(pending_analysis_path(project), conf)
+            pending_path = pending_analysis_path(project)
+            dump_json(pending_path, conf)
+            return pending_path
 
         try:
-            run_off_main_thread(self, None, write_pending)
+            pending_path = run_off_main_thread(self, None, write_pending)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
             return
         relaunch_slot = self._slot_of_plant_path(self.selected_plant)
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
-        pipeline_runner.run_pending_analysis(project)
+        pipeline_runner.run_pending_analysis(pending_path)
         self._follow_relaunch(self.selected_plant, baseline=relaunch_baseline)
 
     def _slot_of_plant_path(self, path):

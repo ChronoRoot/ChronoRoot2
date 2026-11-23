@@ -6,12 +6,15 @@ Load helpers promote old aliases; writers persist canonical keys only.
 
 import json
 import os
+import uuid
 
 SCHEMA_VERSION = 1
 SOURCE_SINGLE_PLANT = "single_plant"
 SOURCE_SCREENING = "screening"
 SCREENING_JOB_KIND = "screening_job"
+# Legacy shared name (still recognized for cleanup). New launches use a UUID suffix.
 PENDING_ANALYSIS_NAME = ".pending_analysis.json"
+PENDING_ANALYSIS_PREFIX = ".pending_analysis_"
 PLANT_METADATA_FILENAME = "metadata.json"
 
 # old persisted key -> canonical name (applied only when the canonical key is missing)
@@ -202,11 +205,17 @@ def is_plant_metadata_path(config_path):
 
 
 def is_pending_analysis_path(config_path):
-    return os.path.basename(os.path.abspath(config_path or "")) == PENDING_ANALYSIS_NAME
+    name = os.path.basename(os.path.abspath(config_path or ""))
+    if name == PENDING_ANALYSIS_NAME:
+        return True
+    return name.startswith(PENDING_ANALYSIS_PREFIX) and name.endswith(".json")
 
 
 def pending_analysis_path(project_dir):
-    return os.path.join(project_dir, PENDING_ANALYSIS_NAME)
+    """Unique per-launch config so concurrent analyses do not share one file."""
+    return os.path.join(
+        project_dir, f"{PENDING_ANALYSIS_PREFIX}{uuid.uuid4().hex}.json",
+    )
 
 
 def project_root_from_result(result_dir):
