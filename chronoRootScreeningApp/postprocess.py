@@ -77,7 +77,8 @@ def _write_results_raw(plant_rows, result_dir):
     return raw_path
 
 
-def _write_metadata(plant_rows, result_dir, pixel_size, time_step, plant_index):
+def _write_metadata(plant_rows, result_dir, pixel_size, time_step, plant_index,
+                    calibration_source=''):
     first = plant_rows.iloc[0]
     time_value = int(time_step) if float(time_step) == int(float(time_step)) else float(time_step)
     conf = {
@@ -93,6 +94,8 @@ def _write_metadata(plant_rows, result_dir, pixel_size, time_step, plant_index):
         'cam': str(first.get('cam', '')),
         'plant': plant_index,
     }
+    if calibration_source:
+        conf['calibration_source'] = calibration_source
     metadata = build_plant_record(conf, source=SOURCE_SCREENING)
     dump_json(os.path.join(result_dir, 'metadata.json'), metadata)
     return metadata
@@ -332,7 +335,13 @@ def postprocess_tracking(merged_seeds, conf):
         os.makedirs(result_dir, exist_ok=True)
 
         raw_path = _write_results_raw(plant_rows, result_dir)
-        metadata = _write_metadata(plant_rows, result_dir, pixel_size, time_step, plant_index)
+        calibration_source = ''
+        if 'calibration_source' in plant_rows.columns:
+            calibration_source = str(plant_rows['calibration_source'].iloc[0] or '')
+        metadata = _write_metadata(
+            plant_rows, result_dir, pixel_size, time_step, plant_index,
+            calibration_source=calibration_source,
+        )
 
         jobs.append({
             'result_dir': result_dir,

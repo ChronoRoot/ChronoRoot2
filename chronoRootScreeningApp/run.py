@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QTabWidget, QTableWidget, QTableWidgetItem, QMenu, QComboBox, QDialog,
                            QTreeWidget, QTreeWidgetItem)
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QPixmap, QIntValidator, QDoubleValidator
+from PyQt5.QtGui import QColor, QPixmap, QIntValidator
 import ui_errors
 import interface_config
 import chrono_root_backend  # noqa: F401
@@ -205,40 +205,35 @@ class AnalysisTab(QWidget):
         calib_group = QGroupBox('Calibration Settings')
         calib_layout = QHBoxLayout()
 
-        # QR Code toggle and calibration options
         self.qr_checkbox = QCheckBox('Video has QR codes for calibration')
         self.qr_checkbox.stateChanged.connect(self.toggle_calibration_mode)
         calib_layout.addWidget(self.qr_checkbox)
 
-        # Manual calibration widget (hidden by default)
-        self.manual_calib_widget = QWidget()
-        manual_calib_layout = QHBoxLayout()
-        
-        # Calibration helper button
-        self.calibrate_btn = QPushButton('Open Calibration Helper')
+        # Defaults passed into Calibration Helper only (not shown on the form).
+        self._calib_known_default = "10"
+        self._calib_pixel_default = ""
+
+        self.calibrate_btn = QPushButton('Calibrate current video…')
+        self.calibrate_btn.setToolTip(
+            "Measure a known distance on the current video and save plate scale."
+        )
         self.calibrate_btn.clicked.connect(self.open_calibration_helper)
-        manual_calib_layout.addWidget(self.calibrate_btn)
-        
-        # Known distance input
-        known_dist_layout = QHBoxLayout()
-        self.known_dist_edit = QLineEdit()
-        self.known_dist_edit.setPlaceholderText('10')
-        self.known_dist_edit.setValidator(QDoubleValidator(0.0, 1000.0, 2))
-        known_dist_layout.addWidget(QLabel('Known distance (mm):'))
-        known_dist_layout.addWidget(self.known_dist_edit)
-        manual_calib_layout.addLayout(known_dist_layout)
+        calib_layout.addWidget(self.calibrate_btn)
 
-        # Pixel distance input
-        pixel_dist_layout = QHBoxLayout()
-        self.pixel_dist_edit = QLineEdit()
-        self.pixel_dist_edit.setPlaceholderText('240')
-        self.pixel_dist_edit.setValidator(QIntValidator(1, 10000))
-        pixel_dist_layout.addWidget(QLabel('Corresponding pixels:'))
-        pixel_dist_layout.addWidget(self.pixel_dist_edit)
-        manual_calib_layout.addLayout(pixel_dist_layout)
+        self.test_qr_btn = QPushButton('Test QR detection…')
+        self.test_qr_btn.setToolTip(
+            "Scan the current video for a QR scale marker and optionally save it."
+        )
+        self.test_qr_btn.clicked.connect(self.test_qr_current_video)
+        calib_layout.addWidget(self.test_qr_btn)
 
-        self.manual_calib_widget.setLayout(manual_calib_layout)
-        calib_layout.addWidget(self.manual_calib_widget)
+        self.review_plates_btn = QPushButton('Review plate calibrations')
+        self.review_plates_btn.setToolTip(
+            "Review plate scale (pixel size) per video. "
+            "Test QR or Set scale on bad plates, then re-process."
+        )
+        self.review_plates_btn.clicked.connect(self.open_plates_scale_dialog)
+        calib_layout.addWidget(self.review_plates_btn)
         calib_group.setLayout(calib_layout)
         
         proj_group.setLayout(proj_layout)
@@ -476,9 +471,10 @@ class AnalysisTab(QWidget):
             self.main_window.set_project_dir(project_dir)
 
     def toggle_calibration_mode(self):
-        """Toggle between QR and manual calibration modes"""
+        """QR on → Test QR; QR off → Calibrate current video."""
         has_qr = self.qr_checkbox.isChecked()
-        self.manual_calib_widget.setVisible(not has_qr)
+        self.calibrate_btn.setVisible(not has_qr)
+        self.test_qr_btn.setVisible(has_qr)
     
     def toggle_plant_growth_options(self):
         """Enable or disable plant growth analysis options in the report dialog."""
@@ -550,8 +546,17 @@ class AnalysisTab(QWidget):
             self.calibration_window = None
 
         try:
-            self.calibration_window = calibration_helper.CalibrationHelper(video_dir)
-            self.calibration_window.distance_measured.connect(self._on_calibration_distance)
+            project = self.proj_dir_edit.text().strip()
+            known = (getattr(self, "_calib_known_default", None) or "").strip() or "10"
+            self.calibration_window = calibration_helper.CalibrationHelper(
+                video_dir,
+                dialog_parent=self.window(),
+                known_distance=known,
+                project_dir=project or None,
+                image_path=video_dir,
+                plate_label=os.path.basename(video_dir.rstrip(os.sep)) or video_dir,
+            )
+            self.calibration_window.scale_saved.connect(self._on_calibration_saved)
             self.calibration_window.destroyed.connect(
                 lambda: setattr(self, 'calibration_window', None)
             )
@@ -559,28 +564,99 @@ class AnalysisTab(QWidget):
         except Exception as e:
             ui_errors.show_critical(self, 'Error', f'Failed to open calibration helper:\n{e}')
 
-    def _on_calibration_distance(self, pixels: int):
-        self.pixel_dist_edit.setText(f"{pixels}")
+    def _on_calibration_saved(self, pixel_size, known, pixels):
+        self._calib_known_default = f"{known:g}"
+        self._calib_pixel_default = str(int(pixels))
+
+    def test_qr_current_video(self):
+        """Test QR detection on the current video and optionally save plate scale."""
+        video = self.video_path_edit.text().strip()
+        if not video:
+            ui_errors.show_warning(self, 'Error', 'Please select a video directory first!')
+            return
+        if not os.path.exists(video):
+            ui_errors.show_warning(self, 'Error', 'Video directory does not exist!')
+            return
+        project = self.proj_dir_edit.text().strip()
+        try:
+            from gui.plates_calibration_dialog import run_test_qr_flow
+        except Exception as e:
+            ui_errors.show_critical(self, 'Error', f'Failed to load QR test UI:\n{e}')
+            return
+        run_test_qr_flow(
+            self,
+            project,
+            video,
+            title="Test QR detection",
+            progress_parent=self.window(),
+            on_set_scale=self.open_calibration_helper,
+        )
+
+    def open_plates_scale_dialog(self):
+        project = self.proj_dir_edit.text().strip()
+        if not project or not os.path.isdir(project):
+            ui_errors.show_warning(
+                self, 'Review plate calibrations',
+                'Open a valid project folder first.',
+            )
+            return
+        try:
+            from gui.plates_calibration_dialog import PlatesCalibrationDialog
+        except Exception as e:
+            ui_errors.show_critical(
+                self, 'Error', f'Failed to load plate calibrations UI:\n{e}',
+            )
+            return
+        known = (getattr(self, "_calib_known_default", None) or "").strip() or "10"
+        video = self.video_path_edit.text().strip() or None
+        self._plates_calib_dialog = PlatesCalibrationDialog(
+            project,
+            parent=self.window(),
+            known_distance_default=known,
+            current_image_path=video,
+        )
+        self._plates_calib_dialog.show()
 
     def validate_inputs(self):
         """Updated validation to include calibration checks"""
         if not self.basic_validation():
             return False
 
-        # Validate calibration settings
+        # Manual mode: offer calibrate if this video has no saved plate scale.
         if not self.qr_checkbox.isChecked():
-            if not self.known_dist_edit.text() or not self.pixel_dist_edit.text():
-                QMessageBox.warning(self, 'Error', 'Please provide both known distance and pixel distance for manual calibration!')
-                return False
             try:
-                known_dist = float(self.known_dist_edit.text())
-                pixel_dist = int(self.pixel_dist_edit.text())
-                if known_dist <= 0 or pixel_dist <= 0:
-                    QMessageBox.warning(self, 'Error', 'Calibration values must be positive numbers!')
+                from analysis.utils.calibration_registry import get_calibration
+            except Exception:
+                get_calibration = None
+            project = self.proj_dir_edit.text().strip()
+            video = self.video_path_edit.text().strip()
+            entry = None
+            if get_calibration is not None and project and video:
+                entry = get_calibration(project, video)
+            if entry is None:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle('Plate scale needed')
+                box.setText(
+                    'No saved plate scale for this video.\n\n'
+                    'Calibrate the current video (recommended), continue without '
+                    'scale (fix later in Review plate calibrations), or cancel.'
+                )
+                calibrate_btn = box.addButton(
+                    'Calibrate current video…', QMessageBox.AcceptRole,
+                )
+                continue_btn = box.addButton(
+                    'Continue anyway', QMessageBox.DestructiveRole,
+                )
+                box.addButton(QMessageBox.Cancel)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked is None or clicked == box.button(QMessageBox.Cancel):
                     return False
-            except ValueError:
-                QMessageBox.warning(self, 'Error', 'Invalid calibration values!')
-                return False
+                if clicked == calibrate_btn:
+                    self.open_calibration_helper()
+                    return False
+                # continue_btn: allow process without form fields
 
         return True
 
@@ -760,8 +836,18 @@ class AnalysisTab(QWidget):
         })
 
         if not config.get('videoHasQR', True):
-            config['knownDistance'] = float(self.known_dist_edit.text())
-            config['pixelDistance'] = int(self.pixel_dist_edit.text())
+            try:
+                from analysis.utils.calibration_registry import get_calibration
+                entry = get_calibration(project_dir, video_folder)
+            except Exception:
+                entry = None
+            if entry:
+                if entry.get('pixel_size') is not None:
+                    config['pixel_size'] = entry['pixel_size']
+                if entry.get('knownDistance') is not None:
+                    config['knownDistance'] = entry['knownDistance']
+                if entry.get('pixelDistance') is not None:
+                    config['pixelDistance'] = entry['pixelDistance']
 
         analysis_dir = os.path.join(project_dir, 'analysis', identifier)
         os.makedirs(analysis_dir, exist_ok=True)

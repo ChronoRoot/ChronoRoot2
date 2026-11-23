@@ -79,8 +79,8 @@ class ConfigStore:
         "timeStep": _numeric_or_text(host.captureIntervalField.text()),
         "saveImages": host.saveImagesButton.isChecked(),
         "videoHasQR": host.videoHasQRbutton.isChecked(),
-        "knownDistance": host.knownDistanceField.text(),
-        "pixelDistance": host.pixelDistanceField.text(),
+        "knownDistance": getattr(host, "_calib_known_default", "") or "",
+        "pixelDistance": getattr(host, "_calib_pixel_default", "") or "",
         "emergenceDistance": _numeric_or_text(host.analysisEmergenceDistanceField.text()
                                                 or host.reportEmergenceDistanceField.text()),
         "saveImagesConvex": host.saveImagesConvex.isChecked(),
@@ -192,10 +192,10 @@ class ConfigStore:
 
     known = self.config_value(data, 'knownDistance')
     if known is not None:
-      host.knownDistanceField.setText(str(known))
+      host._calib_known_default = str(known)
     pixel = self.config_value(data, 'pixelDistance')
     if pixel is not None:
-      host.pixelDistanceField.setText(str(pixel))
+      host._calib_pixel_default = str(pixel)
     _apply_snapshot_hours_field(
         host.daysConvexField, data,
         'snapshotHoursConvex', 'daysConvexHull',

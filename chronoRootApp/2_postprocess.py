@@ -299,8 +299,9 @@ if __name__ == "__main__":
         for plate_label, source, detail, pixel_size in scale_issues:
             print(f"  [{source}] {plate_label}: {detail} (using pixel_size={pixel_size:.6g})")
         print(
-            "Open Review plate calibrations in ChronoRootApp to set scale for "
-            "affected plates, then re-run Process all plants if needed."
+            "Next: Review plate calibrations → Test QR or Set scale on affected "
+            "plates → Process all plants again → Generate report "
+            "(then Analyze more plants as needed)."
         )
 
     print("Post processing finished.")

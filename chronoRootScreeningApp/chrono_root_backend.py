@@ -59,6 +59,17 @@ from analysis.utils.metadata_schema import (  # noqa: E402
     video_has_qr,
     video_image_dir,
 )
+from analysis.utils.calibration_registry import (  # noqa: E402
+    DEFAULT_PIXEL_SIZE,
+    SOURCE_DEFAULT,
+    SOURCE_MANUAL,
+    SOURCE_QR,
+    SOURCE_REGISTRY,
+    apply_scale_to_plants,
+    compute_pixel_size,
+    get_calibration,
+    upsert_calibration,
+)
 from analysis.utils.report_paths import (  # noqa: E402
     MODULE_TEMPORAL,
     data_file,

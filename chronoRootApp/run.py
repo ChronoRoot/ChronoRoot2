@@ -33,10 +33,7 @@ from analysis.utils.fileUtilities import (
     processing_limit_frame_count,
 )
 from analysis.utils.calibration_registry import (
-    SOURCE_MANUAL,
-    compute_pixel_size,
-    manual_scale_warning,
-    upsert_calibration,
+    get_calibration,
 )
 from analysis.utils.metadata_schema import (
     apply_load_aliases,
@@ -1176,22 +1173,10 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         cam = self.cameraField.text()
         plant = self.plantField.text()
         has_qr = self.videoHasQRbutton.isChecked()
-        known_text = self.knownDistanceField.text()
-        pixel_text = self.pixelDistanceField.text()
 
         def load():
             if not video_folder or not os.path.exists(video_folder):
                 return ('bad_folder', None)
-            if not has_qr:
-                if not known_text or not pixel_text:
-                    return ('bad_calibration', None)
-                try:
-                    known_dist = float(known_text)
-                    pixel_dist = int(pixel_text)
-                    if known_dist <= 0 or pixel_dist <= 0:
-                        return ('bad_calibration_sign', None)
-                except ValueError:
-                    return ('bad_calibration_type', None)
             config_path = os.path.join(project_text, PROJECT_CONFIG_NAME)
             try:
                 conf = apply_load_aliases(load_json(config_path))
@@ -1242,22 +1227,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if status == 'bad_folder':
             QtWidgets.QMessageBox.warning(None, 'Error', 'Please specify a valid video folder.')
             return
-        if status == 'bad_calibration':
-            QtWidgets.QMessageBox.warning(
-                None, 'Error',
-                'Please provide both known distance and pixel distance for manual calibration,\n'
-                'or enable "Video has QR codes"!'
-            )
-            return
-        if status == 'bad_calibration_sign':
-            QtWidgets.QMessageBox.warning(None, 'Error', 'Calibration values must be positive numbers!')
-            return
-        if status == 'bad_calibration_type':
-            QtWidgets.QMessageBox.warning(
-                None, 'Error',
-                'Invalid calibration values!\nKnown distance must be a number, pixel distance must be an integer.'
-            )
-            return
         if status == 'bad_config':
             QtWidgets.QMessageBox.critical(None, 'Error', f'Could not load config:\n{payload}')
             return
@@ -1303,21 +1272,31 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
-        # Manual mode only: warn if this video has no matching saved plate scale.
-        if not has_qr:
-            scale_warn = manual_scale_warning(
-                project_text, video_folder, known_text, pixel_text,
+        # Manual mode: offer calibrate if this video has no saved plate scale.
+        if not has_qr and get_calibration(project_text, video_folder) is None:
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Warning)
+            box.setWindowTitle('Plate scale needed')
+            box.setText(
+                'No saved plate scale for this video.\n\n'
+                'Calibrate the current video (recommended), continue without '
+                'scale (fix later in Review plate calibrations), or cancel.'
             )
-            if scale_warn:
-                reply = QtWidgets.QMessageBox.question(
-                    None,
-                    'Plate scale warning',
-                    scale_warn + '\n\nContinue launching this analysis anyway?',
-                    QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Yes,
-                    QtWidgets.QMessageBox.Cancel,
-                )
-                if reply != QtWidgets.QMessageBox.Yes:
-                    return
+            calibrate_btn = box.addButton(
+                'Calibrate current video…', QtWidgets.QMessageBox.AcceptRole,
+            )
+            continue_btn = box.addButton(
+                'Continue anyway', QtWidgets.QMessageBox.DestructiveRole,
+            )
+            box.addButton(QtWidgets.QMessageBox.Cancel)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is None or clicked == box.button(QtWidgets.QMessageBox.Cancel):
+                return
+            if clicked == calibrate_btn:
+                self.open_calibration_helper()
+                return
+            # continue_btn: proceed into ROI
 
         import plant_viewer
         try:
@@ -1340,21 +1319,17 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             saved['MainFolder'] = project_text
             saved['bounding_box'] = bbox
             saved['seed'] = seed
+            if not has_qr:
+                entry = get_calibration(project_text, video_folder)
+                if entry:
+                    if entry.get('pixel_size') is not None:
+                        saved['pixel_size'] = entry['pixel_size']
+                    if entry.get('knownDistance') is not None:
+                        saved['knownDistance'] = entry['knownDistance']
+                    if entry.get('pixelDistance') is not None:
+                        saved['pixelDistance'] = entry['pixelDistance']
             pending_path = pending_analysis_path(project_text)
             dump_json(pending_path, saved)
-            if not has_qr:
-                try:
-                    pixel_size = compute_pixel_size(known_text, pixel_text)
-                    upsert_calibration(
-                        project_text,
-                        video_folder,
-                        pixel_size=pixel_size,
-                        source=SOURCE_MANUAL,
-                        known_distance=known_text,
-                        pixel_distance=pixel_text,
-                    )
-                except (TypeError, ValueError):
-                    pass
             return pending_path
 
         try:
@@ -1806,8 +1781,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "Postprocessing started",
             "Postprocessing started.\n\n"
             "It is running in the terminal. You do not need to press the button again.\n\n"
-            "If QR scale fails for a plate, check the terminal and open "
-            "Review plate calibrations.",
+            "Next: if any plate scale looks wrong (QR miss / default), open "
+            "Review plate calibrations → Test QR or Set scale → Process all "
+            "plants again → Generate report → Analyze more plants as needed.",
         )
 
     def _report_factor_choices(self):
@@ -2120,37 +2096,23 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.videoHasQRbutton.setToolTip(
             "Enable automatic scale detection using the 1-cm QR code in the images.")
 
-        self.manual_calib_widget = QtWidgets.QWidget(self.tab1)
-        self.manual_calib_widget.setGeometry(QtCore.QRect(210, 385, 380, 70))
+        # Defaults passed into Calibration Helper only (not shown on the main tab).
+        self._calib_known_default = "10"
+        self._calib_pixel_default = ""
 
-        self.manual_calib_label = QtWidgets.QLabel(self.manual_calib_widget)
-        self.manual_calib_label.setGeometry(QtCore.QRect(0, 0, 200, 31))
-        self.manual_calib_label.setText("Manual Calibration Parameters:")
-
-        self.known_dist_label = QtWidgets.QLabel(self.manual_calib_widget)
-        self.known_dist_label.setGeometry(QtCore.QRect(220, 0, 100, 31))
-        self.known_dist_label.setText("Known (mm):")
-
-        self.knownDistanceField = QtWidgets.QLineEdit(self.manual_calib_widget)
-        self.knownDistanceField.setGeometry(QtCore.QRect(320, 0, 51, 31))
-        self.knownDistanceField.setPlaceholderText("10")
-        self.knownDistanceField.setObjectName("knownDistanceField")
-
-        self.pixel_dist_label = QtWidgets.QLabel(self.manual_calib_widget)
-        self.pixel_dist_label.setGeometry(QtCore.QRect(220, 31, 70, 31))
-        self.pixel_dist_label.setText("Pixels:")
-
-        self.pixelDistanceField = QtWidgets.QLineEdit(self.manual_calib_widget)
-        self.pixelDistanceField.setGeometry(QtCore.QRect(320, 32, 51, 31))
-        self.pixelDistanceField.setPlaceholderText("240")
-        self.pixelDistanceField.setObjectName("pixelDistanceField")
-
-        self.calibrateBtn = QtWidgets.QPushButton(self.manual_calib_widget)
-        self.calibrateBtn.setGeometry(QtCore.QRect(0, 30, 180, 31))
-        self.calibrateBtn.setText("Open Calibration Helper")
+        self.calibrateBtn = QtWidgets.QPushButton(self.tab1)
+        self.calibrateBtn.setGeometry(QtCore.QRect(210, 420, 200, 31))
+        self.calibrateBtn.setText("Calibrate current video…")
         self.calibrateBtn.setToolTip(
-            "Manually define the physical scale by measuring a known distance in the image.")
+            "Measure a known distance on the current video and save plate scale.")
         self.calibrateBtn.clicked.connect(self.open_calibration_helper)
+
+        self.testQrBtn = QtWidgets.QPushButton(self.tab1)
+        self.testQrBtn.setGeometry(QtCore.QRect(210, 420, 200, 31))
+        self.testQrBtn.setText("Test QR detection…")
+        self.testQrBtn.setToolTip(
+            "Scan the current video for a QR scale marker and optionally save it.")
+        self.testQrBtn.clicked.connect(self.test_qr_current_video)
 
         self.processingLimitLabel = QtWidgets.QLabel(self.tab1)
         self.processingLimitLabel.setGeometry(QtCore.QRect(10, 460, 161, 31))
@@ -2238,8 +2200,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.platesScaleBtn.setObjectName("platesScaleBtn")
         self.platesScaleBtn.setText("Review plate\ncalibrations")
         self.platesScaleBtn.setToolTip(
-            "Review plate scale (pixel size) per video. "
-            "Fix missing QR detections or mismatched plant scales."
+            "Review plate scale per video. Test QR or Set scale on bad plates, "
+            "then re-run Process all plants before generating a report."
         )
         self.platesScaleBtn.clicked.connect(self.open_plates_scale_dialog)
 
@@ -2256,7 +2218,8 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.PostProcessButton.setObjectName("PostProcessButton")
         self.PostProcessButton.setText("Process\nall plants")
         self.PostProcessButton.setToolTip(
-            "Finalize and calculate statistics for all analyzed plants in this project.")
+            "Apply plate scale and compute metrics for all analyzed plants. "
+            "After fixing scale in Review, run this again before Generate report.")
         self.PostProcessButton.clicked.connect(self.PostProcess)
 
         self.loadConfigFileButton = QtWidgets.QPushButton(self.tab1)
@@ -2280,7 +2243,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.loadProject, self.projectField, self.loadVideo, self.videoField,
             self.rpiField, self.cameraField, self.plantField, self.plantIdentifier,
             self.plateConditionName, self.extraField, 
-            self.saveImagesButton, self.videoHasQRbutton, self.manual_calib_widget,
+            self.saveImagesButton, self.videoHasQRbutton, self.calibrateBtn, self.testQrBtn,
             self.processingLimitField, self.captureIntervalField, self.analysisEmergenceDistanceField,
             self.saveButton, self.previewAnalysisButton, self.analysisButton,
             self.platesScaleBtn, self.tab1TimePeriodButton, self.PostProcessButton,
@@ -2317,45 +2280,57 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             y += h + gap
     
     def toggle_calibration_mode(self):
-        """Toggle between QR and manual calibration modes"""
+        """QR on → Test QR; QR off → Calibrate current video."""
         has_qr = self.videoHasQRbutton.isChecked()
-        self.manual_calib_widget.setVisible(not has_qr)
+        self.calibrateBtn.setVisible(not has_qr)
+        self.testQrBtn.setVisible(has_qr)
 
     def open_calibration_helper(self):
-        """Opens calibration helper window"""
+        """Opens calibration helper for the current video."""
         if not self.videoField.text():
             QtWidgets.QMessageBox.warning(None, 'Error', 'Please select a video directory first!')
             return
 
         try:
             import calibration_helper
+            project = (self.projectField.text() or "").strip()
+            video = self.videoField.text()
+            known = (getattr(self, "_calib_known_default", None) or "").strip() or "10"
             self.calibration_window = calibration_helper.CalibrationHelper(
-                self.videoField.text(), dialog_parent=self,
+                video,
+                dialog_parent=self,
+                known_distance=known,
+                project_dir=project or None,
+                image_path=video,
+                plate_label=os.path.basename(video.rstrip(os.sep)) or video,
             )
-            self.calibration_window.distance_measured.connect(self._on_manual_scale_measured)
+            self.calibration_window.scale_saved.connect(self._on_manual_scale_saved)
             self.calibration_window.show()
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "Error", f"Failed to launch calibration helper:\n{e}")
 
-    def _on_manual_scale_measured(self, pixels):
-        self.pixelDistanceField.setText(str(pixels))
-        project = (self.projectField.text() or "").strip()
+    def test_qr_current_video(self):
+        """Test QR detection on the current video and optionally save plate scale."""
         video = (self.videoField.text() or "").strip()
-        known = (self.knownDistanceField.text() or "").strip()
-        if not project or not video or not known:
-            return
-        try:
-            pixel_size = compute_pixel_size(known, pixels)
-            upsert_calibration(
-                project,
-                video,
-                pixel_size=pixel_size,
-                source=SOURCE_MANUAL,
-                known_distance=known,
-                pixel_distance=pixels,
+        if not video:
+            QtWidgets.QMessageBox.warning(
+                None, 'Error', 'Please select a video directory first!',
             )
-        except (TypeError, ValueError):
-            pass
+            return
+        project = (self.projectField.text() or "").strip()
+        from gui.plates_calibration_dialog import run_test_qr_flow
+        run_test_qr_flow(
+            self,
+            project,
+            video,
+            title="Test QR detection",
+            on_set_scale=self.open_calibration_helper,
+        )
+
+    def _on_manual_scale_saved(self, pixel_size, known, pixels):
+        self._calib_known_default = f"{known:g}"
+        self._calib_pixel_default = str(int(pixels))
+        # Registry upsert already done inside the helper when project_dir is set.
 
     def open_plates_scale_dialog(self):
         project = (self.projectField.text() or "").strip()
@@ -2365,11 +2340,15 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             )
             return
         from gui.plates_calibration_dialog import PlatesCalibrationDialog
-        known = (self.knownDistanceField.text() or "").strip() or "10"
+        known = (getattr(self, "_calib_known_default", None) or "").strip() or "10"
+        video = (self.videoField.text() or "").strip() or None
         # Same popup pattern as open_calibration_helper / preview: keep a
         # reference and show() a non-modal QMainWindow.
         self._plates_calib_dialog = PlatesCalibrationDialog(
-            project, parent=self, known_distance_default=known,
+            project,
+            parent=self,
+            known_distance_default=known,
+            current_image_path=video,
         )
         self._plates_calib_dialog.show()
 
@@ -2940,20 +2919,31 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportCaptureIntervalField.textChanged.connect(self.syncCaptureIntervalField)
 
         self.reportTimeWindowsButton = QtWidgets.QPushButton(self.tab4)
-        self.reportTimeWindowsButton.setGeometry(QtCore.QRect(20, 510, 131, 81))
+        self.reportTimeWindowsButton.setGeometry(QtCore.QRect(20, 510, 131, 40))
         self.reportTimeWindowsButton.setObjectName("reportTimeWindowsButton")
-        self.reportTimeWindowsButton.setText("Set analysis\nperiod")
+        self.reportTimeWindowsButton.setText("Set analysis period")
         self.reportTimeWindowsButton.setToolTip(
             "Set analysis duration, per-group start/t0, and clock ticks."
         )
         self.reportTimeWindowsButton.clicked.connect(self.open_time_window_dialog)
+
+        self.reportPlatesScaleBtn = QtWidgets.QPushButton(self.tab4)
+        self.reportPlatesScaleBtn.setGeometry(QtCore.QRect(20, 550, 131, 41))
+        self.reportPlatesScaleBtn.setObjectName("reportPlatesScaleBtn")
+        self.reportPlatesScaleBtn.setText("Review plate calibrations")
+        self.reportPlatesScaleBtn.setToolTip(
+            "Review plate scale per video. Test QR or Set scale on bad plates, "
+            "then re-run Process all plants before generating a report."
+        )
+        self.reportPlatesScaleBtn.clicked.connect(self.open_plates_scale_dialog)
 
         self.reportPostProcessButton = QtWidgets.QPushButton(self.tab4)
         self.reportPostProcessButton.setGeometry(QtCore.QRect(180, 510, 131, 81))
         self.reportPostProcessButton.setObjectName("reportPostProcessButton")
         self.reportPostProcessButton.setText("Process\nall plants")
         self.reportPostProcessButton.setToolTip(
-            "Ensure all plant data is synchronized before generating final figures.")
+            "Apply plate scale and compute metrics for all analyzed plants. "
+            "After fixing scale in Review, run this again before Generate report.")
         self.reportPostProcessButton.clicked.connect(self.PostProcess)
         
         self.reportConfigureStatsButton = QtWidgets.QPushButton(self.tab4)
@@ -2998,7 +2988,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.daysConvexChooseButton,
             self.doFourier, self.doLateralAngles, self.reportEmergenceDistanceField,
             self.daysAnglesField, self.daysAnglesChooseButton, self.reportConfigureStatsButton,
-            self.reportTimeWindowsButton,
+            self.reportTimeWindowsButton, self.reportPlatesScaleBtn,
             self.reportProcessingLimitField, self.reportCaptureIntervalField,
             self.reportGenotypeAxisLabelField, self.reportPlateConditionAxisLabelField,
             self.reportExtraVariableAxisLabelField,

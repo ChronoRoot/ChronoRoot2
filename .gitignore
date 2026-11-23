@@ -5,3 +5,4 @@
 *.ipynb
 Docker/.gitignore
 tests*
+.cursor*

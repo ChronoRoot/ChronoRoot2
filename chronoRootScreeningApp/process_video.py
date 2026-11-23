@@ -20,6 +20,16 @@ from analysis.utils.metadata_schema import (
     load_json,
     video_has_qr,
 )
+from analysis.utils.calibration_registry import (
+    DEFAULT_PIXEL_SIZE,
+    SOURCE_DEFAULT,
+    SOURCE_MANUAL,
+    SOURCE_QR,
+    SOURCE_REGISTRY,
+    get_calibration,
+    normalize_image_path,
+    upsert_calibration,
+)
 from collections import defaultdict
 
 from skimage.morphology import skeletonize
@@ -369,43 +379,86 @@ def process_video(params: Dict[str, Any]):
         "HypocotylLength", "MainRootLength", "TotalLength",
         "LateralRootsLength", "NumberOfLateralRoots",
         "DenseRootArea",
-        "PlateCondition", "ExtraVariable", "pixel_size",
+        "PlateCondition", "ExtraVariable", "pixel_size", "calibration_source",
         "BoundingBox_X", "BoundingBox_Y", "BoundingBox_Width", "BoundingBox_Height",
     ]
 
 
-    # Calculate pixel size from calibration method
-    pixel_size = 0.004  # Default value in case something fails
+    # Calculate pixel size: params → registry → QR → manual → shared default
+    pixel_size = DEFAULT_PIXEL_SIZE
+    calibration_source = SOURCE_DEFAULT
+    video_abs = normalize_image_path(params['video_dir'])
+    project_dir = params['project_dir']
     try:
         if params.get('pixel_size') not in (None, ''):
             pixel_size = float(params['pixel_size'])
-            print(f"Using stored pixel size: {pixel_size:.6f} mm/pixel")
-        elif params['has_qr']:
-            # QR code calibration
-            j = 0
-            for img_file in image_files:
-                image_file = os.path.join(params['video_dir'], img_file)
-                qr = qr_detect(image_file)
-                if qr is not None:
-                    pixel_size = 10 / get_pixel_size(qr[0])
-                    print(f"Pixel size calculated from QR code: {pixel_size:.6f} mm/pixel")
-                    break
-                j += 1
-                if j > 10:
-                    print("No QR code found in the first 10 images, using default value")
-                    break
-
+            calibration_source = str(params.get('calibration_source') or 'params')
+            print(f"Using stored pixel size: {pixel_size:.6f} mm/pixel ({calibration_source})")
         else:
-            # Manual calibration
-            known_distance = params['known_distance']  # in mm
-            pixel_distance = params['pixel_distance']  # in pixels
-            pixel_size = known_distance / pixel_distance
-            print(f"Pixel size from manual calibration: {pixel_size:.6f} mm/pixel")
-            
+            registry_entry = get_calibration(project_dir, video_abs)
+            if registry_entry and 'pixel_size' in registry_entry:
+                pixel_size = float(registry_entry['pixel_size'])
+                calibration_source = SOURCE_REGISTRY
+                print(
+                    f"Pixel size from calibrations.json: {pixel_size:.6f} mm/pixel"
+                )
+            elif params['has_qr']:
+                found_qr = False
+                for j, img_file in enumerate(image_files[:20]):
+                    image_file = os.path.join(params['video_dir'], img_file)
+                    qr = qr_detect(image_file)
+                    if qr is not None:
+                        pixel_size = 10 / get_pixel_size(qr[0])
+                        calibration_source = SOURCE_QR
+                        found_qr = True
+                        upsert_calibration(
+                            project_dir, video_abs,
+                            pixel_size=pixel_size, source=SOURCE_QR,
+                        )
+                        print(f"Pixel size from QR code: {pixel_size:.6f} mm/pixel")
+                        break
+                if not found_qr:
+                    pixel_size = DEFAULT_PIXEL_SIZE
+                    calibration_source = SOURCE_DEFAULT
+                    print(
+                        f"QR not detected in first frames; using default "
+                        f"{pixel_size:.6f} mm/pixel"
+                    )
+            else:
+                known_distance = params.get('known_distance')
+                pixel_distance = params.get('pixel_distance')
+                if known_distance not in (None, '') and pixel_distance not in (None, ''):
+                    pixel_size = float(known_distance) / float(pixel_distance)
+                    calibration_source = SOURCE_MANUAL
+                    upsert_calibration(
+                        project_dir, video_abs,
+                        pixel_size=pixel_size, source=SOURCE_MANUAL,
+                        known_distance=known_distance,
+                        pixel_distance=pixel_distance,
+                    )
+                    print(
+                        f"Pixel size from manual calibration: "
+                        f"{pixel_size:.6f} mm/pixel"
+                    )
+                else:
+                    pixel_size = DEFAULT_PIXEL_SIZE
+                    calibration_source = SOURCE_DEFAULT
+                    print(
+                        f"No registry or manual scale for this video; "
+                        f"using default {pixel_size:.6f} mm/pixel "
+                        f"(fix in Review plate calibrations, then re-process)"
+                    )
+
     except Exception as e:
-        print(f"Error in pixel size calculation: {str(e)}, using default value {pixel_size:.6f} mm/pixel")
+        pixel_size = DEFAULT_PIXEL_SIZE
+        calibration_source = SOURCE_DEFAULT
+        print(
+            f"Error in pixel size calculation: {str(e)}, "
+            f"using default value {pixel_size:.6f} mm/pixel"
+        )
 
     group_info['pixel_size'] = pixel_size
+    group_info['calibration_source'] = calibration_source
     dump_json(os.path.join(analysis_dir, 'group_info.json'), group_info)
 
     seg_subdir = params.get('segmentation_subdir') or 'Ensemble'
@@ -578,7 +631,7 @@ def process_video(params: Dict[str, Any]):
                 hypocotyl_length, mainroot_length, totalroot_length,
                 lateral_length, 0,
                 dense_root_area,
-                plate_condition, extra_variable, pixel_size,
+                plate_condition, extra_variable, pixel_size, calibration_source,
                 x, y, w, h,
             ])   
         
@@ -704,12 +757,15 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
     elif params['has_qr']:
         pass
     else:
-        if config.get('knownDistance') in (None, '') or config.get('pixelDistance') is None:
-            raise ValueError("Manual calibration requires knownDistance and pixelDistance in config")
-        params['known_distance'] = float(config['knownDistance'])
-        params['pixel_distance'] = int(config['pixelDistance'])
-        params['knownDistance'] = params['known_distance']
-        params['pixelDistance'] = params['pixel_distance']
+        # Prefer form/config fields when present; otherwise registry/QR/default
+        # resolution in process_group handles missing scale.
+        known = config.get('knownDistance')
+        pixels = config.get('pixelDistance')
+        if known not in (None, '') and pixels not in (None, ''):
+            params['known_distance'] = float(known)
+            params['pixel_distance'] = int(pixels)
+            params['knownDistance'] = params['known_distance']
+            params['pixelDistance'] = params['pixel_distance']
 
     if 'group_rois' in config and config['group_rois']:
         params['group_rois'] = config['group_rois']

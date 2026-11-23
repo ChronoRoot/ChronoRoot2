@@ -2,21 +2,23 @@
 
 Follows the same popup pattern as CalibrationHelper / ChronoViewWindow:
 non-modal QMainWindow + show(), and the calibration helper is opened the same
-way as Open Calibration Helper on the main window.
+way as Calibrate current video on the main window.
 """
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from analysis.utils.calibration_registry import (
+    SOURCE_QR,
     STATUS_DEFAULT,
     STATUS_MISMATCH,
     STATUS_MISSING,
-    SOURCE_MANUAL,
+    STATUS_REGISTRY_ONLY,
     apply_scale_to_plants,
-    compute_pixel_size,
     list_plate_statuses,
+    try_qr_pixel_size,
     upsert_calibration,
 )
+from gui.background import run_off_main_thread
 
 
 STATUS_LABELS = {
@@ -26,13 +28,115 @@ STATUS_LABELS = {
     "missing": "Missing",
     "default_fallback": "Default (QR miss)",
     "mismatch": "Mismatch",
+    "registry_only": "Saved (no plants yet)",
 }
 
 DIALOG_TITLE = "Review plate calibrations"
 
 
+def run_test_qr_flow(
+    parent,
+    project_dir,
+    image_path,
+    *,
+    plant_paths=None,
+    title=DIALOG_TITLE,
+    progress_parent=None,
+    on_set_scale=None,
+    on_saved=None,
+):
+    """Scan a video for QR scale; offer Save to plate / Set scale on failure.
+
+    Returns True if a scale was saved, False otherwise.
+    """
+    if not image_path:
+        QtWidgets.QMessageBox.warning(parent, title, "No video path selected.")
+        return False
+
+    host = progress_parent if progress_parent is not None else parent
+
+    def scan():
+        return try_qr_pixel_size(image_path)
+
+    try:
+        pixel_size, detail = run_off_main_thread(
+            host, "Testing QR detection…", scan,
+        )
+    except Exception as exc:
+        QtWidgets.QMessageBox.critical(parent, title, f"QR test failed:\n{exc}")
+        return False
+
+    if pixel_size is None:
+        box = QtWidgets.QMessageBox(parent)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle(title)
+        box.setText(f"QR test failed.\n\n{detail}")
+        set_btn = None
+        if on_set_scale is not None:
+            set_btn = box.addButton("Set scale…", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.Close)
+        box.exec_()
+        if set_btn is not None and box.clickedButton() == set_btn:
+            on_set_scale()
+        return False
+
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Information)
+    box.setWindowTitle(title)
+    box.setText(
+        f"QR scale detected.\n\n"
+        f"pixel_size = {pixel_size:.6g} mm/px\n"
+        f"{detail}"
+    )
+    save_btn = box.addButton("Save to plate", QtWidgets.QMessageBox.AcceptRole)
+    box.addButton(QtWidgets.QMessageBox.Close)
+    box.exec_()
+    if box.clickedButton() != save_btn:
+        return False
+
+    if not project_dir:
+        QtWidgets.QMessageBox.warning(
+            parent, title, "Open a valid project folder before saving plate scale.",
+        )
+        return False
+
+    try:
+        upsert_calibration(
+            project_dir,
+            image_path,
+            pixel_size=pixel_size,
+            source=SOURCE_QR,
+        )
+        apply_scale_to_plants(
+            plant_paths or [],
+            pixel_size,
+            source=SOURCE_QR,
+        )
+    except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+            parent, title, f"Could not save QR scale:\n{exc}",
+        )
+        return False
+
+    QtWidgets.QMessageBox.information(
+        parent,
+        title,
+        "QR scale saved for this plate.\n\n"
+        "Re-run Process all plants so metrics use the new scale.",
+    )
+    if on_saved is not None:
+        on_saved(pixel_size)
+    return True
+
+
 class PlatesCalibrationDialog(QtWidgets.QMainWindow):
-    def __init__(self, project_dir, parent=None, known_distance_default="10"):
+    def __init__(
+        self,
+        project_dir,
+        parent=None,
+        known_distance_default="10",
+        current_image_path=None,
+    ):
         # parent=None like CalibrationHelper / ChronoViewWindow so this is a
         # free top-level window. Keep host for loading overlays only.
         super().__init__(None)
@@ -40,10 +144,9 @@ class PlatesCalibrationDialog(QtWidgets.QMainWindow):
         self._host = parent
         self.project_dir = project_dir
         self.known_distance_default = str(known_distance_default or "10")
+        self.current_image_path = current_image_path
         self._rows = []
         self._helper = None
-        self._pending_row = None
-        self._pending_known = None
 
         self.setWindowTitle(DIALOG_TITLE)
         self.resize(900, 480)
@@ -54,8 +157,8 @@ class PlatesCalibrationDialog(QtWidgets.QMainWindow):
 
         help_label = QtWidgets.QLabel(
             "Each video folder has its own plate scale (mm/px). "
-            "Camera-to-plate distance can change between videos. "
-            "Use Set scale… to measure a known length and apply it to all plants on that plate."
+            "Use Test QR… or Set scale… on a bad plate, then re-run "
+            "Process all plants so metrics use the new scale."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
@@ -74,11 +177,17 @@ class PlatesCalibrationDialog(QtWidgets.QMainWindow):
         buttons = QtWidgets.QHBoxLayout()
         self.refresh_btn = QtWidgets.QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
+        self.test_qr_btn = QtWidgets.QPushButton("Test QR…")
+        self.test_qr_btn.setToolTip(
+            "Scan the first frames of the selected video for a QR scale marker."
+        )
+        self.test_qr_btn.clicked.connect(self.test_qr_for_selected)
         self.set_scale_btn = QtWidgets.QPushButton("Set scale…")
         self.set_scale_btn.clicked.connect(self.set_scale_for_selected)
         self.close_btn = QtWidgets.QPushButton("Close")
         self.close_btn.clicked.connect(self.close)
         buttons.addWidget(self.refresh_btn)
+        buttons.addWidget(self.test_qr_btn)
         buttons.addWidget(self.set_scale_btn)
         buttons.addStretch(1)
         buttons.addWidget(self.close_btn)
@@ -87,7 +196,9 @@ class PlatesCalibrationDialog(QtWidgets.QMainWindow):
         self.refresh()
 
     def refresh(self):
-        self._rows = list_plate_statuses(self.project_dir)
+        self._rows = list_plate_statuses(
+            self.project_dir, current_image_path=self.current_image_path,
+        )
         self.table.setRowCount(len(self._rows))
         for row_idx, row in enumerate(self._rows):
             video = row["image_path"]
@@ -107,8 +218,13 @@ class PlatesCalibrationDialog(QtWidgets.QMainWindow):
                     item.setToolTip(video)
                     item.setData(QtCore.Qt.UserRole, row_idx)
                 status = row.get("status")
-                if status in (STATUS_MISSING, STATUS_DEFAULT, STATUS_MISMATCH):
-                    item.setBackground(QtGui.QColor(255, 230, 180))
+                if status in (
+                    STATUS_MISSING, STATUS_DEFAULT, STATUS_MISMATCH, STATUS_REGISTRY_ONLY,
+                ):
+                    if status == STATUS_REGISTRY_ONLY and row.get("pixel_size") is not None:
+                        item.setBackground(QtGui.QColor(220, 240, 220))
+                    else:
+                        item.setBackground(QtGui.QColor(255, 230, 180))
                 self.table.setItem(row_idx, col, item)
         if self._rows:
             self.table.selectRow(0)
@@ -136,69 +252,60 @@ class PlatesCalibrationDialog(QtWidgets.QMainWindow):
             )
             return
 
-        known_text, ok = QtWidgets.QInputDialog.getText(
-            self,
-            "Known distance",
-            "Known physical length (mm) for the two-point measurement:",
-            text=self.known_distance_default,
-        )
-        if not ok:
-            return
-        try:
-            known = float(known_text)
-            if known <= 0:
-                raise ValueError
-        except ValueError:
-            QtWidgets.QMessageBox.warning(
-                self, DIALOG_TITLE, "Enter a positive known distance in mm.",
-            )
-            return
+        video = image_path.rstrip("/").split("/")[-1] or image_path
+        rpi = row.get("rpi") or ""
+        cam = row.get("cam") or ""
+        plate_label = video
+        if rpi or cam:
+            plate_label = f"{video}  ({rpi}/{cam})".strip()
 
-        # Same pattern as run.open_calibration_helper: non-modal QMainWindow,
-        # dialog_parent = main window for the loading overlay, show().
         try:
             import calibration_helper
-            self._pending_row = row
-            self._pending_known = known
             self._helper = calibration_helper.CalibrationHelper(
-                image_path, dialog_parent=self._host,
+                image_path,
+                dialog_parent=self._host,
+                known_distance=self.known_distance_default,
+                project_dir=self.project_dir,
+                image_path=image_path,
+                plate_label=plate_label,
+                plant_paths=row.get("plant_paths") or [],
             )
-            self._helper.distance_measured.connect(self._on_distance_measured)
+            self._helper.scale_saved.connect(self._on_scale_saved)
             self._helper.show()
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, DIALOG_TITLE, f"Could not open calibration helper:\n{exc}",
             )
 
-    def _on_distance_measured(self, pixels):
-        """Apply scale when two points are chosen; leave the helper open to close."""
-        row = self._pending_row
-        known = self._pending_known
-        if row is None or known is None:
+    def _on_scale_saved(self, *_args):
+        self.refresh()
+        QtWidgets.QMessageBox.information(
+            self,
+            DIALOG_TITLE,
+            "Scale saved for this plate.\n\n"
+            "Re-run Process all plants so metrics use the new scale.",
+        )
+
+    def test_qr_for_selected(self):
+        row = self._selected_row()
+        if row is None:
+            QtWidgets.QMessageBox.information(
+                self, DIALOG_TITLE, "Select a plate row first.",
+            )
             return
-        try:
-            pixel_size = compute_pixel_size(known, pixels)
-        except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, str(exc))
+        image_path = row.get("image_path") or ""
+        if not image_path:
+            QtWidgets.QMessageBox.warning(
+                self, DIALOG_TITLE, "This plate has no video path.",
+            )
             return
 
-        upsert_calibration(
+        run_test_qr_flow(
+            self,
             self.project_dir,
-            row["image_path"],
-            pixel_size=pixel_size,
-            source=SOURCE_MANUAL,
-            known_distance=known,
-            pixel_distance=pixels,
+            image_path,
+            plant_paths=row.get("plant_paths") or [],
+            progress_parent=self._host if self._host is not None else self,
+            on_set_scale=self.set_scale_for_selected,
+            on_saved=lambda *_: self.refresh(),
         )
-        apply_scale_to_plants(
-            row.get("plant_paths") or [],
-            pixel_size,
-            source=SOURCE_MANUAL,
-            known_distance=known,
-            pixel_distance=pixels,
-        )
-        self.refresh()
-        if self._helper is not None:
-            self._helper.statusBar().showMessage(
-                f"Saved {pixel_size:.6g} mm/px — close this window when done"
-            )

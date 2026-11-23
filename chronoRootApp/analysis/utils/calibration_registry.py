@@ -35,6 +35,7 @@ STATUS_OK_EXISTING = "ok_existing"
 STATUS_MISSING = "missing"
 STATUS_DEFAULT = "default_fallback"
 STATUS_MISMATCH = "mismatch"
+STATUS_REGISTRY_ONLY = "registry_only"
 
 
 def normalize_image_path(path):
@@ -289,9 +290,72 @@ def _status_from_sources(sources, pixel_sizes, registry_entry):
     return STATUS_OK_EXISTING
 
 
-def list_plate_statuses(project_dir):
+def _row_from_parts(
+    image_path,
+    rpi,
+    cam,
+    plant_paths,
+    registry_entry,
+    *,
+    force_registry_only=False,
+):
+    pixel_sizes = []
+    sources = []
+    for plant_path in plant_paths:
+        _result_dir, meta = _load_latest_metadata(plant_path)
+        if not meta:
+            continue
+        if "pixel_size" in meta:
+            try:
+                pixel_sizes.append(float(meta["pixel_size"]))
+            except (TypeError, ValueError):
+                pass
+        src = meta.get("calibration_source")
+        if src:
+            sources.append(str(src))
+    unique_sizes = sorted({round(float(v), 8) for v in pixel_sizes})
+    display_size = unique_sizes[0] if len(unique_sizes) == 1 else (
+        None if not unique_sizes else unique_sizes[0]
+    )
+    if registry_entry and display_size is None:
+        try:
+            display_size = float(registry_entry.get("pixel_size"))
+        except (TypeError, ValueError):
+            display_size = None
+    if len(unique_sizes) > 1:
+        source = SOURCE_MISMATCH
+    elif sources:
+        non_default = [s for s in sources if s != SOURCE_DEFAULT]
+        source = non_default[0] if non_default else sources[0]
+        if len(set(sources)) > 1 and SOURCE_DEFAULT in sources:
+            source = SOURCE_MISMATCH if len(unique_sizes) > 1 else source
+    elif registry_entry:
+        source = str(registry_entry.get("source") or SOURCE_REGISTRY)
+    else:
+        source = ""
+    status = _status_from_sources(sources, pixel_sizes, registry_entry)
+    if force_registry_only or (not plant_paths and registry_entry):
+        status = STATUS_REGISTRY_ONLY
+    return {
+        "image_path": image_path,
+        "rpi": rpi or "",
+        "cam": cam or "",
+        "plant_paths": list(plant_paths),
+        "plant_count": len(plant_paths),
+        "pixel_size": display_size,
+        "source": source,
+        "status": status,
+        "registry_entry": dict(registry_entry) if registry_entry else None,
+        "pixel_sizes": pixel_sizes,
+    }
+
+
+def list_plate_statuses(project_dir, current_image_path=None):
     """
     Return a list of plate status dicts for the Plates & scale dialog.
+
+    Includes registry-only keys (no Analysis plants yet) and optionally the
+    caller's current video so first-time calibrate works from Review.
 
     Each item: image_path, rpi, cam, plant_paths, plant_count, pixel_size,
     source, status, registry_entry
@@ -300,59 +364,60 @@ def list_plate_statuses(project_dir):
     groups = collect_plate_groups(analysis_root, require_raw_csv=False)
     registry = load_registry(project_dir)
     rows = []
+    seen_paths = set()
     for plate_key in sorted(groups.keys(), key=lambda k: str(k)):
         plant_paths = groups[plate_key]
         if len(plate_key) >= 3:
             image_path, rpi, cam = plate_key[0], plate_key[1], plate_key[2]
         else:
             image_path, rpi, cam = plate_key[0], "", ""
-        registry_entry = registry.get("by_image_path", {}).get(normalize_image_path(image_path))
-        pixel_sizes = []
-        sources = []
-        for plant_path in plant_paths:
-            _result_dir, meta = _load_latest_metadata(plant_path)
-            if not meta:
-                continue
-            if "pixel_size" in meta:
-                try:
-                    pixel_sizes.append(float(meta["pixel_size"]))
-                except (TypeError, ValueError):
-                    pass
-            src = meta.get("calibration_source")
-            if src:
-                sources.append(str(src))
-        unique_sizes = sorted({round(float(v), 8) for v in pixel_sizes})
-        display_size = unique_sizes[0] if len(unique_sizes) == 1 else (
-            None if not unique_sizes else unique_sizes[0]
+        nkey = normalize_image_path(image_path)
+        registry_entry = registry.get("by_image_path", {}).get(nkey)
+        rows.append(_row_from_parts(image_path, rpi, cam, plant_paths, registry_entry))
+        if nkey:
+            seen_paths.add(nkey)
+
+    for key, entry in sorted((registry.get("by_image_path") or {}).items()):
+        nkey = normalize_image_path(key)
+        if not nkey or nkey in seen_paths:
+            continue
+        if not isinstance(entry, dict):
+            entry = None
+        rows.append(
+            _row_from_parts(nkey, "", "", [], entry, force_registry_only=True)
         )
-        if registry_entry and display_size is None:
-            try:
-                display_size = float(registry_entry.get("pixel_size"))
-            except (TypeError, ValueError):
-                display_size = None
-        if len(unique_sizes) > 1:
-            source = SOURCE_MISMATCH
-        elif sources:
-            # Prefer a non-default label if mixed; otherwise the common one
-            non_default = [s for s in sources if s != SOURCE_DEFAULT]
-            source = non_default[0] if non_default else sources[0]
-            if len(set(sources)) > 1 and SOURCE_DEFAULT in sources:
-                source = SOURCE_MISMATCH if len(unique_sizes) > 1 else source
-        elif registry_entry:
-            source = str(registry_entry.get("source") or SOURCE_REGISTRY)
-        else:
-            source = ""
-        status = _status_from_sources(sources, pixel_sizes, registry_entry)
-        rows.append({
-            "image_path": image_path,
-            "rpi": rpi,
-            "cam": cam,
-            "plant_paths": list(plant_paths),
-            "plant_count": len(plant_paths),
-            "pixel_size": display_size,
-            "source": source,
-            "status": status,
-            "registry_entry": dict(registry_entry) if registry_entry else None,
-            "pixel_sizes": pixel_sizes,
-        })
+        seen_paths.add(nkey)
+
+    if current_image_path:
+        nkey = normalize_image_path(current_image_path)
+        if nkey and nkey not in seen_paths:
+            entry = registry.get("by_image_path", {}).get(nkey)
+            rows.append(
+                _row_from_parts(
+                    nkey, "", "", [], entry,
+                    force_registry_only=bool(entry),
+                )
+            )
     return rows
+
+
+def try_qr_pixel_size(image_path, max_frames=20):
+    """
+    Scan the first N frames for a QR scale marker (same logic as postprocess).
+
+    Returns (pixel_size, detail) on success, or (None, detail) on failure.
+    """
+    from analysis.qr import qr_detect, get_pixel_size, load_path
+
+    if not image_path or not os.path.isdir(image_path):
+        return None, f"Video folder not found: {image_path}"
+    images = load_path(image_path, "*.png")
+    if not images:
+        return None, f"No PNG frames in {image_path}"
+    n = min(int(max_frames), len(images))
+    for image in images[:n]:
+        qr = qr_detect(image)
+        if qr is not None:
+            pixel_size = 10 / get_pixel_size(qr[0])
+            return float(pixel_size), f"QR detected in {os.path.basename(image)}"
+    return None, f"QR not detected in first {n} frames of {image_path}"

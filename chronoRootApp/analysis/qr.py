@@ -86,68 +86,146 @@ def flat_field_correct(img=None):
     return img_o
 
 
-def qr_detect(inputImage):
-    inputImage = cv2.imread(inputImage, 0)
-    h, w = inputImage.shape
-    h0 = 0
-    h1 = int(h//2) 
-    w0 = int(w//4)
-    w1 = int(3*w0)
-        
-    roi = inputImage[h0:h1, w0:w1]
+def _prepare_candidate(crop):
+    """Median blur + Otsu mask used by the classic ChronoRoot QR path."""
+    enmask = crop.copy()
+    cv2.medianBlur(enmask, 5, enmask)
+    th3aux = 255 - cv2.threshold(enmask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    cv2.bitwise_and(enmask, th3aux, enmask)
+    return enmask
 
-    kernel1 = cv2.getStructuringElement(cv2.MORPH_RECT, (10,10))    
-    kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (40,40))
+
+def _gamma_decode(image, gamma_start=1.0, gamma_stop=1.74, steps=75):
+    """Try pyzbar across a gamma sweep. Returns decoded list (possibly empty)."""
+    if steps <= 1:
+        gammas = [gamma_start]
+    else:
+        gammas = np.linspace(gamma_start, gamma_stop, steps)
+    for gamma in gammas:
+        adjust = adjust_gamma(image, float(gamma)).astype("uint8")
+        data = pyzbar.decode(adjust)
+        if len(data) > 0:
+            return data
+    return []
+
+
+def _scale_decoded_polygon(decoded, scale):
+    """Undo upscale so polygon side lengths match the original image pixels."""
+    if scale == 1.0 or not decoded:
+        return decoded
+    out = []
+    for item in decoded:
+        point_cls = type(item.polygon[0])
+        poly = [
+            point_cls(int(round(p.x / scale)), int(round(p.y / scale)))
+            for p in item.polygon
+        ]
+        out.append(item._replace(polygon=poly))
+    return out
+
+
+def _try_decode_variants(crop, clipped_top=False):
+    """
+    Decode a QR candidate crop.
+
+    Order: classic prep → white quiet-zone pad → top pad (if clipped) →
+    mild upscale + pad. No new dependencies.
+    """
+    data = _gamma_decode(_prepare_candidate(crop))
+    if data:
+        return data
+
+    # Restore quiet zone when paper is cut flush to the code.
+    for pad in (20, 40, 60):
+        bordered = cv2.copyMakeBorder(
+            crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255
+        )
+        data = _gamma_decode(_prepare_candidate(bordered), steps=40)
+        if data:
+            return data
+
+    # Extra top padding when the contour touches the ROI top.
+    if clipped_top:
+        for pad in (30, 50):
+            toppad = cv2.copyMakeBorder(
+                crop, pad, 0, 0, 0, cv2.BORDER_CONSTANT, value=255
+            )
+            data = _gamma_decode(_prepare_candidate(toppad), steps=40)
+            if data:
+                return data
+
+    # Mild upscale helps soft / low-contrast codes (correct polygon scale after).
+    for scale in (1.25, 1.5):
+        up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        for pad in (20, 40):
+            bordered = cv2.copyMakeBorder(
+                up, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255
+            )
+            data = _gamma_decode(
+                _prepare_candidate(bordered),
+                gamma_start=1.0,
+                gamma_stop=2.0,
+                steps=25,
+            )
+            if data:
+                return _scale_decoded_polygon(data, scale)
+
+    return []
+
+
+def qr_detect(inputImage):
+    if hasattr(inputImage, "shape"):
+        gray = (
+            inputImage
+            if len(inputImage.shape) == 2
+            else cv2.cvtColor(inputImage, cv2.COLOR_BGR2GRAY)
+        )
+    else:
+        gray = cv2.imread(inputImage, 0)
+    if gray is None:
+        return None
+
+    h, w = gray.shape
+    h0 = 0
+    h1 = int(h // 2)
+    w0 = int(w // 4)
+    w1 = int(3 * w0)
+
+    roi = gray[h0:h1, w0:w1]
+
+    kernel1 = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
+    kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 40))
 
     gamma = 1.2
-    blur_re = adjust_gamma(roi, gamma).astype('uint8')
-    
-    a = flat_field_correct(blur_re)
-    th3 = 255 - cv2.threshold(a ,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
+    blur_re = adjust_gamma(roi, gamma).astype("uint8")
 
-    cv2.erode(th3,kernel1, th3)    
+    a = flat_field_correct(blur_re)
+    th3 = 255 - cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    cv2.erode(th3, kernel1, th3)
     cv2.dilate(th3, kernel2, th3)
     cv2.dilate(th3, kernel2, th3)
 
     contours, hierarchy = cv2.findContours(th3, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    contour_sizes = [(cv2.contourArea(contour)) for contour in contours]
-    contour_sizes = np.array(contour_sizes)
-    
+
+    contour_sizes = np.array([cv2.contourArea(contour) for contour in contours])
+    if len(contour_sizes) == 0:
+        return None
+
     index2 = np.argsort(contour_sizes)[::-1]
     index = contour_sizes[index2] > 4000
-    
+
     data = []
-    
     for k in index2[index]:
-        x, y, w, h = cv2.boundingRect(contours[k])
-        
-        if w < 100 or h < 100:
-            pass
-        else:
-            enmask = roi[y:y+h, x:x+w].copy()
-            
-            cv2.medianBlur(enmask, 5, enmask)
-            
-            th3aux = 255 - cv2.threshold(enmask, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
-            cv2.bitwise_and(enmask, th3aux, enmask)
+        x, y, bw, bh = cv2.boundingRect(contours[k])
+        if bw < 100 or bh < 100:
+            continue
+        crop = roi[y : y + bh, x : x + bw].copy()
+        data = _try_decode_variants(crop, clipped_top=(y == 0))
+        if len(data) > 0:
+            break
 
-            for i in range(0, 75):
-                gamma = 1.0 + i*0.01
-                adjust = adjust_gamma(enmask, gamma).astype('uint8')
-
-                data = pyzbar.decode(adjust)
-                
-                if len(data) > 0:
-                    break
-            
-            if len(data) > 0:
-                break
-            
-    if len(data) > 0:
-        return data
-    else:
-        return None
+    return data if len(data) > 0 else None
 
 
 def get_pixel_size(detection):

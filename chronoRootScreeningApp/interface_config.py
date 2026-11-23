@@ -113,8 +113,8 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
         'add_time': analysis_tab.add_time_edit.text(),
         'germination_time_cut': analysis_tab.germination_time_edit.text(),
         'videoHasQR': analysis_tab.qr_checkbox.isChecked(),
-        'knownDistance': analysis_tab.known_dist_edit.text(),
-        'pixelDistance': analysis_tab.pixel_dist_edit.text(),
+        'knownDistance': getattr(analysis_tab, '_calib_known_default', '') or '',
+        'pixelDistance': getattr(analysis_tab, '_calib_pixel_default', '') or '',
         'germination_analysis': analysis_tab.germination_checkbox.isChecked(),
         'plant_growth_analysis': analysis_tab.plant_growth_checkbox.isChecked(),
         'show_tracking': analysis_tab.show_tracking_checkbox.isChecked(),
@@ -230,8 +230,6 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
         for widget, keys, default in (
             (analysis_tab.time_delta_edit, ('timeStep', 'time_delta'), ''),
             (analysis_tab.add_time_edit, ('add_time',), ''),
-            (analysis_tab.known_dist_edit, ('knownDistance', 'known_distance'), ''),
-            (analysis_tab.pixel_dist_edit, ('pixelDistance', 'pixel_distance'), ''),
             (analysis_tab.fpca_components_edit, ('fpca_components',), '2'),
         ):
             value = None
@@ -243,6 +241,13 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
                 widget.setText(str(value))
             elif keys[0] not in data and default:
                 widget.setText(str(default))
+
+        known = data.get('knownDistance', data.get('known_distance'))
+        if known is not None:
+            analysis_tab._calib_known_default = str(known)
+        pixel = data.get('pixelDistance', data.get('pixel_distance'))
+        if pixel is not None:
+            analysis_tab._calib_pixel_default = str(pixel)
 
         if 'germination_time_cut' in data or 'germination_time' in data:
             germ_time = data.get('germination_time_cut', data.get('germination_time', ''))
