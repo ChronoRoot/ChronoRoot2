@@ -405,13 +405,18 @@ def try_qr_pixel_size(image_path, max_frames=20):
     """
     Scan the first N frames for a QR scale marker (same logic as postprocess).
 
+    Uses the same PNG discovery as preview (``list_video_pngs``), including
+    ``Segmentation/segmentation_metadata.json`` → ``input_path`` when frames
+    live outside the selected video folder.
+
     Returns (pixel_size, detail) on success, or (None, detail) on failure.
     """
-    from analysis.qr import qr_detect, get_pixel_size, load_path
+    from analysis.qr import qr_detect, get_pixel_size
+    from .fileUtilities import list_video_pngs
 
     if not image_path or not os.path.isdir(image_path):
         return None, f"Video folder not found: {image_path}"
-    images = load_path(image_path, "*.png")
+    images, resolved = list_video_pngs({"Images": image_path})
     if not images:
         return None, f"No PNG frames in {image_path}"
     n = min(int(max_frames), len(images))
@@ -419,5 +424,9 @@ def try_qr_pixel_size(image_path, max_frames=20):
         qr = qr_detect(image)
         if qr is not None:
             pixel_size = 10 / get_pixel_size(qr[0])
-            return float(pixel_size), f"QR detected in {os.path.basename(image)}"
+            where = resolved or image_path
+            return (
+                float(pixel_size),
+                f"QR detected in {os.path.basename(image)} ({where})",
+            )
     return None, f"QR not detected in first {n} frames of {image_path}"

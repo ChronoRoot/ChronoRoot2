@@ -23,6 +23,7 @@ from analysis.lateral_angles import getAngles
 from analysis.utils.fileUtilities import (
     convertFromPathSafe,
     get_latest_result_dir,
+    list_video_pngs,
     processing_limit_frame_count,
 )
 from analysis.utils.metadata_schema import (
@@ -144,7 +145,8 @@ def resolve_plate_pixel_size(conf, plants):
     if not image_path:
         return DEFAULT_PIXEL_SIZE, SOURCE_DEFAULT, "no ImagePath for QR scan"
 
-    images = load_path(image_path, "*.png")
+    # Same discovery as preview: local PNGs, else segmentation_metadata input_path.
+    images, _resolved = list_video_pngs({"Images": image_path})
     for image in images[:20]:
         qr = qr_detect(image)
         if qr is not None:
