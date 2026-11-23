@@ -11,14 +11,14 @@ def project_config_path(project_dir):
 
 
 def run_analysis(project_dir):
-  subprocess.Popen([
+  return subprocess.Popen([
       "python", "1_analysis.py",
       "--config", project_config_path(project_dir),
   ])
 
 
 def run_analysis_config(config_path):
-  subprocess.Popen([
+  return subprocess.Popen([
       "python", "1_analysis.py",
       "--config", config_path,
   ])
@@ -26,11 +26,11 @@ def run_analysis_config(config_path):
 
 def run_pending_analysis(config_path):
   """Launch analysis for a pending config path written by the GUI."""
-  run_analysis_config(config_path)
+  return run_analysis_config(config_path)
 
 
 def run_analysis_rerun(metadata_path):
-  subprocess.Popen([
+  return subprocess.Popen([
       "python", "1_analysis.py",
       "--config", metadata_path,
       "--rerun",

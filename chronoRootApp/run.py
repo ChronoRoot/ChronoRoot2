@@ -790,6 +790,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._viewing_report_name = ""
         self._report_processes = {}
         self._postprocess_process = None
+        self._analysis_processes = []
         self.figureClockTicks = ['00:00']
         self.showFigureClockTicks = True
         self.snapshotHours = None
@@ -1336,7 +1337,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         try:
             pending_path = run_off_main_thread(self, None, write_pending)
-            pipeline_runner.run_pending_analysis(pending_path)
+            self._track_analysis_process(
+                pipeline_runner.run_pending_analysis(pending_path),
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
 
@@ -1444,7 +1447,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
         relaunch_slot = self._slot_of_plant_path(self.selected_plant)
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
-        pipeline_runner.run_pending_analysis(pending_path)
+        self._track_analysis_process(
+            pipeline_runner.run_pending_analysis(pending_path),
+        )
         self._follow_relaunch(self.selected_plant, baseline=relaunch_baseline)
 
     def _slot_of_plant_path(self, path):
@@ -1626,7 +1631,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         metadata_path = os.path.join(path, "metadata.json")
         relaunch_slot = self._slot_of_plant_path(path)
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
-        pipeline_runner.run_analysis_rerun(metadata_path)
+        self._track_analysis_process(
+            pipeline_runner.run_analysis_rerun(metadata_path),
+        )
         self._follow_relaunch(path, baseline=relaunch_baseline)
 
     def reviewPlant(self):
@@ -1779,6 +1786,80 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return process
         self._postprocess_process = None
         return None
+
+    def _track_analysis_process(self, process):
+        if process is None:
+            return
+        alive = [
+            item for item in getattr(self, "_analysis_processes", [])
+            if item.poll() is None
+        ]
+        alive.append(process)
+        self._analysis_processes = alive
+
+    def _pipeline_jobs_running(self):
+        """True when analysis, postprocess, or report subprocesses are still live."""
+        if any(
+            process.poll() is None
+            for process in getattr(self, "_analysis_processes", [])
+        ):
+            return True
+        if self._reap_postprocess_process() is not None:
+            return True
+        self._reap_report_processes()
+        processes = getattr(self, "_report_processes", None) or {}
+        return any(process.poll() is None for process in processes.values())
+
+    def _stop_pipeline_jobs(self):
+        """Terminate analysis / postprocess / report jobs started from this window."""
+        for process in list(getattr(self, "_analysis_processes", [])):
+            if process.poll() is not None:
+                continue
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self._analysis_processes = []
+
+        postprocess = self._reap_postprocess_process()
+        if postprocess is not None:
+            postprocess.terminate()
+            try:
+                postprocess.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                postprocess.kill()
+            self._postprocess_process = None
+
+        processes = getattr(self, "_report_processes", None) or {}
+        project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
+        for name, process in list(processes.items()):
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            processes.pop(name, None)
+            if project:
+                mark_report_status(os.path.join(project, name), "incomplete")
+
+    def closeEvent(self, event):
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Close ChronoRoot?",
+            "Closing will stop any ongoing analysis, postprocessing, or "
+            "report generation mid-way.\n\n"
+            "Do you want to close the application?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            event.ignore()
+            return
+        if self._pipeline_jobs_running():
+            self._stop_pipeline_jobs()
+        event.accept()
 
     def PostProcess(self):
         # The analysis-period dialog can cancel this. Say the job started only
