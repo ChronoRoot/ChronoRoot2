@@ -32,6 +32,19 @@ from analysis.utils.metadata_schema import (
     video_has_qr,
     video_image_dir,
 )
+from analysis.utils.calibration_registry import (
+    DEFAULT_PIXEL_SIZE,
+    SOURCE_DEFAULT,
+    SOURCE_EXISTING,
+    SOURCE_MANUAL_PROJECT,
+    SOURCE_MISMATCH,
+    SOURCE_QR,
+    SOURCE_REGISTRY,
+    get_calibration,
+    normalize_image_path,
+    plate_key_from_meta,
+    upsert_calibration,
+)
 import json
 import os
 import pathlib
@@ -58,35 +71,14 @@ def _load_latest_metadata(plant_path):
         return result_dir, None
 
 
-def plate_key_from_meta(meta, plant_path):
-    """
-    Identity of the physical plate/video, independent of genotype folder.
-
-    Same ImagePath + rpi + cam share calibration even across Experiments.
-    """
-    image_path = video_image_dir(meta)
-    if meta and image_path:
-        rpi = str(meta.get("rpi", ""))
-        cam = str(meta.get("cam", ""))
-        if not cam:
-            # Fallback: cam_* folder name under plant slot
-            cam = os.path.basename(os.path.dirname(plant_path))
-        if not rpi:
-            rpi = os.path.basename(os.path.dirname(os.path.dirname(plant_path)))
-        return (os.path.abspath(os.path.expanduser(str(image_path))), rpi, cam)
-    # No ImagePath: isolate by camera folder on disk
-    cam_dir = os.path.dirname(plant_path)
-    return (os.path.abspath(cam_dir),)
-
-
 def resolve_plate_pixel_size(conf, plants):
     """
     Resolve pixel_size once for a shared video/plate group.
 
-    Prefer an existing pixel_size from any plant in the group; otherwise
-    manual calibration or QR from the first plant with usable metadata.
+    Returns (pixel_size, source, detail).
     """
     sample_meta = None
+    sizes = []
     for plant in plants:
         _result_dir, meta = _load_latest_metadata(plant)
         if meta is None:
@@ -94,29 +86,63 @@ def resolve_plate_pixel_size(conf, plants):
         if sample_meta is None:
             sample_meta = meta
         if "pixel_size" in meta:
-            return float(meta["pixel_size"])
+            try:
+                sizes.append(float(meta["pixel_size"]))
+            except (TypeError, ValueError):
+                pass
+
+    project_dir = (conf.get("MainFolder") or "").strip()
+    image_path = normalize_image_path(video_image_dir(sample_meta)) if sample_meta else ""
+    registry_entry = get_calibration(project_dir, image_path) if project_dir and image_path else None
+
+    unique = {round(v, 8) for v in sizes}
+    if len(unique) == 1:
+        return sizes[0], SOURCE_EXISTING, "from plant metadata"
+    if len(unique) > 1:
+        detail = f"plants disagree on pixel_size: {sorted(unique)}"
+        if registry_entry and "pixel_size" in registry_entry:
+            return (
+                float(registry_entry["pixel_size"]),
+                SOURCE_MISMATCH,
+                detail + "; using registry",
+            )
+        return sizes[0], SOURCE_MISMATCH, detail + "; using first plant value"
+
+    if registry_entry and "pixel_size" in registry_entry:
+        return float(registry_entry["pixel_size"]), SOURCE_REGISTRY, "from calibrations.json"
 
     if sample_meta is None:
-        return 0.04
+        return DEFAULT_PIXEL_SIZE, SOURCE_DEFAULT, "no plant metadata"
 
     if not video_has_qr(conf):
-        return float(conf["knownDistance"]) / float(conf["pixelDistance"])
+        try:
+            pixel_size = float(conf["knownDistance"]) / float(conf["pixelDistance"])
+            return pixel_size, SOURCE_MANUAL_PROJECT, "project known/pixel fields"
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return DEFAULT_PIXEL_SIZE, SOURCE_DEFAULT, "invalid project manual scale"
 
-    image_path = video_image_dir(sample_meta)
     if not image_path:
-        return 0.04
+        return DEFAULT_PIXEL_SIZE, SOURCE_DEFAULT, "no ImagePath for QR scan"
 
     images = load_path(image_path, "*.png")
-    pixel_size = 0.04
     for image in images[:20]:
         qr = qr_detect(image)
         if qr is not None:
             pixel_size = 10 / get_pixel_size(qr[0])
-            break
-    return pixel_size
+            if project_dir:
+                upsert_calibration(
+                    project_dir, image_path, pixel_size=pixel_size, source=SOURCE_QR,
+                )
+            return pixel_size, SOURCE_QR, "QR detected"
+
+    return (
+        DEFAULT_PIXEL_SIZE,
+        SOURCE_DEFAULT,
+        f"QR not detected in first {min(20, len(images))} frames of {image_path}",
+    )
 
 
-def process_one_plant(plant_path, pixel_size, conf, plot_label):
+def process_one_plant(plant_path, pixel_size, conf, plot_label, calibration_source=""):
     """
     Post-process a single plant slot. Top-level for ProcessPoolExecutor.
 
@@ -134,6 +160,8 @@ def process_one_plant(plant_path, pixel_size, conf, plot_label):
         meta_file = os.path.join(target_res, "metadata.json")
         plant_metadata = apply_load_aliases(load_json(meta_file))
         plant_metadata["pixel_size"] = pixel_size
+        if calibration_source:
+            plant_metadata["calibration_source"] = calibration_source
         dump_json(meta_file, plant_metadata)
 
         n_limit = processing_limit_frame_count(conf)
@@ -228,16 +256,20 @@ if __name__ == "__main__":
     plate_groups = collect_plate_groups(analysis)
     jobs = []
     plate_total = {}
+    scale_issues = []
     for plate_key in sorted(plate_groups.keys(), key=lambda k: str(k)):
         jobs_meta = plate_groups[plate_key]
         if not jobs_meta:
             continue
         plant_paths = [plant_path for plant_path, _label, _exp in jobs_meta]
-        pixel_size = resolve_plate_pixel_size(conf, plant_paths)
+        pixel_size, source, detail = resolve_plate_pixel_size(conf, plant_paths)
         plate_label = _format_plate_log(plate_key)
         plate_total[plate_key] = (plate_label, len(jobs_meta))
+        print(f"  Scale {plate_label}: pixel_size={pixel_size:.6g} source={source} ({detail})")
+        if source in (SOURCE_DEFAULT, SOURCE_MISMATCH):
+            scale_issues.append((plate_label, source, detail, pixel_size))
         for plant_path, plot_label, _exp in jobs_meta:
-            jobs.append((plant_path, pixel_size, conf, plot_label, plate_key))
+            jobs.append((plant_path, pixel_size, conf, plot_label, plate_key, source))
 
     if jobs:
         workers = min(MAX_PLANT_WORKERS, len(jobs))
@@ -245,8 +277,10 @@ if __name__ == "__main__":
         ok_for = {key: 0 for key in plate_total}
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(process_one_plant, plant_path, pixel_size, conf, plot_label): plate_key
-                for plant_path, pixel_size, conf, plot_label, plate_key in jobs
+                executor.submit(
+                    process_one_plant, plant_path, pixel_size, conf, plot_label, source,
+                ): plate_key
+                for plant_path, pixel_size, conf, plot_label, plate_key, source in jobs
             }
             for fut in as_completed(futures):
                 plate_key = futures[fut]
@@ -259,5 +293,14 @@ if __name__ == "__main__":
                 plate_label, total = plate_total[plate_key]
                 if done_for[plate_key] == total:
                     print(f"  {plate_label}: {ok_for[plate_key]}/{total} done")
+
+    if scale_issues:
+        print("Plate scale warnings:")
+        for plate_label, source, detail, pixel_size in scale_issues:
+            print(f"  [{source}] {plate_label}: {detail} (using pixel_size={pixel_size:.6g})")
+        print(
+            "Open Review plate calibrations in ChronoRootApp to set scale for "
+            "affected plates, then re-run Process all plants if needed."
+        )
 
     print("Post processing finished.")

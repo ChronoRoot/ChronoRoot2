@@ -284,12 +284,24 @@ def _close_frame_thread(window):
 
 # --- MAIN WINDOW CLASS ---
 class ChronoViewWindow(QMainWindow):
-    def __init__(self, images, segFiles, bbox, conf, parent=None, clock_names=None, first_frame=None):
+    def __init__(
+        self,
+        images,
+        segFiles,
+        bbox,
+        conf,
+        parent=None,
+        clock_names=None,
+        first_frame=None,
+        previous_rois=None,
+    ):
         super().__init__(parent)
         self.images = images
         self.segFiles = segFiles
         self.bbox = bbox
         self.conf = conf
+        self.previous_rois = list(previous_rois or [])
+        self.show_analyzed = False
 
         n_seg = len(segFiles) if segFiles is not None else 0
         self.n = min(len(images), n_seg) if n_seg else len(images)
@@ -345,7 +357,18 @@ class ChronoViewWindow(QMainWindow):
         self.btn_seg = QPushButton("Toggle Segmentation")
         self.btn_seg.clicked.connect(self.toggle_seg)
 
-        for b in [self.btn_play, self.btn_seg]:
+        buttons = [self.btn_play, self.btn_seg]
+        # Full-frame preview only: cropped plant review uses plant-local coords.
+        if previous_rois is not None and not bbox:
+            self.btn_analyzed = QPushButton("Toggle analyzed plants")
+            self.btn_analyzed.setToolTip(
+                "Show or hide bounding boxes and plant IDs for plants already "
+                "analyzed on this video (same overlay as Analyze Plant)."
+            )
+            self.btn_analyzed.clicked.connect(self.toggle_analyzed_plants)
+            buttons.append(self.btn_analyzed)
+
+        for b in buttons:
             h_layout.addWidget(b)
 
         layout.addLayout(h_layout)
@@ -361,6 +384,10 @@ class ChronoViewWindow(QMainWindow):
 
     def _show_prepared_frame(self, img):
         """Show a frame that was already decoded and cropped off the GUI thread."""
+        if self.show_analyzed and self.previous_rois:
+            img = img.copy()
+            for label, x1, y1, x2, y2 in self.previous_rois:
+                draw_labeled_roi(img, x1, y1, x2, y2, label, color=(255, 0, 0))
         self.pixmap_item.setPixmap(self.cv2_to_qpixmap(img))
         self.lbl_frame.setText(
             f"Frame {self.idx + 1}/{self.n}  |  Day {self.days[self.idx]}  Time {self.hours[self.idx]:02d}:{self.minutes[self.idx]:02d}"
@@ -390,6 +417,8 @@ class ChronoViewWindow(QMainWindow):
         idx = self.idx
         bbox = self.bbox
         use_seg = self.use_seg
+        show_analyzed = self.show_analyzed
+        previous_rois = self.previous_rois
         seg_files = self.segFiles
         path = self.images[src]
         self.lbl_frame.setText("Loading frame…")
@@ -401,6 +430,9 @@ class ChronoViewWindow(QMainWindow):
             img = cv2.imread(path)
             if img is None:
                 return None
+            if show_analyzed and previous_rois and not bbox:
+                for label, x1, y1, x2, y2 in previous_rois:
+                    draw_labeled_roi(img, x1, y1, x2, y2, label, color=(255, 0, 0))
             if bbox and len(bbox) == 4:
                 y1, y2, x1, x2 = bbox
                 h, w = img.shape[:2]
@@ -442,6 +474,10 @@ class ChronoViewWindow(QMainWindow):
 
     def toggle_seg(self):
         self.use_seg = not self.use_seg
+        self.update_display()
+
+    def toggle_analyzed_plants(self):
+        self.show_analyzed = not self.show_analyzed
         self.update_display()
 
     def closeEvent(self, event):

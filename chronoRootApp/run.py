@@ -32,6 +32,12 @@ from analysis.utils.fileUtilities import (
     plant_slot_has_finished_analysis,
     processing_limit_frame_count,
 )
+from analysis.utils.calibration_registry import (
+    SOURCE_MANUAL,
+    compute_pixel_size,
+    manual_scale_warning,
+    upsert_calibration,
+)
 from analysis.utils.metadata_schema import (
     apply_load_aliases,
     dump_json,
@@ -1297,6 +1303,22 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
+        # Manual mode only: warn if this video has no matching saved plate scale.
+        if not has_qr:
+            scale_warn = manual_scale_warning(
+                project_text, video_folder, known_text, pixel_text,
+            )
+            if scale_warn:
+                reply = QtWidgets.QMessageBox.question(
+                    None,
+                    'Plate scale warning',
+                    scale_warn + '\n\nContinue launching this analysis anyway?',
+                    QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Yes,
+                    QtWidgets.QMessageBox.Cancel,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    return
+
         import plant_viewer
         try:
             bbox, seed = select_roi_and_seed(
@@ -1320,6 +1342,19 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             saved['seed'] = seed
             pending_path = pending_analysis_path(project_text)
             dump_json(pending_path, saved)
+            if not has_qr:
+                try:
+                    pixel_size = compute_pixel_size(known_text, pixel_text)
+                    upsert_calibration(
+                        project_text,
+                        video_folder,
+                        pixel_size=pixel_size,
+                        source=SOURCE_MANUAL,
+                        known_distance=known_text,
+                        pixel_distance=pixel_text,
+                    )
+                except (TypeError, ValueError):
+                    pass
             return pending_path
 
         try:
@@ -1674,11 +1709,19 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             except Exception as exc:
                 return ('bad_config', exc)
             import cv2
+            from analysis.utils.roi_selection import collect_previous_rois_and_warnings
+            conf['MainFolder'] = project_text
             images, seg_files = getImages(conf)
             if not images:
                 return ('no_images', None)
             first = cv2.imread(images[0])
-            return ('ok', (images, seg_files, conf, first))
+            try:
+                previous_rois, _warnings = collect_previous_rois_and_warnings(
+                    conf, skip_current=False,
+                )
+            except Exception:
+                previous_rois = []
+            return ('ok', (images, seg_files, conf, first, previous_rois))
 
         try:
             status, payload = run_off_main_thread(self, "Loading preview…", load)
@@ -1696,10 +1739,11 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             return
 
         import plant_viewer
-        images, seg_files, conf, first = payload
+        images, seg_files, conf, first, previous_rois = payload
         try:
             self.preview_window = plant_viewer.ChronoViewWindow(
                 images, seg_files, None, conf, parent=None, first_frame=first,
+                previous_rois=previous_rois,
             )
             self.preview_window.show()
         except Exception as e:
@@ -1761,7 +1805,9 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self,
             "Postprocessing started",
             "Postprocessing started.\n\n"
-            "It is running in the terminal. You do not need to press the button again.",
+            "It is running in the terminal. You do not need to press the button again.\n\n"
+            "If QR scale fails for a plate, check the terminal and open "
+            "Review plate calibrations.",
         )
 
     def _report_factor_choices(self):
@@ -2165,14 +2211,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.actionButtonsSeparator.lower()
 
         self.saveButton = QtWidgets.QPushButton(self.tab1)
-        self.saveButton.setGeometry(QtCore.QRect(660, 0, 141, 81))
         self.saveButton.setObjectName("saveButton")
         self.saveButton.setText("Save")
         self.saveButton.setToolTip("Save the current parameters to the project configuration.")
         self.saveButton.clicked.connect(self.saveFieldsIntoJson)
 
         self.previewAnalysisButton = QtWidgets.QPushButton(self.tab1)
-        self.previewAnalysisButton.setGeometry(QtCore.QRect(660, 100, 141, 81))
         self.previewAnalysisButton.setObjectName("previewAnalysisButton")
         self.previewAnalysisButton.setText("Preview video")
         self.previewAnalysisButton.setToolTip(
@@ -2181,7 +2225,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.previewAnalysisButton.clicked.connect(self.preview)
 
         self.analysisButton = QtWidgets.QPushButton(self.tab1)
-        self.analysisButton.setGeometry(QtCore.QRect(660, 200, 141, 81))
         self.analysisButton.setObjectName("analysisButton")
         self.analysisButton.setText("Analyze Plant")
         self.analysisButton.setToolTip(
@@ -2191,8 +2234,16 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "3. Process the growth tracking graph.")
         self.analysisButton.clicked.connect(self.analysis)
 
+        self.platesScaleBtn = QtWidgets.QPushButton(self.tab1)
+        self.platesScaleBtn.setObjectName("platesScaleBtn")
+        self.platesScaleBtn.setText("Review plate\ncalibrations")
+        self.platesScaleBtn.setToolTip(
+            "Review plate scale (pixel size) per video. "
+            "Fix missing QR detections or mismatched plant scales."
+        )
+        self.platesScaleBtn.clicked.connect(self.open_plates_scale_dialog)
+
         self.tab1TimePeriodButton = QtWidgets.QPushButton(self.tab1)
-        self.tab1TimePeriodButton.setGeometry(QtCore.QRect(660, 300, 141, 81))
         self.tab1TimePeriodButton.setObjectName("tab1TimePeriodButton")
         self.tab1TimePeriodButton.setText("Set analysis\nperiod")
         self.tab1TimePeriodButton.setToolTip(
@@ -2202,7 +2253,6 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.tab1TimePeriodButton.clicked.connect(self.open_time_window_dialog)
 
         self.PostProcessButton = QtWidgets.QPushButton(self.tab1)
-        self.PostProcessButton.setGeometry(QtCore.QRect(660, 400, 141, 81))
         self.PostProcessButton.setObjectName("PostProcessButton")
         self.PostProcessButton.setText("Process\nall plants")
         self.PostProcessButton.setToolTip(
@@ -2210,18 +2260,18 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.PostProcessButton.clicked.connect(self.PostProcess)
 
         self.loadConfigFileButton = QtWidgets.QPushButton(self.tab1)
-        self.loadConfigFileButton.setGeometry(QtCore.QRect(660, 500, 141, 40))
         self.loadConfigFileButton.setObjectName("loadConfigFileButton")
         self.loadConfigFileButton.setText("Load from file")
         self.loadConfigFileButton.setToolTip("Import settings from an existing configuration file.")
         self.loadConfigFileButton.clicked.connect(self.read_config_from_file)
 
         self.loadLastConfigButton = QtWidgets.QPushButton(self.tab1)
-        self.loadLastConfigButton.setGeometry(QtCore.QRect(660, 540, 141, 41))
         self.loadLastConfigButton.setObjectName("loadLastConfigButton")
         self.loadLastConfigButton.setText("Load previous conf")
         self.loadLastConfigButton.setToolTip("Restore the most recently used settings.")
         self.loadLastConfigButton.clicked.connect(self.loadJsonIntoFields)
+
+        self._layout_tab1_action_buttons()
 
         self.videoHasQRbutton.stateChanged.connect(self.toggle_calibration_mode)
         self.toggle_calibration_mode()
@@ -2233,13 +2283,38 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.saveImagesButton, self.videoHasQRbutton, self.manual_calib_widget,
             self.processingLimitField, self.captureIntervalField, self.analysisEmergenceDistanceField,
             self.saveButton, self.previewAnalysisButton, self.analysisButton,
-            self.tab1TimePeriodButton, self.PostProcessButton,
+            self.platesScaleBtn, self.tab1TimePeriodButton, self.PostProcessButton,
             self.loadConfigFileButton, self.loadLastConfigButton,
         ]
         for widget in tab1_interactive:
             widget.raise_()
 
         return
+
+    def _layout_tab1_action_buttons(self):
+        """Equal-height right-column buttons with equal gaps; top and bottom flush."""
+        buttons = [
+            self.saveButton,
+            self.previewAnalysisButton,
+            self.analysisButton,
+            self.platesScaleBtn,
+            self.tab1TimePeriodButton,
+            self.PostProcessButton,
+            self.loadConfigFileButton,
+            self.loadLastConfigButton,
+        ]
+        x, width = 660, 141
+        top, bottom = 0, 581
+        gap = 8
+        n = len(buttons)
+        usable = bottom - top - gap * (n - 1)
+        base = usable // n
+        extra = usable % n
+        y = top
+        for i, button in enumerate(buttons):
+            h = base + (1 if i < extra else 0)
+            button.setGeometry(QtCore.QRect(x, y, width, h))
+            y += h + gap
     
     def toggle_calibration_mode(self):
         """Toggle between QR and manual calibration modes"""
@@ -2257,12 +2332,46 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             self.calibration_window = calibration_helper.CalibrationHelper(
                 self.videoField.text(), dialog_parent=self,
             )
-            self.calibration_window.distance_measured.connect(
-                lambda pixels: self.pixelDistanceField.setText(str(pixels))
-            )
+            self.calibration_window.distance_measured.connect(self._on_manual_scale_measured)
             self.calibration_window.show()
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "Error", f"Failed to launch calibration helper:\n{e}")
+
+    def _on_manual_scale_measured(self, pixels):
+        self.pixelDistanceField.setText(str(pixels))
+        project = (self.projectField.text() or "").strip()
+        video = (self.videoField.text() or "").strip()
+        known = (self.knownDistanceField.text() or "").strip()
+        if not project or not video or not known:
+            return
+        try:
+            pixel_size = compute_pixel_size(known, pixels)
+            upsert_calibration(
+                project,
+                video,
+                pixel_size=pixel_size,
+                source=SOURCE_MANUAL,
+                known_distance=known,
+                pixel_distance=pixels,
+            )
+        except (TypeError, ValueError):
+            pass
+
+    def open_plates_scale_dialog(self):
+        project = (self.projectField.text() or "").strip()
+        if not project or not os.path.isdir(project):
+            QtWidgets.QMessageBox.warning(
+                None, "Review plate calibrations", "Open a valid project folder first.",
+            )
+            return
+        from gui.plates_calibration_dialog import PlatesCalibrationDialog
+        known = (self.knownDistanceField.text() or "").strip() or "10"
+        # Same popup pattern as open_calibration_helper / preview: keep a
+        # reference and show() a non-modal QMainWindow.
+        self._plates_calib_dialog = PlatesCalibrationDialog(
+            project, parent=self, known_distance_default=known,
+        )
+        self._plates_calib_dialog.show()
 
     def _factor_blank(self, value):
         text = str(value or "").strip().lower()

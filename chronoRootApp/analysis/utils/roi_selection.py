@@ -194,8 +194,12 @@ def _inject_pending_plant(cam_plants, video_slots, conf):
     video_slots[current_video].append((experiment, rpi, cam, plant_folder))
 
 
-def collect_previous_rois_and_warnings(conf, include_pending=False):
-    """Scan Analysis tree for prior ROIs on the same video and path warnings."""
+def collect_previous_rois_and_warnings(conf, include_pending=False, skip_current=True):
+    """Scan Analysis tree for prior ROIs on the same video and path warnings.
+
+    skip_current: when True (analysis launch), omit the plant slot about to be
+    drawn. Preview passes False so every analyzed plant on the video is shown.
+    """
     analysis_root = os.path.join(conf['MainFolder'], 'Analysis')
     current_slot = os.path.abspath(plant_slot_path(conf))
     current_video = os.path.abspath(video_image_dir(conf) or conf['Images'])
@@ -227,7 +231,7 @@ def collect_previous_rois_and_warnings(conf, include_pending=False):
                 cam_plants[cam_path].append((plant_folder, video_abs))
                 video_slots[video_abs].append((experiment, rpi, cam, plant_folder))
 
-            if os.path.abspath(slot_str) == current_slot:
+            if skip_current and os.path.abspath(slot_str) == current_slot:
                 continue
             if not result_dir or get_bounding_box(meta) is None:
                 continue

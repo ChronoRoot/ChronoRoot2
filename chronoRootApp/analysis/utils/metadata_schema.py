@@ -319,6 +319,8 @@ def build_plant_record(conf, source=SOURCE_SINGLE_PLANT):
         record["ImagePath"] = image_path
     if conf.get("pixel_size") is not None:
         record["pixel_size"] = conf["pixel_size"]
+    if conf.get("calibration_source") is not None:
+        record["calibration_source"] = conf["calibration_source"]
     if source == SOURCE_SINGLE_PLANT:
         for key in SINGLE_PLANT_SNAPSHOT_KEYS:
             if key in conf:
