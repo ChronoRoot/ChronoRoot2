@@ -39,7 +39,8 @@ if ! RAW_OUTPUT=$(hf models ls --author "ngaggion" 2>&1); then
     exit 1
 fi
 
-REPOS=($(echo "$RAW_OUTPUT" | grep -o "ngaggion/ChronoRoot2-[^\",]*"))
+# Match repo IDs only (hf models ls prints a table; avoid trailing columns)
+REPOS=($(echo "$RAW_OUTPUT" | grep -oE 'ngaggion/ChronoRoot2-[A-Za-z0-9_-]+' | sort -u))
 
 if [ ${#REPOS[@]} -eq 0 ]; then
     echo -e "${YELLOW}[!]${NC} No models found matching 'ngaggion/ChronoRoot2-'."
