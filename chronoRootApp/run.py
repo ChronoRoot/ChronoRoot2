@@ -30,6 +30,7 @@ from analysis.utils.fileUtilities import (
     load_result_metadata,
     normalize_factor_value,
     plant_slot_has_finished_analysis,
+    plant_slot_path,
     processing_limit_frame_count,
 )
 from analysis.utils.calibration_registry import (
@@ -50,6 +51,7 @@ from gui.config_store import ConfigStore, PROJECT_CONFIG_NAME
 from gui import pipeline_runner
 from gui.stats_config_dialog import StatsConfigDialog
 from gui.remap_identifiers_dialog import RemapIdentifiersDialog
+from gui.edit_plant_labels_dialog import EditPlantLabelsDialog
 from gui.time_window_dialog import TimeWindowDialog
 from gui.snapshot_hours_dialog import SnapshotHoursDialog
 from gui.report_subset_dialog import ReportSubsetDialog
@@ -63,6 +65,11 @@ from analysis.utils.remap_identifiers import (
     RemapError,
     apply_experiment_remap,
     collect_experiment_counts,
+)
+from analysis.utils.edit_plant_labels import (
+    EditPlantLabelsError,
+    apply_plant_label_edit,
+    current_plant_labels,
 )
 from analysis.utils.plant_inventory import read_log_summary, scan_analysis_plants
 from analysis.utils.report_subset import list_reports, mark_report_status, running_status, write_subset_file
@@ -733,7 +740,23 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
     def _remove_plant_slot(self, plant_slot):
         project = self.projectField.text().strip()
-        self._drop_relaunch_watch(plant_slot)
+        plant_slot = os.path.abspath(plant_slot)
+        if self._analysis_running_for_slot(plant_slot):
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Cancel analysis and remove?",
+                "This plant is still being analyzed.\n\n"
+                "Removing it will cancel the ongoing analysis mid-way "
+                "and move the plant to Removed.\n\n"
+                "Continue?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+            self._cancel_analysis_for_slot(plant_slot)
+        else:
+            self._drop_relaunch_watch(plant_slot)
         self._clear_overlay_cache_for_path(plant_slot)
         try:
             # A directory rename on this disk is immediate. Doing it here avoids
@@ -1337,9 +1360,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
         try:
             pending_path = run_off_main_thread(self, None, write_pending)
+            slot = plant_slot_path(conf)
             self._track_analysis_process(
                 pipeline_runner.run_pending_analysis(pending_path),
+                plant_slot=slot,
             )
+            self._follow_relaunch(slot, baseline=get_latest_result_dir(slot) or "")
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, 'Error', f'Failed to launch analysis:\n{e}')
 
@@ -1449,6 +1475,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         self._track_analysis_process(
             pipeline_runner.run_pending_analysis(pending_path),
+            plant_slot=relaunch_slot,
         )
         self._follow_relaunch(self.selected_plant, baseline=relaunch_baseline)
 
@@ -1633,6 +1660,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         relaunch_baseline = get_latest_result_dir(relaunch_slot) if relaunch_slot else ""
         self._track_analysis_process(
             pipeline_runner.run_analysis_rerun(metadata_path),
+            plant_slot=relaunch_slot,
         )
         self._follow_relaunch(path, baseline=relaunch_baseline)
 
@@ -1787,22 +1815,80 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self._postprocess_process = None
         return None
 
-    def _track_analysis_process(self, process):
+    def _normalize_analysis_job(self, job):
+        if isinstance(job, dict):
+            process = job.get("process")
+            slot = job.get("plant_slot")
+        else:
+            process = job
+            slot = None
+        if process is None:
+            return None
+        return {
+            "process": process,
+            "plant_slot": os.path.abspath(slot) if slot else None,
+        }
+
+    def _alive_analysis_jobs(self):
+        alive = []
+        for job in getattr(self, "_analysis_processes", []):
+            normalized = self._normalize_analysis_job(job)
+            if normalized is None or normalized["process"].poll() is not None:
+                continue
+            alive.append(normalized)
+        self._analysis_processes = alive
+        return alive
+
+    def _track_analysis_process(self, process, plant_slot=None):
         if process is None:
             return
-        alive = [
-            item for item in getattr(self, "_analysis_processes", [])
-            if item.poll() is None
-        ]
-        alive.append(process)
+        alive = self._alive_analysis_jobs()
+        alive.append({
+            "process": process,
+            "plant_slot": os.path.abspath(plant_slot) if plant_slot else None,
+        })
         self._analysis_processes = alive
+
+    def _analysis_running_for_slot(self, plant_slot):
+        if not plant_slot:
+            return False
+        plant_slot = os.path.abspath(plant_slot)
+        watches = getattr(self, "_relaunch_watches", None) or {}
+        if plant_slot in watches:
+            return True
+        for job in self._alive_analysis_jobs():
+            slot = job.get("plant_slot")
+            if slot and slot == plant_slot:
+                return True
+        return False
+
+    def _terminate_process(self, process):
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    def _cancel_analysis_for_slot(self, plant_slot):
+        """Stop the analysis subprocess for one plant and drop its relaunch watch."""
+        if not plant_slot:
+            return
+        plant_slot = os.path.abspath(plant_slot)
+        self._drop_relaunch_watch(plant_slot)
+        remaining = []
+        for job in self._alive_analysis_jobs():
+            slot = job.get("plant_slot")
+            if slot and slot == plant_slot:
+                self._terminate_process(job["process"])
+            else:
+                remaining.append(job)
+        self._analysis_processes = remaining
 
     def _pipeline_jobs_running(self):
         """True when analysis, postprocess, or report subprocesses are still live."""
-        if any(
-            process.poll() is None
-            for process in getattr(self, "_analysis_processes", [])
-        ):
+        if self._alive_analysis_jobs():
             return True
         if self._reap_postprocess_process() is not None:
             return True
@@ -1812,34 +1898,22 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
 
     def _stop_pipeline_jobs(self):
         """Terminate analysis / postprocess / report jobs started from this window."""
-        for process in list(getattr(self, "_analysis_processes", [])):
-            if process.poll() is not None:
-                continue
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
+        for job in list(self._alive_analysis_jobs()):
+            self._terminate_process(job["process"])
         self._analysis_processes = []
+        watches = getattr(self, "_relaunch_watches", None)
+        if watches is not None:
+            watches.clear()
 
         postprocess = self._reap_postprocess_process()
         if postprocess is not None:
-            postprocess.terminate()
-            try:
-                postprocess.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                postprocess.kill()
+            self._terminate_process(postprocess)
             self._postprocess_process = None
 
         processes = getattr(self, "_report_processes", None) or {}
         project = self.projectField.text().strip() if hasattr(self, "projectField") else ""
         for name, process in list(processes.items()):
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            self._terminate_process(process)
             processes.pop(name, None)
             if project:
                 mark_report_status(os.path.join(project, name), "incomplete")
@@ -2717,16 +2791,124 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         if item is None:
             return
 
+        path = getattr(item, "path", None)
+        plant_slot = getattr(item, "plant_slot", None) or (
+            self._slot_of_plant_path(path) if path else ""
+        )
+
         menu = QtWidgets.QMenu(self)
-        action = menu.addAction("See in Plant Overlay")
+        overlay_action = menu.addAction("See in Plant Overlay")
+        edit_action = menu.addAction("Edit labels…")
         chosen = menu.exec_(self.table.viewport().mapToGlobal(pos))
-        if chosen != action:
+        if chosen == overlay_action:
+            if path:
+                self.see_plant_in_overlay(path)
+            return
+        if chosen == edit_action:
+            if plant_slot:
+                self.open_edit_plant_labels_dialog(plant_slot)
             return
 
-        path = getattr(item, 'path', None)
-        if not path:
+    def open_edit_plant_labels_dialog(self, plant_slot):
+        plant_slot = os.path.abspath(plant_slot)
+        if self._analysis_running_for_slot(plant_slot):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Analysis running",
+                "This plant is still being analyzed.\n\n"
+                "Wait for it to finish (or remove/cancel it) before editing labels.",
+            )
             return
-        self.see_plant_in_overlay(path)
+
+        try:
+            labels = current_plant_labels(plant_slot)
+        except EditPlantLabelsError as exc:
+            QtWidgets.QMessageBox.warning(self, "Edit labels", str(exc))
+            return
+
+        dialog = EditPlantLabelsDialog(self)
+        dialog.populate(labels)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        new_values = dialog.values()
+        old_experiment = labels["experiment"]
+        old_plate = str(labels.get("plate_condition") or "").strip()
+        old_extra = str(labels.get("extra_variable") or "").strip()
+        new_experiment = new_values["experiment"]
+        new_plate = new_values["plate_condition"]
+        new_extra = new_values["extra_variable"]
+
+        if (
+            new_experiment == old_experiment
+            and new_plate == old_plate
+            and new_extra == old_extra
+        ):
+            return
+
+        def line(title, old, new):
+            if old == new:
+                return None
+            return f"  {title}: {old or '(empty)'}  →  {new or '(empty)'}"
+
+        lines = [
+            line("Genotype", old_experiment, new_experiment),
+            line("Plate condition", old_plate, new_plate),
+            line("Extra variable", old_extra, new_extra),
+        ]
+        lines = [item for item in lines if item]
+        move_note = ""
+        if new_experiment != old_experiment:
+            move_note = (
+                "\n\nGenotype change will move this plant under "
+                f"Analysis/{new_experiment}/…"
+            )
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm label edit",
+            "Apply these label changes?\n\n"
+            + "\n".join(lines)
+            + move_note
+            + "\n\nAfterwards re-run Process all plants and Generate report.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if confirm != QtWidgets.QMessageBox.Yes:
+            return
+
+        self._clear_overlay_cache_for_path(plant_slot)
+        self._clear_overlay_cache_for_path(labels.get("result_dir") or "")
+        try:
+            new_slot = run_off_main_thread(
+                self,
+                "Updating plant labels…",
+                lambda: apply_plant_label_edit(
+                    plant_slot,
+                    experiment=new_experiment,
+                    plate_condition=new_plate,
+                    extra_variable=new_extra,
+                ),
+            )
+        except EditPlantLabelsError as exc:
+            QtWidgets.QMessageBox.critical(self, "Edit labels failed", str(exc))
+            self.refresh_table()
+            return
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Edit labels failed", f"Unexpected error:\n{exc}",
+            )
+            self.refresh_table()
+            return
+
+        self._clear_overlay_cache_for_path(new_slot)
+        self.refresh_table()
+        QtWidgets.QMessageBox.information(
+            self,
+            "Labels updated",
+            "Plant labels were updated.\n\n"
+            "Re-run \"Process all plants\" and \"Generate report\" "
+            "so aggregates and figures use the new names.",
+        )
 
     def see_plant_in_overlay(self, path):
         """Select a plant in the Overlay combo and switch to that tab."""
