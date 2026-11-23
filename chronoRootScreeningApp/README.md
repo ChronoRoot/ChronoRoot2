@@ -1,12 +1,12 @@
-# ChronoRoot 2.0 - Screening Interface
+# ChronoRoot 2.1 - Screening Interface
 
-This directory contains the High-throughput Screening Interface for ChronoRoot 2.0, designed for efficient analysis of multiple plants simultaneously.
+This directory contains the High-throughput Screening Interface for ChronoRoot 2.1, designed for efficient analysis of multiple plants simultaneously.
 
 ![Figure](screenshots/MainScreen.png)
 
 ## Overview
 
-The Screening Interface extends ChronoRoot 2.0's capabilities to high-throughput scenarios through automated multi-plant tracking. It enables researchers to efficiently process and compare multiple experimental conditions, with specialized modules for germination analysis, hypocotyl development, and basic plant measurements.
+The Screening Interface extends ChronoRoot 2.1's capabilities to high-throughput scenarios through automated multi-plant tracking. It shares the main app report/statistics backend and enables researchers to efficiently process and compare multiple experimental conditions, with specialized modules for germination analysis, hypocotyl development, and basic plant measurements.
 
 ## Key Features
 

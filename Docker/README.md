@@ -1,12 +1,12 @@
-## ChronoRoot 2.0 Docker
+## ChronoRoot 2.1 Docker
 
-This directory contains the Dockerfile and documentation for the official ChronoRoot 2.0 Docker image. This image provides the recommended way to use all components of the ChronoRoot 2.0 platform in a consistent, isolated environment.
+This directory contains the Dockerfile and documentation for the official ChronoRoot 2.1 Docker image. This image provides the recommended way to use all components of the ChronoRoot 2.1 platform in a consistent, isolated environment.
 
 ---
 
 ## Overview
 
-The Docker image `ngaggion/chronoroot` contains a complete environment for running all ChronoRoot 2.0 components:
+The Docker image `ngaggion/chronoroot` contains a complete environment for running all ChronoRoot 2.1 components:
 
 * **nnUNetv2** for AI-powered segmentation.
 * **Standard Root Phenotyping Interface** for detailed individual plant analysis.
@@ -58,7 +58,7 @@ docker pull ngaggion/chronoroot:latest
 
 ---
 
-## Running ChronoRoot 2.0
+## Running ChronoRoot 2.1
 
 To avoid permission issues where files created by Docker are owned by "root", we launch the container using your current User ID (`-u`). This ensures all results saved to your host machine belong to you.
 
