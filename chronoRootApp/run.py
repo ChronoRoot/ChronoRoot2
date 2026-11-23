@@ -784,10 +784,12 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.numComponentsFPCAField.setText("2")
         self.stats_config_dialog.set_defaults()
         self.timeSyncMode = 'clock'
+        self.timeMergePartialOverlaps = True
         self.timeDurationHours = None
         self.reportFolderName = 'Report'
         self._viewing_report_name = ""
         self._report_processes = {}
+        self._postprocess_process = None
         self.figureClockTicks = ['00:00']
         self.showFigureClockTicks = True
         self.snapshotHours = None
@@ -1769,13 +1771,44 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         )
         return False
 
+    def _reap_postprocess_process(self):
+        process = getattr(self, "_postprocess_process", None)
+        if process is None:
+            return None
+        if process.poll() is None:
+            return process
+        self._postprocess_process = None
+        return None
+
     def PostProcess(self):
         # The analysis-period dialog can cancel this. Say the job started only
         # after that prompt is finished and the process is actually launched.
+        running = self._reap_postprocess_process()
+        if running is not None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Postprocessing already running",
+                "Postprocessing is already running for this project.\n\n"
+                "Wait for it to finish before starting it again.",
+            )
+            return
         if not self._ensure_analysis_period():
             return
+        # Re-check after the period dialog: a double-click / second press during
+        # the modal flow must not start a second job.
+        running = self._reap_postprocess_process()
+        if running is not None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Postprocessing already running",
+                "Postprocessing is already running for this project.\n\n"
+                "Wait for it to finish before starting it again.",
+            )
+            return
         self.saveFieldsIntoJson()
-        pipeline_runner.run_postprocess(self.projectField.text())
+        self._postprocess_process = pipeline_runner.run_postprocess(
+            self.projectField.text(),
+        )
         QtWidgets.QMessageBox.information(
             self,
             "Postprocessing started",
@@ -1820,6 +1853,22 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "extras": text(getattr(self, "reportExtraVariableAxisLabelField", None), "Extra variable"),
         }
 
+    def _report_params_hint_path(self, project):
+        return os.path.join(project, ".report_params_hint_shown")
+
+    def _report_params_hint_already_shown(self, project):
+        return bool(project) and os.path.isfile(self._report_params_hint_path(project))
+
+    def _mark_report_params_hint_shown(self, project):
+        if not project:
+            return
+        path = self._report_params_hint_path(project)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("1\n")
+        except OSError:
+            pass
+
     def report(self):
         project = self.projectField.text().strip()
         choices = run_off_main_thread(
@@ -1827,6 +1876,34 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
             "Checking plants…",
             self._report_factor_choices,
         )
+        plates = choices.get("plates") or []
+        extras = choices.get("extras") or []
+        if (
+            (len(plates) >= 2 or len(extras) >= 2)
+            and not self._report_params_hint_already_shown(project)
+        ):
+            prompt = QtWidgets.QMessageBox(self)
+            prompt.setWindowTitle("Report parameters")
+            prompt.setIcon(QtWidgets.QMessageBox.Information)
+            prompt.setText(
+                "This project has multiple plate conditions and/or extra variables.\n\n"
+                "Review Configure Report Parameters so advanced comparison modes "
+                "match what you want before generating the report."
+            )
+            open_btn = prompt.addButton(
+                "Open parameters", QtWidgets.QMessageBox.ActionRole
+            )
+            prompt.addButton("Continue", QtWidgets.QMessageBox.AcceptRole)
+            cancel_btn = prompt.addButton(
+                "Cancel", QtWidgets.QMessageBox.RejectRole
+            )
+            prompt.exec_()
+            self._mark_report_params_hint_shown(project)
+            clicked = prompt.clickedButton()
+            if clicked == cancel_btn:
+                return
+            if clicked == open_btn:
+                self.open_stats_config_dialog()
         dialog = ReportSubsetDialog(
             choices,
             self._project_reports(),
@@ -2930,7 +3007,7 @@ class Ui_ChronoRootAnalysis(QtWidgets.QMainWindow):
         self.reportPlatesScaleBtn = QtWidgets.QPushButton(self.tab4)
         self.reportPlatesScaleBtn.setGeometry(QtCore.QRect(20, 550, 131, 41))
         self.reportPlatesScaleBtn.setObjectName("reportPlatesScaleBtn")
-        self.reportPlatesScaleBtn.setText("Review plate calibrations")
+        self.reportPlatesScaleBtn.setText("Review plate\ncalibrations")
         self.reportPlatesScaleBtn.setToolTip(
             "Review plate scale per video. Test QR or Set scale on bad plates, "
             "then re-run Process all plants before generating a report."

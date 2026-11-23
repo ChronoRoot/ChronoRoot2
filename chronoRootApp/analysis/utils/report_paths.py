@@ -217,11 +217,37 @@ def temporal_metric_slug(metric_column: str) -> str:
     return mapping.get(metric_column, metric_slug(metric_column))
 
 
+def _purge_mode_files_in_dir(directory, slug, disabled):
+    """Delete ``{slug}_{mode}`` plot/stats files in one directory."""
+    if not os.path.isdir(directory):
+        return
+    for mode in disabled:
+        stem = f'{slug}_{mode}'
+        names = [f'{stem}_stats.txt']
+        for ext in FIGURE_FORMATS:
+            names.append(f'{stem}{ext}')
+            names.append(f'{stem}_count{ext}')
+        for filename in names:
+            path = os.path.join(directory, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+
+
+def _purge_mode_tree(base, slug, disabled):
+    """Purge mode outputs in ``base`` and nested dirs (fpca, replicas, growth_speed)."""
+    if not os.path.isdir(base):
+        return
+    for dirpath, _dirnames, _filenames in os.walk(base):
+        _purge_mode_files_in_dir(dirpath, slug, disabled)
+
+
 def purge_disabled_comparison_outputs(conf, effective_modes):
     """Remove comparison figures and stats for modes not in the effective list.
 
     Only touches directories that already exist so unused modules
     (angles, convex hull, unselected temporal slugs) are not created.
+    Walks nested trees so fpca/pc*, replicas/*, and growth_speed/replicas
+    do not keep stale advanced-mode files after a mode is turned off.
     """
     from ..stats_utils import ALL_COMPARISON_MODES
 
@@ -242,36 +268,102 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
             continue
         for slug in slugs:
             base = os.path.join(module_path, slug)
-            bases = [base]
+            _purge_mode_tree(base, slug, disabled)
             if module == MODULE_TEMPORAL:
                 rel_base = os.path.join(base, RELATIVE_MEASUREMENTS_DIR)
-                if os.path.isdir(rel_base):
-                    bases.append(rel_base)
-            for out_dir in bases:
-                if not os.path.isdir(out_dir):
-                    continue
-                for mode in disabled:
-                    stem = f'{slug}_{mode}'
-                    names = [f'{stem}_stats.txt']
-                    for ext in FIGURE_FORMATS:
-                        names.append(f'{stem}{ext}')
-                        names.append(f'{stem}_count{ext}')
-                    for filename in names:
-                        path = os.path.join(out_dir, filename)
-                        if os.path.isfile(path):
-                            os.remove(path)
+                _purge_mode_tree(rel_base, slug, disabled)
 
-    for parent_slug in FOURIER_PARENT_METRICS.values():
-        growth_dir = os.path.join(root, MODULE_TEMPORAL, parent_slug, 'growth_speed')
-        if not os.path.isdir(growth_dir):
+    # Fourier growth-speed files use the parent temporal slug as the stem; the
+    # walk above already covers growth_speed/ under those parents when present.
+
+
+def _is_atlas_image(filename):
+    lower = filename.lower()
+    return lower.endswith(('.png', '.jpg', '.jpeg'))
+
+
+def _atlas_genotype_prefix(filename):
+    """Return path-safe genotype prefix from an atlas filename, or None."""
+    if filename.startswith('combined_atlas'):
+        return None
+    stem = filename
+    for ext in ('.png', '.jpg', '.jpeg', '.svg', '.pdf'):
+        if stem.lower().endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    for marker in ('_day_', '_Last_Day', '_t_'):
+        if marker in stem:
+            return stem.split(marker, 1)[0]
+    return None
+
+
+def _purge_stale_atlases_in_folder(folder, current_slugs):
+    if not os.path.isdir(folder):
+        return
+    current = set(current_slugs or [])
+    for filename in os.listdir(folder):
+        path = os.path.join(folder, filename)
+        if not os.path.isfile(path) or not _is_atlas_image(filename):
             continue
-        for mode in disabled:
-            stem = f'{parent_slug}_{mode}'
-            names = [f'{stem}_stats.txt']
-            for ext in FIGURE_FORMATS:
-                names.append(f'{stem}{ext}')
-                names.append(f'{stem}_count{ext}')
-            for filename in names:
-                path = os.path.join(growth_dir, filename)
-                if os.path.isfile(path):
-                    os.remove(path)
+        if filename.startswith('combined_atlas'):
+            # Combined figures are rebuilt from current atlases each run.
+            os.remove(path)
+            continue
+        prefix = _atlas_genotype_prefix(filename)
+        if prefix is not None and prefix not in current:
+            os.remove(path)
+
+
+def clear_convex_overview_atlases(conf):
+    """Remove qualitative atlas images so the next write is not mixed with orphans."""
+    folder = overview_dir(conf, MODULE_CONVEX)
+    if not os.path.isdir(folder):
+        return
+    for filename in os.listdir(folder):
+        path = os.path.join(folder, filename)
+        if os.path.isfile(path) and _is_atlas_image(filename):
+            os.remove(path)
+    for split_name in ('by_plate', 'by_extra'):
+        split_root = os.path.join(folder, split_name)
+        if os.path.isdir(split_root):
+            shutil.rmtree(split_root, ignore_errors=True)
+
+
+def purge_stale_genotype_outputs(conf, current_genotype_slugs):
+    """Drop individual_plots, overview atlases, and angle overlays for remapped genotypes."""
+    current = set(current_genotype_slugs or [])
+    root = report_root(conf)
+    ip_root = os.path.join(root, INDIVIDUAL_PLOTS_DIR)
+    if os.path.isdir(ip_root):
+        for name in os.listdir(ip_root):
+            path = os.path.join(ip_root, name)
+            if os.path.isdir(path) and name not in current:
+                shutil.rmtree(path, ignore_errors=True)
+
+    overview = os.path.join(root, MODULE_CONVEX, OVERVIEW_SLUG)
+    _purge_stale_atlases_in_folder(overview, current)
+    for split_name in ('by_plate', 'by_extra'):
+        split_root = os.path.join(overview, split_name)
+        if not os.path.isdir(split_root):
+            continue
+        for level in os.listdir(split_root):
+            _purge_stale_atlases_in_folder(os.path.join(split_root, level), current)
+
+    angles_root = os.path.join(root, MODULE_ANGLES)
+    if os.path.isdir(angles_root):
+        for name in os.listdir(angles_root):
+            if not name.startswith('overlays_'):
+                continue
+            slug = name[len('overlays_'):]
+            path = os.path.join(angles_root, name)
+            if os.path.isdir(path) and slug not in current:
+                shutil.rmtree(path, ignore_errors=True)
+        first_lr_root = os.path.join(angles_root, 'first_lr_tip_angle')
+        if os.path.isdir(first_lr_root):
+            for name in os.listdir(first_lr_root):
+                if not name.startswith('overlays_'):
+                    continue
+                slug = name[len('overlays_'):]
+                path = os.path.join(first_lr_root, name)
+                if os.path.isdir(path) and slug not in current:
+                    shutil.rmtree(path, ignore_errors=True)

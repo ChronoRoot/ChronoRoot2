@@ -290,7 +290,16 @@ def plant_date_spans(data):
     return pd.DataFrame(rows)
 
 
-def _union_find_clusters(spans):
+START_COHORT_HOURS = 12
+
+
+def _union_find_clusters(spans, *, merge_partial_overlaps=True, start_window_hours=START_COHORT_HOURS):
+    """Cluster date spans.
+
+    merge_partial_overlaps=True: any calendar overlap joins plants (legacy).
+    False: only plants whose starts are within start_window_hours join, so
+    staggered biological replicates with long partial overlap stay separate.
+    """
     n = len(spans)
     parent = list(range(n))
 
@@ -305,12 +314,20 @@ def _union_find_clusters(spans):
         if ra != rb:
             parent[rb] = ra
 
-    for i in range(n):
-        start_i, end_i = spans[i]
-        for j in range(i + 1, n):
-            start_j, end_j = spans[j]
-            if start_i <= end_j and start_j <= end_i:
-                union(i, j)
+    if merge_partial_overlaps:
+        for i in range(n):
+            start_i, end_i = spans[i]
+            for j in range(i + 1, n):
+                start_j, end_j = spans[j]
+                if start_i <= end_j and start_j <= end_i:
+                    union(i, j)
+    else:
+        window = pd.Timedelta(hours=float(start_window_hours))
+        starts = [span[0] for span in spans]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if abs(starts[i] - starts[j]) <= window:
+                    union(i, j)
 
     clusters = defaultdict(list)
     for i in range(n):
@@ -360,8 +377,13 @@ def _spans_frame(data):
     return plant_date_spans(data)
 
 
-def detect_time_groups(data, mode='clock'):
-    """Cluster plants whose Date ranges overlap (synthetic dates by Video)."""
+def detect_time_groups(data, mode='clock', merge_partial_overlaps=True):
+    """Cluster plants into analysis-period groups.
+
+    merge_partial_overlaps=True merges any overlapping calendar ranges.
+    False keeps separate start cohorts (starts more than ~12h apart).
+    Synthetic dates are still bucketed by Video.
+    """
     spans = _spans_frame(data)
     if spans.empty:
         return []
@@ -380,7 +402,9 @@ def detect_time_groups(data, mode='clock'):
     group_id = 1
     if real_rows:
         intervals = [(r['date_min'], r['date_max']) for r in real_rows]
-        for cluster in _union_find_clusters(intervals):
+        for cluster in _union_find_clusters(
+            intervals, merge_partial_overlaps=bool(merge_partial_overlaps),
+        ):
             members = [real_rows[i] for i in cluster]
             groups.append(_group_dict(group_id, members, mode=mode))
             group_id += 1
@@ -455,7 +479,11 @@ def resolved_time_groups(conf, data=None):
     saved = list((conf or {}).get('timeGroups') or [])
     if saved:
         return saved, mode
-    detected = detect_time_groups(data, mode=mode) if data is not None else []
+    merge = True if conf is None else conf.get('timeMergePartialOverlaps', True)
+    detected = (
+        detect_time_groups(data, mode=mode, merge_partial_overlaps=bool(merge))
+        if data is not None else []
+    )
     return detected, mode
 
 

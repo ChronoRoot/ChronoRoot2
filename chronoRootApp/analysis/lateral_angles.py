@@ -56,7 +56,10 @@ from .time_windows import (
 )
 from .utils.report_paths import (
     MODULE_ANGLES,
+    REPLICAS_DIR,
+    analysis_dir,
     angle_overlays_dir,
+    clear_replicas_subdir,
     data_file,
     first_lr_overlays_dir,
     plot_file,
@@ -68,6 +71,7 @@ from .stats_utils import (
     perform_interval_pairwise_stats,
     ensure_factor_columns,
     comparison_modes_for_run,
+    iter_replica_runs,
     _mode_spec,
     _describe_averaging,
     run_pairwise_comparisons,
@@ -84,6 +88,25 @@ plt.switch_backend('agg')
 pd.options.mode.chained_assignment = None
 
 MAX_ANGLE_FIGURE_WORKERS = 4
+
+
+def plant_has_measured_laterals(results_path):
+    """True when LateralRootsData.csv records at least one measured lateral.
+
+    Used to keep plants without laterals out of the report angles section
+    (stats, plots, and overlays). Postprocess still writes the zero CSV.
+    """
+    path = os.path.join(results_path, 'LateralRootsData.csv')
+    if not os.path.isfile(path):
+        return False
+    try:
+        frame = pd.read_csv(path)
+    except Exception:
+        return False
+    if frame.empty or 'Number of lateral roots' not in frame.columns:
+        return False
+    counts = pd.to_numeric(frame['Number of lateral roots'], errors='coerce')
+    return bool((counts.fillna(0) > 0).any())
 
 
 def traverse_root(root_element, is_lateral_root=False):
@@ -906,6 +929,8 @@ def makeLateralAnglesPlots(conf):
 
             if not os.path.exists(file) or not os.path.exists(file2):
                 continue
+            if not plant_has_measured_laterals(results):
+                continue
 
             meta = load_result_metadata(results)
             data2 = pd.read_csv(file2)
@@ -1070,43 +1095,11 @@ def makeLateralAnglesPlots(conf):
     return
 
 
-def performStatisticalAnalysisAngles(conf, data, metric):
-    data = ensure_factor_columns(data)
-    if 'ElapsedTime (h)' not in data.columns and 'Day' in data.columns:
-        data['ElapsedTime (h)'] = data['Day']
-    data['ElapsedTime (h)'] = data['ElapsedTime (h)'].astype(int).astype(str)
-    hours = [str(h) for h in conf_snapshot_hours(conf, kind='angles')]
-    slug = 'mean_emergence_angle'
-    table_path = table_file(conf, MODULE_ANGLES, slug, 'summary_table.csv')
-    perform_interval_pairwise_stats(
-        conf, data, metric, output_dir=None,
-        interval_col='ElapsedTime (h)',
-        intervals=hours,
-        plant_id_col='Plant_id',
-        interval_label='ElapsedTime (h)',
-        module=MODULE_ANGLES,
-        metric_slug_name=slug,
-        table_file_path=table_path,
-    )
-    emit_interval_comparison_plots(
-        conf, data, metric, metric_dir(conf, MODULE_ANGLES, slug),
-        module=MODULE_ANGLES, metric_slug_name=slug,
-        metric_label='Mean emergence angle',
-        x_col='ElapsedTime (h)',
-    )
-    return
-
-
-def performStatisticalAnalysisFirstLR(conf, data, metric):
-    data = ensure_factor_columns(data)
-    data['Experiment'] = data['Experiment'].astype(str)
-    slug = 'first_lr_tip_angle'
-    dt = int(conf['everyXhourFieldAngles'])
-
+def _write_first_lr_mode_stats(conf, data, metric, slug, dt, *, subpath=()):
     for mode in comparison_modes_for_run(conf, data):
         spec = _mode_spec(mode, conf=conf)
         output_path = _resolve_stats_path(
-            conf, MODULE_ANGLES, slug, mode,
+            conf, MODULE_ANGLES, slug, mode, subpath=subpath,
         )
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
@@ -1127,14 +1120,86 @@ def performStatisticalAnalysisFirstLR(conf, data, metric):
                 )
                 f.write('\n')
 
+
+def performStatisticalAnalysisAngles(conf, data, metric):
+    data = ensure_factor_columns(data)
+    if 'ElapsedTime (h)' not in data.columns and 'Day' in data.columns:
+        data['ElapsedTime (h)'] = data['Day']
+    data['ElapsedTime (h)'] = data['ElapsedTime (h)'].astype(int).astype(str)
+    hours = [str(h) for h in conf_snapshot_hours(conf, kind='angles')]
+    slug = 'mean_emergence_angle'
+    table_path = table_file(conf, MODULE_ANGLES, slug, 'summary_table.csv')
+    base_dir = metric_dir(conf, MODULE_ANGLES, slug)
+    perform_interval_pairwise_stats(
+        conf, data, metric, output_dir=None,
+        interval_col='ElapsedTime (h)',
+        intervals=hours,
+        plant_id_col='Plant_id',
+        interval_label='ElapsedTime (h)',
+        module=MODULE_ANGLES,
+        metric_slug_name=slug,
+        table_file_path=table_path,
+    )
+    emit_interval_comparison_plots(
+        conf, data, metric, base_dir,
+        module=MODULE_ANGLES, metric_slug_name=slug,
+        metric_label='Mean emergence angle',
+        x_col='ElapsedTime (h)',
+    )
+    clear_replicas_subdir(base_dir)
+    for _extra, extra_slug, subset, replica_conf in iter_replica_runs(conf, data):
+        replica_dir = analysis_dir(conf, MODULE_ANGLES, slug, REPLICAS_DIR, extra_slug)
+        replica_subpath = (REPLICAS_DIR, extra_slug)
+        perform_interval_pairwise_stats(
+            replica_conf, subset, metric, output_dir=None,
+            interval_col='ElapsedTime (h)',
+            intervals=hours,
+            plant_id_col='Plant_id',
+            interval_label='ElapsedTime (h)',
+            module=MODULE_ANGLES,
+            metric_slug_name=slug,
+            subpath=replica_subpath,
+        )
+        emit_interval_comparison_plots(
+            replica_conf, subset, metric, replica_dir,
+            module=MODULE_ANGLES, metric_slug_name=slug,
+            metric_label='Mean emergence angle',
+            x_col='ElapsedTime (h)',
+        )
+    return
+
+
+def performStatisticalAnalysisFirstLR(conf, data, metric):
+    data = ensure_factor_columns(data)
+    data['Experiment'] = data['Experiment'].astype(str)
+    slug = 'first_lr_tip_angle'
+    dt = int(conf['everyXhourFieldAngles'])
+    base_dir = metric_dir(conf, MODULE_ANGLES, slug)
+
+    _write_first_lr_mode_stats(conf, data, metric, slug, dt)
     emit_temporal_comparison_plots(
-        conf, data, metric, metric_dir(conf, MODULE_ANGLES, slug),
+        conf, data, metric, base_dir,
         module=MODULE_ANGLES, metric_slug_name=slug,
         metric_label='First LR tip angle',
         x_col='Time',
         xlabel='Time since emergence (h)',
         ylabel='Angle',
     )
+    clear_replicas_subdir(base_dir)
+    for _extra, extra_slug, subset, replica_conf in iter_replica_runs(conf, data):
+        replica_dir = analysis_dir(conf, MODULE_ANGLES, slug, REPLICAS_DIR, extra_slug)
+        replica_subpath = (REPLICAS_DIR, extra_slug)
+        _write_first_lr_mode_stats(
+            replica_conf, subset, metric, slug, dt, subpath=replica_subpath,
+        )
+        emit_temporal_comparison_plots(
+            replica_conf, subset, metric, replica_dir,
+            module=MODULE_ANGLES, metric_slug_name=slug,
+            metric_label='First LR tip angle',
+            x_col='Time',
+            xlabel='Time since emergence (h)',
+            ylabel='Angle',
+        )
     return
 
 
@@ -1155,7 +1220,7 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
         emergence_distance: Emergence distance in mm, same value as the measurement
 
     Returns:
-        ax: Modified matplotlib axes with angle visualizations
+        (ax, drew_any): axes and whether at least one lateral angle was drawn
     """
     plt.ioff()
     plant = resolve_rsml_plant(path, rsml_path=rsml_path, index=i)
@@ -1171,14 +1236,17 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
     lateral_root_starts = []
     lateral_root_names = []
     num_roots = 0
+    drew_any = False
+
+    # Always show the crop so empty plants are never saved as blank axes.
+    ax.imshow(img)
+    ax.axis('off')
 
     lateral_root_elements = direct_lateral_roots(main_root)
     if lateral_root_elements:
-
         points_list = []
         start_points = []
 
-        # First: perform tracking
         for lr_element in lateral_root_elements:
             points = traverse_root(lr_element, is_lateral_root=True)
             points_list.append(points)
@@ -1190,10 +1258,7 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
             num_roots
         )
 
-        # Display image and overlay angle measurements. Short roots stay
-        # tracked, but they are left out of the drawing.
-        ax.imshow(img)
-
+        # Short roots stay tracked, but they are left out of the drawing.
         for root in lateral_roots:
             if lenRoot(root, pixel_size) < min_length_mm:
                 continue
@@ -1205,9 +1270,9 @@ def estimateAngles(path, ax, img, i=-1, tip=False, rsml_path=None, emergence_dis
                 ax, root, angle, tip=tip,
                 distance_cm=emergence_mm, pixel_size=pixel_size,
             )
-        ax.axis('off')
+            drew_any = True
 
-    return ax
+    return ax, drew_any
 
 
 def render_plant_angle_figures(job):
@@ -1231,6 +1296,21 @@ def render_plant_angle_figures(job):
         safe_robot = job['safe_robot']
         safe_cam = job['safe_cam']
         safe_plant = job['safe_plant']
+
+        if not plant_has_measured_laterals(results_path):
+            # Clear any older blank overlays left from before this filter.
+            stem = f"{job['safe_exp']}_{job['safe_robot']}_{job['safe_cam']}_{job['safe_plant']}"
+            for suffix in ('_emergence_angles', '_tip_angles'):
+                for ext in ('.png', '.svg', '.pdf'):
+                    stale = os.path.join(job['save_path'], f"{stem}{suffix}{ext}")
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+            zoom_dir = job.get('first_lr_save_path') or job['save_path']
+            for ext in ('.png', '.svg', '.pdf'):
+                stale = os.path.join(zoom_dir, f"{stem}_first_lr_72h{ext}")
+                if os.path.isfile(stale):
+                    os.remove(stale)
+            return label, True, ''
 
         metadata = load_result_metadata(results_path)
         images_csv = os.path.join(results_path, "FilesAfterPostprocessing.csv")
@@ -1274,10 +1354,15 @@ def render_plant_angle_figures(job):
             direct = 0
             nested = 0
             for child in main_root:
-                if child.tag != 'root':
+                tag = child.tag.rsplit('}', 1)[-1] if isinstance(child.tag, str) else child.tag
+                if tag != 'root':
                     continue
                 direct += 1
-                nested += len(child.findall('.//root'))
+                nested += len([
+                    node for node in child.iter()
+                    if isinstance(node.tag, str) and node.tag.rsplit('}', 1)[-1] == 'root'
+                    and node is not child
+                ])
             if direct <= 1 and nested >= 3:
                 continue
             overlay_image = image
@@ -1298,32 +1383,34 @@ def render_plant_angle_figures(job):
         emergence_mm = float(conf['emergenceDistance'])
         stamp = datetime_from_filename(overlay_image)
         when = stamp.strftime('%Y-%m-%d %H:%M') if stamp is not None else os.path.basename(overlay_image)
+        stem = f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}"
 
-        fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
-        estimateAngles(
-            results_path, ax, crop.copy(), rsml_path=rsml_path,
-            emergence_distance=emergence_mm,
-        )
-        plt.title(f"Emergence Angles — {when}")
-        save_report_figure(
-            plt,
-            os.path.join(save_path, f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_emergence_angles.png"),
-            conf, bbox_inches="tight", dpi=200,
-        )
-        plt.close(fig)
+        def _save_or_clear_overlay(tip, title, filename_stem):
+            out_png = os.path.join(save_path, f"{filename_stem}.png")
+            fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
+            _ax, drew = estimateAngles(
+                results_path, ax, crop.copy(), rsml_path=rsml_path, tip=tip,
+                emergence_distance=emergence_mm,
+            )
+            if drew:
+                plt.title(title)
+                save_report_figure(
+                    plt, out_png, conf, bbox_inches="tight", dpi=200,
+                )
+            else:
+                for ext in ('.png', '.svg', '.pdf'):
+                    stale = os.path.join(save_path, f"{filename_stem}{ext}")
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+            plt.close(fig)
+            return drew
 
-        fig, ax = plt.subplots(figsize=(16, 8), dpi=200)
-        estimateAngles(
-            results_path, ax, crop.copy(), rsml_path=rsml_path, tip=True,
-            emergence_distance=emergence_mm,
+        _save_or_clear_overlay(
+            False, f"Emergence Angles — {when}", f"{stem}_emergence_angles",
         )
-        plt.title(f"Tip Angles — {when}")
-        save_report_figure(
-            plt,
-            os.path.join(save_path, f"{safe_exp}_{safe_robot}_{safe_cam}_{safe_plant}_tip_angles.png"),
-            conf, bbox_inches="tight", dpi=200,
+        _save_or_clear_overlay(
+            True, f"Tip Angles — {when}", f"{stem}_tip_angles",
         )
-        plt.close(fig)
 
         track_path = os.path.join(results_path, 'FirstLRTrack.json')
         if not os.path.isfile(track_path):
@@ -1518,6 +1605,8 @@ def plotLateralAnglesOnTop(conf):
                     if results_path is None or not os.path.exists(results_path):
                         continue
                     if not result_dir_in_report(conf, results_path):
+                        continue
+                    if not plant_has_measured_laterals(results_path):
                         continue
                     if first_lr_save_path is None:
                         first_lr_save_path = first_lr_overlays_dir(conf, safe_exp)

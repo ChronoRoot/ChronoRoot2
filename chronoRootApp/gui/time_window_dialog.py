@@ -21,7 +21,10 @@ from analysis.time_windows import (
 HELP_TEXT = (
     "Real-time sync uses one shared clock origin (the earliest group start). "
     "Later groups are padded; hours before that origin are dropped. "
-    "Anchor sync sets elapsed 0 at a treatment time."
+    "Anchor sync sets elapsed 0 at a treatment time. "
+    "Merge overlapping dates when staggered starts are the same run "
+    "(delayed module / power cut). Uncheck it to split separate replicates "
+    "that only partially overlap on the calendar."
 )
 
 ANCHOR_TOOLTIP = (
@@ -486,23 +489,30 @@ class TimeGroupDetectWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, main_folder):
+    def __init__(self, main_folder, merge_partial_overlaps=True):
         super().__init__()
         self.main_folder = main_folder or ''
+        self.merge_partial_overlaps = bool(merge_partial_overlaps)
 
     @QtCore.pyqtSlot()
     def run(self):
         try:
+            from analysis.utils.roi_selection import analysis_module_reuse_warnings
+
             data = collect_acquisition_spans(self.main_folder)
+            module_warn = analysis_module_reuse_warnings(self.main_folder)
             if data is None or data.empty:
                 self.finished.emit({
                     'groups': [],
                     'duration': None,
                     'sources': [],
                     'empty': True,
+                    'module_warnings': module_warn,
                 })
                 return
-            groups = detect_time_groups(data)
+            groups = detect_time_groups(
+                data, merge_partial_overlaps=self.merge_partial_overlaps,
+            )
             duration = default_duration_hours(groups, data)
             sources = time_period_sources(self.main_folder, spans=data)
             self.finished.emit({
@@ -510,6 +520,7 @@ class TimeGroupDetectWorker(QtCore.QObject):
                 'duration': int(duration) if duration is not None else None,
                 'sources': list(sources or []),
                 'empty': False,
+                'module_warnings': module_warn,
             })
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -532,6 +543,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self._detect_generation = 0
         self._detect_thread = None
         self._detect_worker = None
+        self._module_warn_shown = False
 
         self.clock_radio = QtWidgets.QRadioButton("Synchronize by real time")
         self.anchor_radio = QtWidgets.QRadioButton("Synchronize by anchor time")
@@ -548,6 +560,16 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.ticks_edit = QtWidgets.QLineEdit("00:00")
         self.ticks_edit.setPlaceholderText("HH:MM")
         self.ticks_edit.setMaximumWidth(120)
+        self.merge_overlaps_check = QtWidgets.QCheckBox(
+            "Merge plants with overlapping dates (same run / delayed modules)"
+        )
+        self.merge_overlaps_check.setChecked(True)
+        self.merge_overlaps_check.setToolTip(
+            "Checked: one analysis-period group when acquisition dates overlap "
+            "(use when a module started late in the same biological run).\n"
+            "Unchecked: split into start cohorts (~12 h) so staggered replicates "
+            "with partial calendar overlap stay separate."
+        )
 
         top = QtWidgets.QGridLayout()
         top.addWidget(self.clock_radio, 0, 0)
@@ -562,9 +584,10 @@ class TimeWindowDialog(QtWidgets.QDialog):
         top.addLayout(duration_row, 1, 0)
         top.addWidget(self.show_ticks_check, 1, 1)
         top.addWidget(self.ticks_edit, 1, 3)
+        top.addWidget(self.merge_overlaps_check, 2, 0, 1, 5)
         self.help_label = QtWidgets.QLabel(HELP_TEXT)
         self.help_label.setWordWrap(True)
-        top.addWidget(self.help_label, 2, 0, 1, 5)
+        top.addWidget(self.help_label, 3, 0, 1, 5)
 
         self.legend_label = QtWidgets.QLabel("")
         self.legend_label.setStyleSheet("color: #444;")
@@ -607,6 +630,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.clock_radio.toggled.connect(self._on_mode_changed)
         self.anchor_radio.toggled.connect(self._on_mode_changed)
         self.show_ticks_check.toggled.connect(self._on_ticks_toggled)
+        self.merge_overlaps_check.toggled.connect(self._on_merge_overlaps_toggled)
         self._apply_mode_tick_default()
         self._sync_ticks_enabled()
         self._update_legend()
@@ -661,6 +685,14 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self._update_legend()
         self._update_timeline()
 
+    def _on_merge_overlaps_toggled(self, _checked=True):
+        if self._updating:
+            return
+        # Changing merge mode invalidates saved group overlays for this scan.
+        self._saved_groups = []
+        if self.main_folder:
+            self._start_detect()
+
     def _sync_anchor_fields(self):
         show = self._anchor_mode()
         self._header_anchor.setVisible(show)
@@ -691,6 +723,8 @@ class TimeWindowDialog(QtWidgets.QDialog):
             self.show_ticks_check.setChecked(bool(conf.get('showFigureClockTicks')))
         else:
             self.show_ticks_check.setChecked(mode != 'anchor')
+        merge = conf.get('timeMergePartialOverlaps', True)
+        self.merge_overlaps_check.setChecked(bool(merge) if merge is not None else True)
         groups = list(conf.get('timeGroups') or [])
         self._saved_groups = groups
         self._saved_sources = [str(s) for s in list(conf.get('timePeriodSources') or [])]
@@ -715,6 +749,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
         if self._ok_button is not None:
             self._ok_button.setEnabled(not detecting)
         self.preview_btn.setEnabled(not detecting)
+        self.merge_overlaps_check.setEnabled(not detecting)
         if detecting:
             self.timeline.set_empty_text("Detecting groups…")
 
@@ -741,7 +776,10 @@ class TimeWindowDialog(QtWidgets.QDialog):
         self.timeline.set_empty_text("Detecting groups…")
         self._set_groups([])
         self._set_detecting(True)
-        worker = TimeGroupDetectWorker(self.main_folder)
+        worker = TimeGroupDetectWorker(
+            self.main_folder,
+            merge_partial_overlaps=self.merge_overlaps_check.isChecked(),
+        )
         thread = QtCore.QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -777,6 +815,10 @@ class TimeWindowDialog(QtWidgets.QDialog):
             return
         self._set_detecting(False)
         payload = payload or {}
+        module_warn = (payload.get('module_warnings') or '').strip()
+        if module_warn and not self._module_warn_shown:
+            self._module_warn_shown = True
+            QtWidgets.QMessageBox.warning(self, "Module folder reuse", module_warn)
         detected = list(payload.get('groups') or [])
         sources = [str(s) for s in list(payload.get('sources') or [])]
         self._detected_sources = sources
@@ -997,6 +1039,7 @@ class TimeWindowDialog(QtWidgets.QDialog):
             'timeDurationHours': int(self.duration_edit.value()),
             'showFigureClockTicks': show_ticks,
             'figureClockTicks': ticks,
+            'timeMergePartialOverlaps': self.merge_overlaps_check.isChecked(),
             'timeGroups': groups_to_config(self._groups_from_rows()),
             # Fingerprint from the scan that filled this dialog. Re-walking the
             # project here would stamp a different set than the one on screen

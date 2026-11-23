@@ -38,7 +38,7 @@ def run_analysis_rerun(metadata_path):
 
 
 def run_postprocess(project_dir):
-  subprocess.Popen([
+  return subprocess.Popen([
       "python", "2_postprocess.py",
       "--config", project_config_path(project_dir),
   ])

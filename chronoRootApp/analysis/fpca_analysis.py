@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -8,7 +11,11 @@ from skfda.representation.basis import MonomialBasis
 
 import seaborn as sns
 from scipy.stats import norm
-from .stats_utils import perform_scalar_pairwise_stats, ensure_factor_columns
+from .stats_utils import (
+    perform_scalar_pairwise_stats,
+    ensure_factor_columns,
+    iter_genotype_showcase_views,
+)
 from .report_plots import emit_scalar_comparison_plots, emit_replica_scalar_comparisons, relative_title
 from .utils.report_paths import (
     MODULE_TEMPORAL,
@@ -38,6 +45,149 @@ DEFAULT_FPCA_COLUMNS = [
     'DiscreteLateralDensity (LR/cm)',
     'HypocotylLength (mm)',
 ]
+
+
+def _clear_fpca_showcase_outputs(fpca_root, mag_slug):
+    """Drop previous Phase A showcase PNGs so mode toggles do not leave orphans."""
+    if not os.path.isdir(fpca_root):
+        return
+    for name in os.listdir(fpca_root):
+        path = os.path.join(fpca_root, name)
+        if os.path.isfile(path) and name.startswith(mag_slug) and name.endswith(
+            ('.png', '.svg', '.pdf')
+        ):
+            # Keep pcN comparison folders; only clear top-level showcase images.
+            if '_overview' in name or ('_pc' in name and '_vs_pc' in name):
+                os.remove(path)
+    for split_name in ('by_plate', 'by_extra'):
+        split_root = os.path.join(fpca_root, split_name)
+        if os.path.isdir(split_root):
+            shutil.rmtree(split_root, ignore_errors=True)
+
+
+def _write_fpca_overview(
+    conf, temporal_df, fpc_df, fpca, fpc_values, magnitude, *,
+    inverse_rank_normalize, number_of_components,
+    genotype_palette, genotype_legend, out_subpath, condition_title=None,
+):
+    """Phase A multipanel overview for one display subset (fit stays global)."""
+    mag_slug = temporal_metric_slug(magnitude)
+    plt.figure(figsize=(8, 16))
+
+    plt.subplot(5, 2, 1)
+    sns.lineplot(
+        x='ElapsedTime (h)', y=magnitude, hue='Experiment',
+        data=temporal_df, errorbar='se', palette=genotype_palette,
+    )
+    plt.title(relative_title(magnitude, conf), fontsize=16)
+    leg = plt.gca().get_legend()
+    if leg is not None:
+        leg.set_title(genotype_legend)
+
+    ax = plt.subplot(5, 2, 2)
+    sns.scatterplot(
+        data=fpc_df,
+        x='PC1' + ('_IRN' if inverse_rank_normalize else ''),
+        y='PC2' + ('_IRN' if inverse_rank_normalize else ''),
+        hue='Experiment',
+        palette=genotype_palette,
+        s=100,
+        ax=ax,
+    )
+    ax.set_title(relative_title('PC1 vs PC2', conf))
+    ax.set_xlabel('PC1' + (' (IRN)' if inverse_rank_normalize else ''))
+    ax.set_ylabel('PC2' + (' (IRN)' if inverse_rank_normalize else ''))
+    ax.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    for fpc1 in range(1, number_of_components + 1):
+        ax = plt.subplot(5, 2, 1 + fpc1 * 2)
+        sns.boxplot(
+            data=fpc_df,
+            x='Experiment',
+            hue='Experiment',
+            y=f"PC{fpc1}{'_IRN' if inverse_rank_normalize else ''}",
+            ax=ax,
+            palette=genotype_palette,
+        )
+        ax.set_title(
+            relative_title(
+                f'PC{fpc1}. Variance Explained: {fpca.explained_variance_ratio_[fpc1 - 1]:.2f}',
+                conf,
+            ),
+            fontsize=16,
+        )
+
+        ax = plt.subplot(5, 2, 1 + fpc1 * 2 + 1)
+        # Interpretation curves use the global fit (all plants).
+        N = 10
+        quantiles = np.arange(N + 1) / N
+        z_quantiles = np.quantile(fpc_values, quantiles, axis=0)[1:-1]
+        N = 8
+        palette = sns.color_palette('coolwarm', N + 1)
+        for i in range(z_quantiles.shape[0]):
+            z_value = z_quantiles[i, fpc1 - 1]
+            z = z_value * np.identity(number_of_components)[:, (fpc1 - 1)]
+            curve = fpca.inverse_transform(z)
+            curve = [x[0] for x in curve.data_matrix[0]]
+            ax.plot(curve, color=palette[i], label=f'Q {quantiles[i]:.2f}')
+
+        ax.set_title(relative_title(f'Interpretation of PC{fpc1}', conf), fontsize=16)
+        ax.set_ylabel(magnitude)
+        ax.set_xlabel('Time (h)')
+        handles = [plt.Line2D([0, 1], [0, 1], color=palette[i], lw=2) for i in range(N + 1)][::-1]
+        labels = [f'{z_quantiles[i, fpc1 - 1]:.2f}' for i in range(N + 1)][::-1]
+        ax.legend(handles, labels, title=f'PC{fpc1} Value', bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    if condition_title:
+        plt.suptitle(condition_title, fontsize=16)
+    plt.tight_layout()
+    save_report_figure(
+        plt,
+        plot_file(
+            conf, MODULE_TEMPORAL, mag_slug, f'{mag_slug}_overview.png', *out_subpath,
+        ),
+        conf, dpi=300, bbox_inches='tight',
+    )
+    plt.close()
+    plt.cla()
+    plt.clf()
+
+
+def _write_fpca_pc_scatters(
+    conf, fpc_df, magnitude, *, inverse_rank_normalize, number_of_components,
+    genotype_palette, genotype_legend, out_subpath, condition_title=None,
+):
+    if number_of_components < 2:
+        return
+    mag_slug = temporal_metric_slug(magnitude)
+    for i in range(1, number_of_components + 1):
+        for j in range(i + 1, number_of_components + 1):
+            plt.figure(figsize=(8, 6))
+            fpc_i = f"PC{i}{'_IRN' if inverse_rank_normalize else ''}"
+            fpc_j = f"PC{j}{'_IRN' if inverse_rank_normalize else ''}"
+            sns.scatterplot(
+                data=fpc_df, x=fpc_i, y=fpc_j, hue='Experiment',
+                palette=genotype_palette, s=100,
+            )
+            title = relative_title(f'{magnitude} - PC{i} vs PC{j}', conf)
+            if condition_title:
+                title = f'{title} — {condition_title}'
+            plt.title(title, fontsize=14)
+            plt.xlabel(f'PC{i}', fontsize=12)
+            plt.ylabel(f'PC{j}', fontsize=12)
+            plt.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.tight_layout()
+            save_report_figure(
+                plt,
+                plot_file(
+                    conf, MODULE_TEMPORAL, mag_slug,
+                    f'{mag_slug}_pc{i}_vs_pc{j}.png', *out_subpath,
+                ),
+                conf, dpi=300, bbox_inches='tight',
+            )
+            plt.close()
+            plt.cla()
+            plt.clf()
 
 
 def performFPCA(conf_path):
@@ -103,20 +253,10 @@ def performFPCA(conf_path):
 
     for magnitude in magnitudes_dict:
         mag_slug = temporal_metric_slug(magnitude)
+        fpca_root = analysis_dir(conf, MODULE_TEMPORAL, mag_slug, 'fpca')
+        _clear_fpca_showcase_outputs(fpca_root, mag_slug)
 
-        # Phase A: original 5x2 overview figure (verbatim layout)
-        plt.figure(figsize=(8, 16))
-
-        plt.subplot(5, 2, 1)
-        sns.lineplot(
-            x='ElapsedTime (h)', y=magnitude, hue='Experiment',
-            data=temporal_data_df, errorbar='se', palette=genotype_palette,
-        )
-        plt.title(relative_title(magnitude, conf), fontsize=16)
-        leg = plt.gca().get_legend()
-        if leg is not None:
-            leg.set_title(genotype_legend)
-
+        # Fit once on all usable plants.
         fpca = FPCA(n_components=number_of_components, components_basis=basis)
         fpc_values = fpca.fit_transform(FDataGrid(magnitudes_dict[magnitude].transpose()))
 
@@ -134,99 +274,31 @@ def performFPCA(conf_path):
             fpc_df[f'PC{j}_IRN'] = norm.ppf(fpc_df[f'PC{j}'].rank() / (len(fpc_df) + 1))
         fpc_df = fpc_df.sort_values(by='Experiment')
 
-        ax = plt.subplot(5, 2, 2)
-        sns.scatterplot(
-            data=fpc_df,
-            x='PC1' + ('_IRN' if inverse_rank_normalize else ''),
-            y='PC2' + ('_IRN' if inverse_rank_normalize else ''),
-            hue='Experiment',
-            palette=genotype_palette,
-            s=100,
-            ax=ax,
-        )
-        ax.set_title(relative_title('PC1 vs PC2', conf))
-        ax.set_xlabel('PC1' + (' (IRN)' if inverse_rank_normalize else ''))
-        ax.set_ylabel('PC2' + (' (IRN)' if inverse_rank_normalize else ''))
-        ax.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
-
-        for fpc1 in range(1, number_of_components + 1):
-            ax = plt.subplot(5, 2, 1 + fpc1 * 2)
-            sns.boxplot(
-                data=fpc_df,
-                x='Experiment',
-                hue='Experiment',
-                y=f"PC{fpc1}{'_IRN' if inverse_rank_normalize else ''}",
-                ax=ax,
-                palette=genotype_palette,
+        # Phase A showcases: same global scores, filtered/faceted per mode.
+        for subpath_tail, fpc_subset, condition_title in iter_genotype_showcase_views(conf, fpc_df):
+            plant_ids = set(fpc_subset['Plant_id'].astype(str))
+            temporal_subset = temporal_data_df[
+                temporal_data_df['Plant_id'].astype(str).isin(plant_ids)
+            ]
+            out_subpath = ('fpca',) + tuple(subpath_tail)
+            _write_fpca_overview(
+                conf, temporal_subset, fpc_subset, fpca, fpc_values, magnitude,
+                inverse_rank_normalize=inverse_rank_normalize,
+                number_of_components=number_of_components,
+                genotype_palette=genotype_palette,
+                genotype_legend=genotype_legend,
+                out_subpath=out_subpath,
+                condition_title=condition_title,
             )
-            ax.set_title(
-                relative_title(
-                    f'PC{fpc1}. Variance Explained: {fpca.explained_variance_ratio_[fpc1 - 1]:.2f}',
-                    conf,
-                ),
-                fontsize=16,
+            _write_fpca_pc_scatters(
+                conf, fpc_subset, magnitude,
+                inverse_rank_normalize=inverse_rank_normalize,
+                number_of_components=number_of_components,
+                genotype_palette=genotype_palette,
+                genotype_legend=genotype_legend,
+                out_subpath=out_subpath,
+                condition_title=condition_title,
             )
-
-            ax = plt.subplot(5, 2, 1 + fpc1 * 2 + 1)
-            N = 10
-            quantiles = np.arange(N + 1) / N
-            z_quantiles = np.quantile(fpc_values, quantiles, axis=0)[1:-1]
-
-            N = 8
-            palette = sns.color_palette('coolwarm', N + 1)
-
-            for i in range(z_quantiles.shape[0]):
-                z_value = z_quantiles[i, fpc1 - 1]
-                z = z_value * np.identity(number_of_components)[:, (fpc1 - 1)]
-                curve = fpca.inverse_transform(z)
-                curve = [x[0] for x in curve.data_matrix[0]]
-                color = palette[i]
-                ax.plot(curve, color=color, label=f'Q {quantiles[i]:.2f}')
-
-            ax.set_title(relative_title(f'Interpretation of PC{fpc1}', conf), fontsize=16)
-            ax.set_ylabel(magnitude)
-            ax.set_xlabel('Time (h)')
-
-            handles = [plt.Line2D([0, 1], [0, 1], color=palette[i], lw=2) for i in range(N + 1)][::-1]
-            labels = [f'{z_quantiles[i, fpc1 - 1]:.2f}' for i in range(N + 1)][::-1]
-            ax.legend(handles, labels, title=f'PC{fpc1} Value', bbox_to_anchor=(1.05, 1), loc='upper left')
-
-        plt.tight_layout()
-        save_report_figure(
-            plt,
-            plot_file(conf, MODULE_TEMPORAL, mag_slug, f'{mag_slug}_overview.png', 'fpca'),
-            conf, dpi=300, bbox_inches='tight',
-        )
-        plt.close()
-        plt.cla()
-        plt.clf()
-
-        if number_of_components >= 2:
-            for i in range(1, number_of_components + 1):
-                for j in range(i + 1, number_of_components + 1):
-                    plt.figure(figsize=(8, 6))
-                    fpc_i = f"PC{i}{'_IRN' if inverse_rank_normalize else ''}"
-                    fpc_j = f"PC{j}{'_IRN' if inverse_rank_normalize else ''}"
-                    sns.scatterplot(
-                        data=fpc_df, x=fpc_i, y=fpc_j, hue='Experiment',
-                        palette=genotype_palette, s=100,
-                    )
-                    plt.title(relative_title(f'{magnitude} - PC{i} vs PC{j}', conf), fontsize=14)
-                    plt.xlabel(f'PC{i}', fontsize=12)
-                    plt.ylabel(f'PC{j}', fontsize=12)
-                    plt.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
-                    plt.tight_layout()
-                    save_report_figure(
-                        plt,
-                        plot_file(
-                            conf, MODULE_TEMPORAL, mag_slug,
-                            f'{mag_slug}_pc{i}_vs_pc{j}.png', 'fpca',
-                        ),
-                        conf, dpi=300, bbox_inches='tight',
-                    )
-                    plt.close()
-                    plt.cla()
-                    plt.clf()
 
         # Phase B: paired comparison stats/plots per PC (after overview is saved)
         for fpc1 in range(1, number_of_components + 1):

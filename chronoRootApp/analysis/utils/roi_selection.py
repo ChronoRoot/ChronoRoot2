@@ -121,7 +121,13 @@ def _format_warnings(analysis_root, cam_plants, video_slots):
         sections.append('\n'.join(lines))
 
     if sections:
-        sections.insert(0, 'Same camera, different video sources:')
+        sections.insert(
+            0,
+            'Same robot/camera folder, different video sources:\n'
+            'Rename the robot folder with a run suffix (e.g. 20_3_run / 20_3_run2) '
+            'so different biological runs of the same ChronoRoot module do not '
+            'share one Analysis slot.',
+        )
 
     shared_video_sections = []
     for video_abs, slots in sorted(video_slots.items()):
@@ -256,6 +262,34 @@ def video_path_warnings(conf):
     """Conflict text including the plant about to be launched, or empty."""
     _rois, warnings_text = collect_previous_rois_and_warnings(conf, include_pending=True)
     return warnings_text
+
+
+def analysis_module_reuse_warnings(main_folder):
+    """Warn when the same robot/camera Analysis slot mixes different videos."""
+    analysis_root = os.path.join(main_folder or '', 'Analysis')
+    if not os.path.isdir(analysis_root):
+        return ''
+    cam_plants = defaultdict(list)
+    video_slots = defaultdict(list)
+    for plant_slot in pathlib.Path(analysis_root).glob('*/*/*/*'):
+        if not plant_slot.is_dir():
+            continue
+        rel = os.path.relpath(str(plant_slot), analysis_root)
+        parts = rel.split(os.sep)
+        if len(parts) < 4:
+            continue
+        experiment_folder, rpi, cam, plant_folder = parts[0], parts[1], parts[2], parts[3]
+        cam_path = os.path.join(analysis_root, experiment_folder, rpi, cam)
+        experiment = convertFromPathSafe(experiment_folder)
+        result_dir = get_latest_result_dir(str(plant_slot))
+        meta = load_result_metadata(result_dir) if result_dir else {}
+        video = video_image_dir(meta)
+        if not video:
+            continue
+        video_abs = os.path.abspath(video)
+        cam_plants[cam_path].append((plant_folder, video_abs))
+        video_slots[video_abs].append((experiment, rpi, cam, plant_folder))
+    return _format_warnings(analysis_root, cam_plants, video_slots)
 
 
 def select_roi_and_seed(

@@ -186,7 +186,39 @@ def draw_clock_ticks_on_axes(axes, data, conf):
     decorate_elapsed_time_axes(axes, data, conf)
 
 
-def place_elapsed_time_suptitle(fig, title, *, top=0.82, y=0.98):
+def push_facet_titles_below_day_axes(plot_obj):
+    """Move seaborn facet titles below Day twin-axis labels.
+
+    Axes titles sit above twin Day ticks and can outrank ``fig.suptitle`` after
+    ``bbox_inches='tight'``. Clearing them and drawing just above the axes spine
+    keeps the stack: overall title → Day ticks → facet label → plot.
+    """
+    if plot_obj is None:
+        return
+    axes = []
+    grid = getattr(plot_obj, 'axes', None)
+    if grid is not None and grid is not plot_obj:
+        axes = list(np.ravel(grid))
+    else:
+        axes = [plot_obj]
+    for ax in axes:
+        if ax is None or not hasattr(ax, 'get_title'):
+            continue
+        title = ax.get_title()
+        if not title:
+            continue
+        ax.set_title('')
+        ax.text(
+            0.5, 1.02, title,
+            transform=ax.transAxes,
+            ha='center',
+            va='bottom',
+            fontsize=11,
+            clip_on=False,
+        )
+
+
+def place_elapsed_time_suptitle(fig, title, *, top=0.78, y=0.98):
     """Put the figure title above Day-axis ticks instead of on top of them."""
     if fig is None or not title:
         return

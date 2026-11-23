@@ -35,7 +35,12 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 plt.switch_backend('agg')
 
-from .utils.fileUtilities import convertFromPathSafe, convertToPathSafe
+from .utils.fileUtilities import (
+    UNSPECIFIED_FACTOR,
+    convertFromPathSafe,
+    convertToPathSafe,
+    normalize_factor_value,
+)
 from .utils.report_paths import (
     FIGURE_FORMATS,
     GERMINATION_TIME_SLUG,
@@ -50,7 +55,11 @@ from .utils.report_paths import (
     table_file,
     temporal_metric_slug,
 )
+from .utils.report_utils import ensure_directory
 from .stats_utils import (
+    _mode_spec,
+    comparison_modes_for_run,
+    get_enabled_comparison_modes,
     perform_scalar_pairwise_stats,
     perform_temporal_pairwise_stats,
     ensure_factor_columns,
@@ -66,7 +75,12 @@ from .report_plots import (
 )
 from .plot_time_axis import decorate_elapsed_time_axis, decorate_elapsed_time_axes
 from .time_windows import elapsed_hour_windows
-from .utils.report_style import genotype_palette_for_data, get_genotype_axis_label
+from .utils.report_style import (
+    genotype_palette_for_data,
+    get_extra_axis_label,
+    get_genotype_axis_label,
+    get_plate_axis_label,
+)
 
 
 DEFAULT_TEMPORAL_METRICS = [
@@ -280,23 +294,28 @@ def performGerminationAnalysis(conf, data):
     _write_germination_summary_table(germ_conf, germ_df)
     _write_germination_plant_list(germ_conf, germ_df)
     base_dir = metric_dir(germ_conf, MODULE_TEMPORAL, GERMINATION_TIME_SLUG)
-    perform_scalar_pairwise_stats(
-        germ_conf, germ_df, GERMINATION_TIME_COLUMN, output_dir=None, plant_id_col='Plant_id',
-        module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
-        analysis_type='scalar',
-    )
-    emit_scalar_comparison_plots(
-        germ_conf, germ_df, GERMINATION_TIME_COLUMN, base_dir,
-        module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
-        analysis_type='scalar', metric_label='Germination time',
-        show_mean=True,
-    )
-    emit_replica_scalar_comparisons(
-        germ_conf, germ_df, GERMINATION_TIME_COLUMN,
-        module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
-        analysis_type='scalar', metric_label='Germination time',
-        show_mean=True,
-    )
+    saved_modes = germ_conf.get('effectiveComparisonModes')
+    germ_conf['effectiveComparisonModes'] = get_enabled_comparison_modes(germ_conf, germ_df)
+    try:
+        perform_scalar_pairwise_stats(
+            germ_conf, germ_df, GERMINATION_TIME_COLUMN, output_dir=None, plant_id_col='Plant_id',
+            module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
+            analysis_type='scalar',
+        )
+        emit_scalar_comparison_plots(
+            germ_conf, germ_df, GERMINATION_TIME_COLUMN, base_dir,
+            module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
+            analysis_type='scalar', metric_label='Germination time',
+            show_mean=True,
+        )
+        emit_replica_scalar_comparisons(
+            germ_conf, germ_df, GERMINATION_TIME_COLUMN,
+            module=MODULE_TEMPORAL, metric_slug_name=GERMINATION_TIME_SLUG,
+            analysis_type='scalar', metric_label='Germination time',
+            show_mean=True,
+        )
+    finally:
+        germ_conf['effectiveComparisonModes'] = saved_modes
 
 
 def _include_lateral_root_plots(conf):
@@ -602,14 +621,32 @@ def _overview_ylabel(col):
     return 'Length (mm)'
 
 
-def plot_info_all(conf, dataframe):
-    plt.ioff()
-    dataframe = ensure_factor_columns(dataframe)
-    geno_palette = genotype_palette_for_data(dataframe)
-    geno_label = get_genotype_axis_label(conf)
-    metrics = _overview_metric_pairs(conf, dataframe)
-    if not metrics:
+def _overview_factor_levels(dataframe, column):
+    if column not in dataframe.columns:
+        return []
+    levels = []
+    seen = set()
+    for value in dataframe[column].dropna().unique():
+        normalized = normalize_factor_value(value)
+        if normalized == UNSPECIFIED_FACTOR or normalized in seen:
+            continue
+        seen.add(normalized)
+        levels.append(normalized)
+    return sorted(levels, key=str)
+
+
+def _condition_overview_title(factor_label, value):
+    factor = str(factor_label or '').strip() or 'Condition'
+    return f'{factor}: {value}'
+
+
+def _write_temporal_overview_pair(conf, dataframe, out_dir, metrics, geno_label,
+                                  condition_title=None):
+    """Write all_metrics_subplots.png and all_metrics_n.png into out_dir."""
+    if dataframe is None or dataframe.empty or not metrics:
         return
+    ensure_directory(out_dir)
+    geno_palette = genotype_palette_for_data(dataframe)
 
     def _plot_metric(ax, y_col, title):
         plot_df = dataframe.dropna(subset=[y_col]) if y_col in dataframe.columns else dataframe
@@ -631,10 +668,12 @@ def plot_info_all(conf, dataframe):
         ax.set_xlabel('Elapsed Time (h)', fontsize=12)
         ax.set_ylabel(_overview_ylabel(col), fontsize=12)
     decorate_elapsed_time_axes(axes, dataframe, conf)
+    if condition_title:
+        fig3.suptitle(condition_title, fontsize=18)
 
     save_report_figure(
         plt,
-        os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_subplots.png'),
+        os.path.join(out_dir, 'all_metrics_subplots.png'),
         conf, dpi=300, bbox_inches='tight',
     )
 
@@ -656,12 +695,72 @@ def plot_info_all(conf, dataframe):
         ax.set_ylabel('Number of plants', fontsize=12)
         ax.legend(loc='best', title=geno_label)
     decorate_elapsed_time_axes(axes_n, dataframe, conf)
+    if condition_title:
+        fig_n.suptitle(condition_title, fontsize=18)
     save_report_figure(
         plt,
-        os.path.join(overview_dir(conf, MODULE_TEMPORAL), 'all_metrics_n.png'),
+        os.path.join(out_dir, 'all_metrics_n.png'),
         conf, dpi=300, bbox_inches='tight',
     )
 
     plt.cla()
     plt.clf()
     plt.close('all')
+
+
+def plot_info_all(conf, dataframe):
+    plt.ioff()
+    dataframe = ensure_factor_columns(dataframe)
+    geno_label = get_genotype_axis_label(conf)
+    metrics = _overview_metric_pairs(conf, dataframe)
+    if not metrics:
+        return
+
+    base = overview_dir(conf, MODULE_TEMPORAL)
+    plates = _overview_factor_levels(dataframe, 'PlateCondition')
+    extras = _overview_factor_levels(dataframe, 'ExtraVariable')
+    modes = set(comparison_modes_for_run(conf, dataframe))
+    # Qualitative genotype-within-condition overviews follow the matching
+    # advanced modes (not every plate/extra mode checkbox).
+    split_plates = len(plates) >= 2 and 'genotype_by_plate' in modes
+    split_extras = len(extras) >= 2 and 'genotype_by_extra' in modes
+    write_general = ('by_genotype' in modes) or (not split_plates and not split_extras)
+
+    # Drop previous split trees / flat overviews so remaps do not leave stale pools.
+    for split_name in ('by_plate', 'by_extra'):
+        split_root = os.path.join(base, split_name)
+        if os.path.isdir(split_root):
+            shutil.rmtree(split_root, ignore_errors=True)
+    for name in ('all_metrics_subplots.png', 'all_metrics_n.png'):
+        path = os.path.join(base, name)
+        if os.path.isfile(path):
+            os.remove(path)
+
+    if write_general:
+        general_title = (
+            _mode_spec('by_genotype', conf=conf)['header']
+            if (split_plates or split_extras)
+            else None
+        )
+        _write_temporal_overview_pair(
+            conf, dataframe, base, metrics, geno_label,
+            condition_title=general_title,
+        )
+    if split_plates:
+        plate_label = get_plate_axis_label(conf)
+        for plate in plates:
+            subset = dataframe[dataframe['PlateCondition'].astype(str) == str(plate)]
+            out_dir = os.path.join(base, 'by_plate', convertToPathSafe(str(plate)))
+            _write_temporal_overview_pair(
+                conf, subset, out_dir, metrics, geno_label,
+                condition_title=_condition_overview_title(plate_label, plate),
+            )
+    if split_extras:
+        extra_label = get_extra_axis_label(conf)
+        for extra in extras:
+            subset = dataframe[dataframe['ExtraVariable'].astype(str) == str(extra)]
+            out_dir = os.path.join(base, 'by_extra', convertToPathSafe(str(extra)))
+            _write_temporal_overview_pair(
+                conf, subset, out_dir, metrics, geno_label,
+                condition_title=_condition_overview_title(extra_label, extra),
+            )

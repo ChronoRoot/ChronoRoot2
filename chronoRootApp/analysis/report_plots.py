@@ -27,6 +27,7 @@ from .plot_time_axis import (
     decorate_elapsed_time_axes,
     draw_snapshot_day_axis_on,
     place_elapsed_time_suptitle,
+    push_facet_titles_below_day_axes,
 )
 from .utils.report_style import (
     apply_factor_axis_labels,
@@ -65,12 +66,14 @@ def _decorate_temporal_grid(g, data, conf, x_col, title=None):
         return
     hour_col = x_col if x_col in getattr(data, 'columns', []) else 'ElapsedTime (h)'
     decorate_elapsed_time_axes(g.axes.flat, data, conf, hour_col=hour_col)
+    push_facet_titles_below_day_axes(g)
     place_elapsed_time_suptitle(g.fig, title)
 
 
 def _decorate_snapshot_grid(plot_obj, x_col, title=None):
     if x_col == 'ElapsedTime (h)':
         draw_snapshot_day_axis_on(plot_obj)
+    push_facet_titles_below_day_axes(plot_obj)
     fig = plot_obj.fig if hasattr(plot_obj, 'fig') else getattr(plot_obj, 'figure', None)
     if title and fig is not None:
         place_elapsed_time_suptitle(fig, title)
@@ -108,6 +111,21 @@ def _set_hue_legend(ax, hue_col, conf):
         leg.set_title(legend_title_for_hue(hue_col, conf))
 
 
+def _set_figure_hue_legend(plot_obj, hue_col, conf):
+    """Retitle FacetGrid / figure-level legends (seaborn often skips axes legends)."""
+    if not hue_col:
+        return
+    title = legend_title_for_hue(hue_col, conf)
+    leg = getattr(plot_obj, '_legend', None)
+    if leg is not None:
+        leg.set_title(title)
+    fig = getattr(plot_obj, 'fig', None) or getattr(plot_obj, 'figure', None)
+    if fig is None:
+        return
+    for fig_leg in list(getattr(fig, 'legends', None) or []):
+        fig_leg.set_title(title)
+
+
 _FACTOR_COLUMNS = frozenset({'Experiment', 'PlateCondition', 'ExtraVariable', 'Type'})
 
 
@@ -125,6 +143,8 @@ def finalize_comparison_axes(plot_obj, conf, *, x_col=None, hue_col=None, facet_
                 ax.set_xlabel(x_label)
             if hue_col:
                 _set_hue_legend(ax, hue_col, conf)
+        if hue_col:
+            _set_figure_hue_legend(g, hue_col, conf)
     else:
         apply_factor_axis_labels(plot_obj, conf, x_col=x_col, hue_col=hue_col)
 

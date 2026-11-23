@@ -115,6 +115,7 @@ class ConfigStore:
     for key in (
         'timeSyncMode', 'timeDurationHours', 'reportFolderName',
         'figureClockTicks', 'showFigureClockTicks', 'timeGroups', 'timePeriodSources',
+        'timeMergePartialOverlaps',
     ):
       if hasattr(host, key):
         data[key] = getattr(host, key)
@@ -238,6 +239,11 @@ class ConfigStore:
     if mode not in ('clock', 'anchor'):
       mode = 'clock'
     host.timeSyncMode = mode
+
+    if 'timeMergePartialOverlaps' in data and data.get('timeMergePartialOverlaps') is not None:
+      host.timeMergePartialOverlaps = bool(data.get('timeMergePartialOverlaps'))
+    else:
+      host.timeMergePartialOverlaps = True
 
     duration = data.get('timeDurationHours') if 'timeDurationHours' in data else None
     if duration == '':

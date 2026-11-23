@@ -53,7 +53,9 @@ from analysis.utils.report_paths import (
     individual_plots_dir,
     overview_dir,
     MODULE_CONVEX,
+    clear_convex_overview_atlases,
     purge_disabled_comparison_outputs,
+    purge_stale_genotype_outputs,
     report_root,
     temporal_data_file,
 )
@@ -191,6 +193,13 @@ if __name__ == "__main__":
     conf['effectiveComparisonModes'] = effective_modes
     log_auto_disabled_modes(conf, config_modes, effective_modes)
 
+    current_genotype_slugs = []
+    for exp_dir in experiments:
+        exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
+        if experiment_in_report(conf, real_exp_name):
+            current_genotype_slugs.append(exp_dir_name)
+    purge_stale_genotype_outputs(conf, current_genotype_slugs)
+
     # --- Phase 2: convex hull ---
     convex_hull_df = pd.DataFrame()
     if conf.get('doConvex') and not relative:
@@ -204,13 +213,14 @@ if __name__ == "__main__":
         timestep = int(conf['timeStep'])
         convex_overview = overview_dir(conf, MODULE_CONVEX)
         convex_frames = []
+        atlas_jobs = []
         n_experiments = len(included)
 
         for exp_index, exp_dir in enumerate(included, start=1):
             exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
             print(f'Phase 2/3: convex hull ({exp_index}/{n_experiments}): {real_exp_name}')
 
-            atlases, current_convex_df = convex_hull.generate_root_atlases(
+            atlas_bundle, current_convex_df = convex_hull.generate_root_atlases(
                 exp_dir,
                 snapshot_hours=snapshot_h,
                 timestep=timestep,
@@ -224,25 +234,57 @@ if __name__ == "__main__":
                 current_convex_df['Experiment'] = real_exp_name
                 convex_frames.append(current_convex_df)
 
-            if conf.get('saveImagesConvex') and atlases:
-                for i, hour in enumerate(snapshot_h):
-                    at_hull, at_cont, at_root = atlases[i]
-                    convex_hull.visualize_single_atlas(
-                        at_hull, at_cont, at_root,
-                        convex_overview, exp_dir_name, hour,
-                    )
-            elif atlases:
-                at_hull, at_cont, at_root = atlases[-1]
-                convex_hull.visualize_single_atlas(
-                    at_hull, at_cont, at_root,
-                    convex_overview, exp_dir_name,
-                    snapshot_h[-1] if snapshot_h else None,
-                )
+            if atlas_bundle and (atlas_bundle.get('all') or []):
+                atlas_jobs.append((atlas_bundle, exp_dir_name))
 
         convex_hull_df = pd.concat(convex_frames, ignore_index=True) if convex_frames else pd.DataFrame()
         if not convex_hull_df.empty:
             convex_hull_df.to_csv(convex_data_path, index=False)
             print(f'Phase 2/3: wrote {convex_data_path}')
+
+        plate_levels = (
+            convex_hull.usable_atlas_factor_levels(convex_hull_df['PlateCondition'])
+            if not convex_hull_df.empty and 'PlateCondition' in convex_hull_df.columns
+            else []
+        )
+        extra_levels = (
+            convex_hull.usable_atlas_factor_levels(convex_hull_df['ExtraVariable'])
+            if not convex_hull_df.empty and 'ExtraVariable' in convex_hull_df.columns
+            else []
+        )
+        mode_set = set(effective_modes or [])
+        split_plates = len(plate_levels) >= 2 and 'genotype_by_plate' in mode_set
+        split_extras = len(extra_levels) >= 2 and 'genotype_by_extra' in mode_set
+        write_all = 'by_genotype' in mode_set
+        clear_convex_overview_atlases(conf)
+        save_all_hours = bool(conf.get('saveImagesConvex'))
+        for atlas_bundle, exp_dir_name in atlas_jobs:
+            if save_all_hours:
+                bundle_to_write = atlas_bundle
+                hour_list = list(snapshot_h)
+            else:
+                series = atlas_bundle.get('all') or []
+                if not series:
+                    continue
+                bundle_to_write = {
+                    'all': [series[-1]],
+                    'by_plate': {
+                        key: [vals[-1]]
+                        for key, vals in (atlas_bundle.get('by_plate') or {}).items()
+                        if vals
+                    },
+                    'by_extra': {
+                        key: [vals[-1]]
+                        for key, vals in (atlas_bundle.get('by_extra') or {}).items()
+                        if vals
+                    },
+                }
+                hour_list = [snapshot_h[-1]] if snapshot_h else []
+            convex_hull.write_experiment_atlases(
+                bundle_to_write, convex_overview, exp_dir_name, hour_list,
+                split_plates=split_plates, split_extras=split_extras,
+                write_all=write_all,
+            )
 
     purge_disabled_comparison_outputs(conf, effective_modes)
 

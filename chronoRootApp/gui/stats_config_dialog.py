@@ -68,7 +68,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
     self.advanced_group = QtWidgets.QGroupBox("Advanced comparison modes")
     self.advanced_group.setObjectName("advancedComparisonModes")
     self.advanced_group.setCheckable(True)
-    self.advanced_group.setChecked(False)
+    self.advanced_group.setChecked(True)
     advanced_layout = QtWidgets.QVBoxLayout()
     self._mode_checkboxes = {}
     for object_name, label in STATS_MODE_WIDGETS:
@@ -136,7 +136,7 @@ class StatsConfigDialog(QtWidgets.QDialog):
     self.everyXhourField[1].setText("6")
     self.everyXhourFieldFourier[1].setText("6")
     self.everyXhourFieldAngles[1].setText("6")
-    self.advanced_group.setChecked(False)
+    self.advanced_group.setChecked(True)
     for checkbox in self._mode_checkboxes.values():
       checkbox.setChecked(True)
 

@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import os
+import shutil
 import numpy as np
 from scipy import signal
 import scipy.stats as stats
@@ -12,6 +13,7 @@ from .stats_utils import (
     perform_fourier_pairwise_stats,
     ensure_factor_columns,
     comparison_modes_for_run,
+    iter_genotype_showcase_views,
     iter_replica_runs,
     _mode_spec,
     _describe_averaging,
@@ -381,13 +383,60 @@ class Visualizer:
         plt.rc('legend', fontsize=SMALL_SIZE)
         plt.rc('figure', titlesize=BIGGER_SIZE)
 
-    def create_joint_plot(self, data: pd.DataFrame, data_detrended: pd.DataFrame, 
-                         time: np.ndarray, metric_config: dict, 
-                         output_prefix: str):
+    def _clear_showcase_outputs(self):
+        growth_dir = analysis_dir(self.conf, MODULE_TEMPORAL, self.slug, 'growth_speed')
+        if not os.path.isdir(growth_dir):
+            return
+        for name in (
+            f'{self.slug}_overview_joint.png',
+            f'{self.slug}_individual_original.png',
+            f'{self.slug}_individual_normalized.png',
+        ):
+            path = os.path.join(growth_dir, name)
+            if os.path.isfile(path):
+                os.remove(path)
+        for split_name in ('by_plate', 'by_extra'):
+            split_root = os.path.join(growth_dir, split_name)
+            if os.path.isdir(split_root):
+                shutil.rmtree(split_root, ignore_errors=True)
+
+    def create_showcase_plots(self, data: pd.DataFrame, data_detrended: pd.DataFrame,
+                              time: np.ndarray, metric_config: dict):
+        """Emit joint + individual showcases for each enabled genotype view.
+
+        Processing stays on the full tables; each view filters rows for display.
+        """
+        self._clear_showcase_outputs()
+        data = ensure_factor_columns(data)
+        data_detrended = ensure_factor_columns(data_detrended)
+        factor_cols = [
+            c for c in ('Experiment', 'PlateCondition', 'ExtraVariable')
+            if c in data.columns and c in data_detrended.columns
+        ]
+        for subpath_tail, subset, condition_title in iter_genotype_showcase_views(self.conf, data):
+            if factor_cols:
+                keys = subset[factor_cols].drop_duplicates()
+                subset_det = data_detrended.merge(keys, on=factor_cols, how='inner')
+            else:
+                subset_det = data_detrended
+            out_subpath = ('growth_speed',) + tuple(subpath_tail)
+            self.create_joint_plot(
+                subset, subset_det, time, metric_config,
+                out_subpath=out_subpath, condition_title=condition_title,
+            )
+            self.create_individual_plots(
+                subset, subset_det, time, metric_config,
+                out_subpath=out_subpath, condition_title=condition_title,
+            )
+
+    def create_joint_plot(self, data: pd.DataFrame, data_detrended: pd.DataFrame,
+                         time: np.ndarray, metric_config: dict,
+                         output_prefix: str = '', out_subpath=('growth_speed',),
+                         condition_title=None):
         """Create joint plot with original and detrended data"""
         fig = plt.figure(figsize=(12, 8), constrained_layout=True, dpi=300)
         gs = fig.add_gridspec(2, 2)
-        
+
         axes = {
             'original': fig.add_subplot(gs[0, 0]),
             'detrended': fig.add_subplot(gs[0, 1]),
@@ -395,104 +444,102 @@ class Visualizer:
             'fft_detrended': fig.add_subplot(gs[1, 1])
         }
 
-        # Plot original data
-        self._plot_time_series(axes['original'], data, time, 
-                             metric_config['ylabel'], 
+        self._plot_time_series(axes['original'], data, time,
+                             metric_config['ylabel'],
                              f"Original {metric_config['title']}")
-        
-        # Plot detrended data with reference curves
+
         self._plot_time_series(axes['detrended'], data_detrended, time,
                              metric_config['norm_ylabel'],
                              f"Normalized & Detrended {metric_config['title']}")
-        
-        # Add reference curves to detrended plot
+
         exp1 = 1.75 - 0.25 * np.cos(1/24 * (time-12) * 2 * np.pi + np.pi)
         exp2 = 1.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
         axes['detrended'].plot(time, exp1, color='red', label='24h rhythm')
         axes['detrended'].plot(time, exp2, color='black', label='12h rhythm')
-        
-        # Update legend for detrended plot
+
         handles, labels = axes['detrended'].get_legend_handles_labels()
         axes['detrended'].legend(handles, labels, loc='best')
 
-        # Plot FFTs
         self._plot_fft(axes['fft_original'], data, "FFT of Original Signal")
         self._plot_fft(axes['fft_detrended'], data_detrended, "FFT of Normalized & Detrended Signal")
 
-        plt.suptitle(f"Joint Plot - {metric_config['title']}", fontsize=16, y=1.02)
+        title = f"Joint Plot - {metric_config['title']}"
+        if condition_title:
+            title = f'{title} — {condition_title}'
+        plt.suptitle(title, fontsize=16, y=1.02)
 
         save_report_figure(
             plt,
-            plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_overview_joint.png', 'growth_speed'),
+            plot_file(
+                self.conf, MODULE_TEMPORAL, self.slug,
+                f'{self.slug}_overview_joint.png', *out_subpath,
+            ),
             self.conf, dpi=300, bbox_inches='tight',
         )
         plt.close()
 
-
     def create_individual_plots(self, data: pd.DataFrame, data_detrended: pd.DataFrame,
-                                time: np.ndarray, metric_config: dict):
-        """Create individual plots for each experiment"""
-        unique_experiments = data['Type'].unique()
+                                time: np.ndarray, metric_config: dict,
+                                out_subpath=('growth_speed',), condition_title=None):
+        """Create individual plots for each experiment (genotype)."""
+        if data is None or data.empty or 'Type' not in data.columns:
+            return
+        unique_experiments = list(pd.unique(data['Type']))
         n_exp = len(unique_experiments)
-        
-        # Get color palette for consistent colors across both plots
+        if n_exp == 0:
+            return
+
         geno_palette = genotype_palette_for_data(data, 'Type')
-        
-        # Calculate y-axis limits for original data
         min_signal = data['Signal'].min()
         max_signal = data['Signal'].mean() + 3 * data['Signal'].std()
-        
-        # First Figure: Original Signals
+
         fig1 = plt.figure(figsize=(10, 3 * (n_exp + 1)), constrained_layout=True)
         gs1 = fig1.add_gridspec(n_exp + 1, 1)
-        
-        # Plot original data for each experiment
+
         for i, exp_name in enumerate(unique_experiments):
             ax = fig1.add_subplot(gs1[i, 0])
             exp_data = data[data['Type'] == exp_name]
-            
             sns.lineplot(x="Time", y="Signal", data=exp_data,
                         errorbar='se', ax=ax, color=geno_palette.get(exp_name),
                         estimator=np.mean)
             tick_df = exp_data.rename(columns={'Time': 'ElapsedTime (h)'}) if 'ElapsedTime (h)' not in exp_data.columns else exp_data
             decorate_elapsed_time_axis(ax, tick_df, self.conf, day_axis=True)
-            
             ax.set_ylabel(metric_config['ylabel'])
             ax.set_xlabel('')
             ax.set_ylim(min_signal, max_signal)
             ax.legend([f"{exp_name}"], loc='upper left')
-        
-        # Add reference sinusoids for original scale
+
         ax_sin = fig1.add_subplot(gs1[-1, 0])
         exp1 = -0.25 - 0.25 * np.cos(1/24 * (time-12) * 2 * np.pi + np.pi)
         exp2 = 0.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
         ax_sin.plot(time, exp1, color='red', label='24h rhythm')
         ax_sin.plot(time, exp2, color='black', label='12h rhythm')
         self._clock_ticks(ax_sin, data, day_axis=True)
-        
         ax_sin.set_ylabel('Reference Patterns')
         ax_sin.set_xlabel('Time (h)')
         ax_sin.legend(loc='upper right')
-        
-        plt.suptitle(f"{metric_config['title']} Analysis - Original", fontsize=16, y=1.02)
-        
-        # Save original plots
+
+        title = f"{metric_config['title']} Analysis - Original"
+        if condition_title:
+            title = f'{title} — {condition_title}'
+        plt.suptitle(title, fontsize=16, y=1.02)
         save_report_figure(
             plt,
-            plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_individual_original.png', 'growth_speed'),
+            plot_file(
+                self.conf, MODULE_TEMPORAL, self.slug,
+                f'{self.slug}_individual_original.png', *out_subpath,
+            ),
             self.conf, dpi=300, bbox_inches='tight',
         )
         plt.close()
-        
-        # Second Figure: Normalized Signals
+
         fig2 = plt.figure(figsize=(10, 3 * (n_exp + 1)), constrained_layout=True)
         gs2 = fig2.add_gridspec(n_exp + 1, 1)
-        
-        # Plot normalized data for each experiment
         for i, exp_name in enumerate(unique_experiments):
             ax = fig2.add_subplot(gs2[i, 0])
             exp_data_norm = data_detrended[data_detrended['Type'] == exp_name]
-            
+            if exp_data_norm.empty:
+                continue
             sns.lineplot(x="Time", y="Signal", data=exp_data_norm,
                         errorbar='se', ax=ax, color=geno_palette.get(exp_name),
                         estimator=np.mean)
@@ -501,8 +548,7 @@ class Visualizer:
             ax.set_xlabel('')
             ax.set_ylim(-1, 1)
             ax.legend([f"{exp_name}"], loc='upper left')
-        
-        # Add reference sinusoids for normalized scale
+
         ax_sin = fig2.add_subplot(gs2[-1, 0])
         exp1 = 0.25 - 0.25 * np.cos(1/24 * (time-12) * 2 * np.pi + np.pi)
         exp2 = -0.25 + 0.25 * np.cos(1/12 * (time-12) * 2 * np.pi + np.pi)
@@ -512,12 +558,16 @@ class Visualizer:
         ax_sin.set_ylabel('Reference Patterns')
         ax_sin.set_xlabel('Time (h)')
         ax_sin.legend(loc='upper right')
-        plt.suptitle(f"{metric_config['title']} Analysis - Normalized", fontsize=16, y=1.02)
-        
-        # Save normalized plots
+        title = f"{metric_config['title']} Analysis - Normalized"
+        if condition_title:
+            title = f'{title} — {condition_title}'
+        plt.suptitle(title, fontsize=16, y=1.02)
         save_report_figure(
             plt,
-            plot_file(self.conf, MODULE_TEMPORAL, self.slug, f'{self.slug}_individual_normalized.png', 'growth_speed'),
+            plot_file(
+                self.conf, MODULE_TEMPORAL, self.slug,
+                f'{self.slug}_individual_normalized.png', *out_subpath,
+            ),
             self.conf, dpi=300, bbox_inches='tight',
         )
         plt.close()
@@ -609,24 +659,14 @@ def makeFourierPlots(conf: dict):
                     metric_type
                 )
                 
-                # Create visualizations
                 time_series = all_frames_original.loc[
                     all_frames_original['Time'].notna(), 'Time'
                 ].drop_duplicates().to_numpy()
-                visualizer.create_joint_plot(
+                visualizer.create_showcase_plots(
                     all_frames_original,
                     all_frames_detrended,
                     time_series,
                     metric_config,
-                    f"JointPlot_{metric_type}"
-                )
-                
-                # Create individual plots - updated call to match function signature
-                visualizer.create_individual_plots(
-                    all_frames_original,
-                    all_frames_detrended,
-                    time_series,
-                    metric_config
                 )
                 
             except Exception as e:

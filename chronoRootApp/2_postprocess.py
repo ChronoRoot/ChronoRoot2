@@ -56,6 +56,26 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 MAX_PLANT_WORKERS = 4
 
 
+def _file_stamp(path):
+    try:
+        st = os.stat(path)
+        return {"mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)}
+    except OSError:
+        return None
+
+
+def postprocess_fingerprint(raw_csv_path, pixel_size, calibration_source, conf):
+    """Inputs that must match for a plant to be considered unchanged."""
+    return {
+        "raw": _file_stamp(raw_csv_path),
+        "pixel_size": round(float(pixel_size), 8),
+        "calibration_source": str(calibration_source or ""),
+        "processingLimit": conf.get("processingLimit"),
+        "timeStep": conf.get("timeStep"),
+        "emergenceDistance": conf.get("emergenceDistance"),
+    }
+
+
 def _load_latest_metadata(plant_path):
     """Return (result_dir, metadata dict) or (None, None)."""
     result_dir = get_latest_result_dir(plant_path)
@@ -146,19 +166,29 @@ def process_one_plant(plant_path, pixel_size, conf, plot_label, calibration_sour
     """
     Post-process a single plant slot. Top-level for ProcessPoolExecutor.
 
-    Returns (plant_path, ok, error_message).
+    Returns (plant_path, ok, error_message, skipped).
     """
     try:
         target_res = get_latest_result_dir(plant_path)
         if target_res is None:
-            return plant_path, False, "no Results_* folder"
+            return plant_path, False, "no Results_* folder", False
 
         pfile = os.path.join(target_res, "Results_raw.csv")
         if not os.path.isfile(pfile):
-            return plant_path, False, "missing Results_raw.csv"
+            return plant_path, False, "missing Results_raw.csv", False
 
+        processed_csv = os.path.join(target_res, "PostProcess_Hour.csv")
         meta_file = os.path.join(target_res, "metadata.json")
         plant_metadata = apply_load_aliases(load_json(meta_file))
+        fingerprint = postprocess_fingerprint(
+            pfile, pixel_size, calibration_source, conf,
+        )
+        if (
+            os.path.isfile(processed_csv)
+            and plant_metadata.get("postprocess_fingerprint") == fingerprint
+        ):
+            return plant_path, True, "skipped unchanged", True
+
         plant_metadata["pixel_size"] = pixel_size
         if calibration_source:
             plant_metadata["calibration_source"] = calibration_source
@@ -167,15 +197,21 @@ def process_one_plant(plant_path, pixel_size, conf, plot_label, calibration_sour
         n_limit = processing_limit_frame_count(conf)
         dataWork(conf, pfile, target_res, N_exp=n_limit)
 
-        processed_csv = os.path.join(target_res, "PostProcess_Hour.csv")
         if os.path.exists(processed_csv):
             data = pd.read_csv(processed_csv)
             plot_individual_plant(target_res, data, plot_label, conf)
 
         getAngles(conf, target_res)
-        return plant_path, True, ""
+
+        plant_metadata = apply_load_aliases(load_json(meta_file))
+        plant_metadata["pixel_size"] = pixel_size
+        if calibration_source:
+            plant_metadata["calibration_source"] = calibration_source
+        plant_metadata["postprocess_fingerprint"] = fingerprint
+        dump_json(meta_file, plant_metadata)
+        return plant_path, True, "", False
     except Exception as exc:
-        return plant_path, False, str(exc)
+        return plant_path, False, str(exc), False
 
 
 def collect_plate_groups(analysis_root):
@@ -275,6 +311,8 @@ if __name__ == "__main__":
         workers = min(MAX_PLANT_WORKERS, len(jobs))
         done_for = {key: 0 for key in plate_total}
         ok_for = {key: 0 for key in plate_total}
+        skipped_for = {key: 0 for key in plate_total}
+        skipped_total = 0
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(
@@ -284,15 +322,27 @@ if __name__ == "__main__":
             }
             for fut in as_completed(futures):
                 plate_key = futures[fut]
-                plant_path, ok, err = fut.result()
+                plant_path, ok, err, skipped = fut.result()
                 done_for[plate_key] += 1
                 if ok:
                     ok_for[plate_key] += 1
+                    if skipped:
+                        skipped_for[plate_key] += 1
+                        skipped_total += 1
                 else:
                     print(f"  Error {os.path.basename(plant_path)}: {err}")
                 plate_label, total = plate_total[plate_key]
                 if done_for[plate_key] == total:
-                    print(f"  {plate_label}: {ok_for[plate_key]}/{total} done")
+                    skipped_n = skipped_for[plate_key]
+                    if skipped_n:
+                        print(
+                            f"  {plate_label}: {ok_for[plate_key]}/{total} done "
+                            f"({skipped_n} unchanged skipped)"
+                        )
+                    else:
+                        print(f"  {plate_label}: {ok_for[plate_key]}/{total} done")
+        if skipped_total:
+            print(f"Skipped {skipped_total} unchanged plant(s).")
 
     if scale_issues:
         print("Plate scale warnings:")

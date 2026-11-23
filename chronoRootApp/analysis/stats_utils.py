@@ -96,6 +96,72 @@ def specified_extra_values(data):
     return sorted(values, key=lambda item: str(item).lower())
 
 
+def specified_plate_values(data):
+    """Unique PlateCondition values that are not unspecified, sorted stably."""
+    data = ensure_factor_columns(data)
+    values = []
+    seen = set()
+    for value in pd.Series(data['PlateCondition']).dropna().unique():
+        normalized = normalize_factor_value(value)
+        if normalized == UNSPECIFIED_FACTOR or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return sorted(values, key=lambda item: str(item).lower())
+
+
+def iter_genotype_showcase_views(conf, data):
+    """Yield display subsets for genotype-hued showcase figures.
+
+    Fitting/analysis stays on the full table. Each yield is
+    ``(subpath_parts, subset, condition_title)`` where ``subpath_parts`` is
+    empty for the pooled ``by_genotype`` view, or
+    ``('by_plate', slug)`` / ``('by_extra', slug)`` when those advanced modes
+    are enabled and the factor has ≥2 levels.
+    """
+    from .utils.fileUtilities import convertToPathSafe
+
+    data = ensure_factor_columns(data)
+    modes = set(comparison_modes_for_run(conf, data))
+    plates = specified_plate_values(data)
+    extras = specified_extra_values(data)
+    split_plates = 'genotype_by_plate' in modes and len(plates) >= 2
+    split_extras = 'genotype_by_extra' in modes and len(extras) >= 2
+    write_general = ('by_genotype' in modes) or (not split_plates and not split_extras)
+
+    if write_general:
+        title = None
+        if split_plates or split_extras:
+            title = _mode_spec('by_genotype', conf=conf)['header']
+        yield (), data, title
+
+    if split_plates:
+        plate_label = get_plate_axis_label(conf)
+        plate_series = data['PlateCondition'].astype(str)
+        for plate in plates:
+            subset = data[plate_series == str(plate)].copy()
+            if subset.empty:
+                continue
+            yield (
+                ('by_plate', convertToPathSafe(str(plate))),
+                subset,
+                f'{plate_label}: {plate}',
+            )
+
+    if split_extras:
+        extra_label = get_extra_axis_label(conf)
+        extra_series = data['ExtraVariable'].astype(str)
+        for extra in extras:
+            subset = data[extra_series == str(extra)].copy()
+            if subset.empty:
+                continue
+            yield (
+                ('by_extra', convertToPathSafe(str(extra))),
+                subset,
+                f'{extra_label}: {extra}',
+            )
+
+
 def replica_comparison_modes(conf, data=None):
     """Enabled comparison modes that do not stratify or group by ExtraVariable."""
     return [mode for mode in comparison_modes_for_run(conf, data) if mode not in _EXTRA_MODES]
