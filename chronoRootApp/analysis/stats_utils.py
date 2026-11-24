@@ -6,8 +6,9 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 
+from .time_windows import elapsed_hour_windows
 from .utils.fileUtilities import UNSPECIFIED_FACTOR, normalize_factor_value
-from .utils.report_paths import stats_file as report_stats_file
+from .utils.report_paths import metric_slug, stats_file as report_stats_file
 from .utils.report_style import get_extra_axis_label, get_genotype_axis_label, get_plate_axis_label
 
 ALL_COMPARISON_MODES = (
@@ -29,6 +30,8 @@ _EXTRA_MODES = frozenset({
 
 
 def _modes_from_config(conf):
+    if conf.get('advancedComparisonModes') is False:
+        return ['by_genotype']
     modes = []
     if conf.get('statsByGenotype', True):
         modes.append('by_genotype')
@@ -77,6 +80,115 @@ def comparison_modes_for_run(conf, data=None):
     if data is not None:
         return get_enabled_comparison_modes(conf, data)
     return get_enabled_comparison_modes(conf)
+
+
+def specified_extra_values(data):
+    """Unique ExtraVariable values that are not unspecified, sorted stably."""
+    data = ensure_factor_columns(data)
+    values = []
+    seen = set()
+    for value in pd.Series(data['ExtraVariable']).dropna().unique():
+        normalized = normalize_factor_value(value)
+        if normalized == UNSPECIFIED_FACTOR or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return sorted(values, key=lambda item: str(item).lower())
+
+
+def specified_plate_values(data):
+    """Unique PlateCondition values that are not unspecified, sorted stably."""
+    data = ensure_factor_columns(data)
+    values = []
+    seen = set()
+    for value in pd.Series(data['PlateCondition']).dropna().unique():
+        normalized = normalize_factor_value(value)
+        if normalized == UNSPECIFIED_FACTOR or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return sorted(values, key=lambda item: str(item).lower())
+
+
+def iter_genotype_showcase_views(conf, data):
+    """Yield display subsets for genotype-hued showcase figures.
+
+    Fitting/analysis stays on the full table. Each yield is
+    ``(subpath_parts, subset, condition_title)`` where ``subpath_parts`` is
+    empty for the pooled ``by_genotype`` view, or
+    ``('by_plate', slug)`` / ``('by_extra', slug)`` when those advanced modes
+    are enabled and the factor has ≥2 levels.
+    """
+    from .utils.fileUtilities import convertToPathSafe
+
+    data = ensure_factor_columns(data)
+    modes = set(comparison_modes_for_run(conf, data))
+    plates = specified_plate_values(data)
+    extras = specified_extra_values(data)
+    split_plates = 'genotype_by_plate' in modes and len(plates) >= 2
+    split_extras = 'genotype_by_extra' in modes and len(extras) >= 2
+    write_general = ('by_genotype' in modes) or (not split_plates and not split_extras)
+
+    if write_general:
+        title = None
+        if split_plates or split_extras:
+            title = _mode_spec('by_genotype', conf=conf)['header']
+        yield (), data, title
+
+    if split_plates:
+        plate_label = get_plate_axis_label(conf)
+        plate_series = data['PlateCondition'].astype(str)
+        for plate in plates:
+            subset = data[plate_series == str(plate)].copy()
+            if subset.empty:
+                continue
+            yield (
+                ('by_plate', convertToPathSafe(str(plate))),
+                subset,
+                f'{plate_label}: {plate}',
+            )
+
+    if split_extras:
+        extra_label = get_extra_axis_label(conf)
+        extra_series = data['ExtraVariable'].astype(str)
+        for extra in extras:
+            subset = data[extra_series == str(extra)].copy()
+            if subset.empty:
+                continue
+            yield (
+                ('by_extra', convertToPathSafe(str(extra))),
+                subset,
+                f'{extra_label}: {extra}',
+            )
+
+
+def replica_comparison_modes(conf, data=None):
+    """Enabled comparison modes that do not stratify or group by ExtraVariable."""
+    return [mode for mode in comparison_modes_for_run(conf, data) if mode not in _EXTRA_MODES]
+
+
+def iter_replica_runs(conf, data):
+    """Yield (extra_value, extra_slug, subset, replica_conf) for each specified extra.
+
+    replica_conf copies conf and sets effectiveComparisonModes to the non-extra
+    modes that still apply on that extra-variable subset.
+    """
+    data = ensure_factor_columns(data)
+    extras = specified_extra_values(data)
+    replica_modes = replica_comparison_modes(conf, data)
+    if not extras or not replica_modes:
+        return
+    extra_series = data['ExtraVariable'].astype(str)
+    for extra in extras:
+        subset = data[extra_series == str(extra)].copy()
+        if subset.empty:
+            continue
+        modes = [mode for mode in replica_modes if _mode_applicable_for_data(mode, subset, conf)]
+        if not modes:
+            continue
+        replica_conf = dict(conf)
+        replica_conf['effectiveComparisonModes'] = modes
+        yield extra, metric_slug(str(extra)), subset, replica_conf
 
 
 def log_auto_disabled_modes(conf, config_modes, effective_modes):
@@ -167,10 +279,8 @@ def _stratify_label(spec, conf):
     return spec['stratify_col']
 
 
-def _describe_averaging(conf):
-    if conf.get('averagePerPlantStats', False):
-        return 'Test values: mean per plant within each time interval, then compared across plants.'
-    return 'Test values: all hourly observations in each interval (no per-plant averaging).'
+def _describe_averaging():
+    return 'Test values: mean per plant within each time interval, then compared across plants.'
 
 
 def _resolve_stats_path(conf, module, metric_slug_name, mode, output_dir=None, metric=None,
@@ -202,10 +312,14 @@ def _usable_groups(values, min_groups=2):
     return groups if len(groups) >= min_groups else []
 
 
-def _average_per_plant(subdata, group_cols, plant_id_col, metric, conf):
-    if not conf.get('averagePerPlantStats', False):
+def _average_per_plant(subdata, group_cols, plant_id_col, metric):
+    """One mean per plant inside the rows already limited to one window."""
+    if plant_id_col not in subdata.columns:
         return subdata
     cols = [c for c in group_cols + [plant_id_col] if c in subdata.columns]
+    if metric in subdata.columns and not pd.api.types.is_numeric_dtype(subdata[metric]):
+        subdata = subdata.copy()
+        subdata[metric] = pd.to_numeric(subdata[metric], errors='coerce')
     return subdata.groupby(cols).mean(numeric_only=True).reset_index()
 
 
@@ -213,8 +327,8 @@ def _write_pairwise_block(f, subdata, metric, group_col, group_names, label_pref
     for i in range(len(group_names) - 1):
         for j in range(i + 1, len(group_names)):
             g1, g2 = group_names[i], group_names[j]
-            v1 = subdata[subdata[group_col].astype(str) == str(g1)][metric]
-            v2 = subdata[subdata[group_col].astype(str) == str(g2)][metric]
+            v1 = subdata[subdata[group_col].astype(str) == str(g1)][metric].dropna()
+            v2 = subdata[subdata[group_col].astype(str) == str(g2)][metric].dropna()
             prefix = f'{label_prefix}' if label_prefix else ''
             try:
                 if len(v1) == 0 or len(v2) == 0:
@@ -241,7 +355,7 @@ def run_pairwise_comparisons(f, subdata, metric, group_col, stratify_col=None,
     if stratify_col:
         group_cols = [stratify_col, group_col]
 
-    subdata = _average_per_plant(subdata, group_cols, plant_id_col, metric, conf)
+    subdata = _average_per_plant(subdata, group_cols, plant_id_col, metric)
 
     if stratify_col:
         strata = _usable_groups(subdata[stratify_col].unique())
@@ -269,10 +383,6 @@ def perform_temporal_pairwise_stats(conf, data, metric, output_dir=None, plant_i
                                     analysis_type='temporal', table_file_path=None):
     data = ensure_factor_columns(data)
     dt = int(conf['everyXhourField'])
-    max_hour = data['ElapsedTime (h)'].max()
-    if pd.isna(max_hour):
-        return
-    n_steps = int(round((max_hour + 1) / dt, 0))
 
     for mode in comparison_modes_for_run(conf, data):
         spec = _mode_spec(mode, conf=conf)
@@ -284,13 +394,12 @@ def perform_temporal_pairwise_stats(conf, data, metric, output_dir=None, plant_i
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
 
-            for step in range(n_steps):
-                end = int(min(dt * (step + 1), max_hour))
-                hours = np.arange(dt * step, end)
+            for start, end in elapsed_hour_windows(data, dt):
+                hours = np.arange(start, end)
                 subdata = data[data['ElapsedTime (h)'].isin(hours)]
-                f.write(f'Hours from {step * dt} to {end}\n')
+                f.write(f'Hours from {start} to {end}\n')
                 run_pairwise_comparisons(
                     f, subdata, metric,
                     group_col=spec['group_col'],
@@ -322,7 +431,7 @@ def perform_interval_pairwise_stats(conf, data, metric, output_dir, interval_col
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
 
             for interval in intervals:
                 subdata = data[data[interval_col].astype(str) == str(interval)]
@@ -356,7 +465,7 @@ def perform_scalar_pairwise_stats(conf, data, metric, output_dir, plant_id_col='
         with open(output_path, 'w') as f:
             f.write('Using Mann Whitney U test to compare groups\n')
             f.write(f"{spec['header']}\n")
-            f.write(f'{_describe_averaging(conf)}\n\n')
+            f.write(f'{_describe_averaging()}\n\n')
             run_pairwise_comparisons(
                 f, data, metric,
                 group_col=spec['group_col'],
@@ -373,6 +482,8 @@ def write_fourier_comparison_stats(f, subdata, group_col, metric, group_names, l
             g1, g2 = group_names[i], group_names[j]
             v1 = subdata[subdata[group_col].astype(str) == str(g1)][metric]
             v2 = subdata[subdata[group_col].astype(str) == str(g2)][metric]
+            v1 = v1.dropna()
+            v2 = v2.dropna()
             prefix = label_prefix
             try:
                 if len(v1) == 0 or len(v2) == 0:
@@ -410,7 +521,7 @@ def perform_fourier_pairwise_stats(conf, subdata, metric, f, plant_id_col='i', t
         cols = [compare_col]
         if spec['stratify_col']:
             cols = [spec['stratify_col'], compare_col]
-        if conf.get('averagePerPlantStats', False) and plant_id_col in subdata.columns:
+        if plant_id_col in subdata.columns:
             subdata = subdata.groupby(cols + [plant_id_col]).mean(numeric_only=True).reset_index()
 
         if spec['stratify_col']:

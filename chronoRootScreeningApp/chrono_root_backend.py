@@ -1,0 +1,81 @@
+"""Import chronoRootApp analysis modules without modifying that package.
+
+Screening and the standard app share this backend: put chronoRootApp on
+sys.path once, then import analysis.* and gui.stats_config_dialog as usual.
+"""
+
+import os
+import sys
+
+SCREENING_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CHRONOROOT_APP_DIR = os.path.abspath(
+    os.path.join(SCREENING_APP_DIR, '..', 'chronoRootApp')
+)
+# Screening stays first for screening-only modules (sort, robot_ids, ui_errors).
+# plant_viewer, calibration_helper, and analysis.qr come from chronoRootApp.
+for _path in (SCREENING_APP_DIR, CHRONOROOT_APP_DIR):
+    if _path in sys.path:
+        sys.path.remove(_path)
+sys.path.insert(0, SCREENING_APP_DIR)
+sys.path.insert(1, CHRONOROOT_APP_DIR)
+
+from analysis.dataWork import dataWork  # noqa: E402
+from analysis.report import (  # noqa: E402
+    generateTableTemporal,
+    performStatisticalAnalysis,
+    performStatisticalAnalysisForMetrics,
+    plot_individual_plant,
+    plot_info_all,
+)
+from analysis.stats_utils import (  # noqa: E402
+    ensure_factor_columns,
+    get_enabled_comparison_modes,
+    log_auto_disabled_modes,
+    perform_scalar_pairwise_stats,
+)
+from analysis.report_plots import emit_scalar_comparison_plots  # noqa: E402
+from analysis.fpca_analysis import performFPCA  # noqa: E402
+from analysis.fourier_analysis import makeFourierPlots  # noqa: E402
+from analysis.time_windows import (  # noqa: E402
+    apply_time_windows,
+    hourly_covers_analysis_period,
+    hourly_files_exist,
+    load_hourly_tables,
+    subtract_initial_stage,
+)
+from analysis.utils.fileUtilities import (  # noqa: E402
+    convertToPathSafe,
+    normalize_factor_value,
+    UNSPECIFIED_FACTOR,
+)
+from analysis.utils.metadata_schema import (  # noqa: E402
+    SCREENING_JOB_KIND,
+    SOURCE_SCREENING,
+    apply_load_aliases,
+    build_plant_record,
+    canonicalize_persisted,
+    dump_json,
+    load_json,
+    video_has_qr,
+    video_image_dir,
+)
+from analysis.utils.calibration_registry import (  # noqa: E402
+    DEFAULT_PIXEL_SIZE,
+    SOURCE_DEFAULT,
+    SOURCE_MANUAL,
+    SOURCE_QR,
+    SOURCE_REGISTRY,
+    apply_scale_to_plants,
+    compute_pixel_size,
+    get_calibration,
+    upsert_calibration,
+)
+from analysis.utils.report_paths import (  # noqa: E402
+    MODULE_TEMPORAL,
+    data_file,
+    metric_dir,
+    metric_slug,
+    purge_disabled_comparison_outputs,
+    report_root,
+    temporal_metric_slug,
+)

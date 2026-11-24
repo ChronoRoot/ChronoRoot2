@@ -322,7 +322,6 @@ def extract_hypocotyl_length(multi_class_mask):
     # Apply your cleanup pipeline
     skeleton_crop = trim(prune(skeleton_crop, 5))
     skeleton_crop = trim(prune(skeleton_crop, 3))
-    skeleton_crop = trim(prune(skeleton_crop, 3))
     
     # Place back into full frame
     full_skeleton = np.zeros_like(binary_mask)
@@ -348,10 +347,6 @@ def extract_skeleton(binary_mask):
     skeleton_crop = trim(skeleton_crop)
     
     # Second cleanup pass
-    skeleton_crop = prune(skeleton_crop, 3)  
-    skeleton_crop = trim(skeleton_crop)
-
-    # Third cleanup pass
     skeleton_crop = prune(skeleton_crop, 3)  
     skeleton_crop = trim(skeleton_crop)
     
@@ -385,28 +380,103 @@ def trim(ske): ## Removes unwanted pixels from the skeleton
     return ske
 
 
-def prune(skel, num_it): 
-    ## Removes branches with length lower than num_it
-    orig = skel
-    
-    # 1. Pruning loop using the relaxed PRUNE_KERNELS
-    for i in range(0, num_it):
-        current_skel = skel
-        for kernel in PRUNE_KERNELS:
-            hit = cv2.morphologyEx(current_skel, cv2.MORPH_HITMISS, kernel)
-            current_skel = cv2.subtract(current_skel, hit)
-        skel = current_skel
-        
-    # 2. Re-grow endpoints
-    end = endPoints(skel) # Still correctly uses EP_KERNELS under the hood
-    kernel_size = 3
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    
-    for i in range(0, num_it):
-        end = cv2.dilate(end, kernel)
-        end = cv2.bitwise_and(end, orig)
-        
-    return cv2.bitwise_or(end, skel)
+_RING = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+
+def _ring_components(sk, y, x):
+    """8-neighborhood foreground pixels grouped into connected branches."""
+    h, w = sk.shape
+    vals = []
+    for dy, dx in _RING:
+        yy, xx = y + dy, x + dx
+        if 0 <= yy < h and 0 <= xx < w and sk[yy, xx]:
+            vals.append((int(yy), int(xx)))
+        else:
+            vals.append(None)
+    if vals and all(v is not None for v in vals):
+        return [vals]
+    comps = []
+    cur = []
+    for v in vals:
+        if v is None:
+            if cur:
+                comps.append(cur)
+                cur = []
+        else:
+            cur.append(v)
+    if cur:
+        if comps and vals[0] is not None:
+            comps[0] = cur + comps[0]
+        else:
+            comps.append(cur)
+    return comps
+
+def _branch_counts(sk):
+    """How many separate branches leave each pixel (0 on background).
+
+    1 = tip, 2 = along a branch, 3 or more = junction.
+    Diagonal contacts that belong to the same branch count as one.
+    """
+    padded = np.pad(sk, 1, constant_values=0)
+    neighbors = (
+        padded[:-2, 1:-1],  # N
+        padded[:-2, 2:],    # NE
+        padded[1:-1, 2:],   # E
+        padded[2:, 2:],     # SE
+        padded[2:, 1:-1],   # S
+        padded[2:, :-2],    # SW
+        padded[1:-1, :-2],  # W
+        padded[:-2, :-2],   # NW
+    )
+    counts = np.zeros(sk.shape, np.uint8)
+    for i, nbr in enumerate(neighbors):
+        nxt = neighbors[(i + 1) % 8]
+        counts += (nbr == 0) & (nxt > 0)
+    counts[sk == 0] = 0
+    return counts
+
+def _follow_branch(sk, counts, tip, max_len):
+    """Pixels of the branch that starts at tip, excluding the junction.
+
+    Returns None when the branch is longer than max_len or never meets a junction.
+    """
+    path = [tip]
+    prev = None
+    cur = tip
+    while True:
+        comps = _ring_components(sk, cur[0], cur[1])
+        forward = [c for c in comps if prev is None or prev not in c]
+        if len(forward) != 1:
+            return None
+        step = forward[0]
+        if any(counts[pixel] >= 3 for pixel in step):
+            return path
+        if len(step) != 1 or len(path) >= max_len:
+            return None
+        prev, cur = cur, step[0]
+        path.append(cur)
+
+def prune(skel, num_it):
+    """Remove spurs of at most num_it pixels.
+
+    Each tip starts a branch. The branch is the pixels walked until the first
+    junction. A short branch is cleared and the junction stays, so two short
+    tips become one end. The main root and longer laterals are not touched.
+    """
+    sk = (np.asarray(skel) > 0).astype(np.uint8)
+    if num_it <= 0 or not np.any(sk):
+        return sk
+
+    counts = _branch_counts(sk)
+    tip_rows, tip_cols = np.where(counts == 1)
+    spurs = []
+    for y, x in zip(tip_rows.tolist(), tip_cols.tolist()):
+        branch = _follow_branch(sk, counts, (y, x), int(num_it))
+        if branch is not None:
+            spurs.extend(branch)
+
+    for y, x in spurs:
+        sk[y, x] = 0
+    return sk
 
 
 def endPoints(skel):

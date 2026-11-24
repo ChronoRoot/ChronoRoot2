@@ -54,7 +54,11 @@ def _looks_like_group_rois(data: Any) -> bool:
 
 
 def _looks_like_metadata(data: Any) -> bool:
-    return isinstance(data, dict) and 'status' in data and 'start_time' in data
+    if not isinstance(data, dict):
+        return False
+    if data.get('kind') == 'screening_job':
+        return True
+    return 'status' in data and 'start_time' in data
 
 
 def validate_setup_config(data: Any, path: str) -> Tuple[bool, str]:
@@ -97,32 +101,66 @@ def build_interface_config(analysis_tab) -> Dict[str, Any]:
             'seed_count': seed_count if seed_count is not None else '',
         })
 
-    return {
+    payload = {
         'config_kind': CONFIG_KIND,
         'config_version': CONFIG_VERSION,
         'user_video_path': analysis_tab.video_path_edit.text(),
         'project_dir': analysis_tab.proj_dir_edit.text(),
         'analysis_id': analysis_tab.identifier_edit.text().strip(),
-        'time_delta': analysis_tab.time_delta_edit.text(),
+        'PlateCondition': analysis_tab.plateConditionName.text(),
+        'ExtraVariable': analysis_tab.extraField.text(),
+        'timeStep': analysis_tab.time_delta_edit.text(),
         'add_time': analysis_tab.add_time_edit.text(),
         'germination_time_cut': analysis_tab.germination_time_edit.text(),
-        'has_qr': analysis_tab.qr_checkbox.isChecked(),
-        'known_distance': analysis_tab.known_dist_edit.text(),
-        'pixel_distance': analysis_tab.pixel_dist_edit.text(),
+        'videoHasQR': analysis_tab.qr_checkbox.isChecked(),
+        'knownDistance': getattr(analysis_tab, '_calib_known_default', '') or '',
+        'pixelDistance': getattr(analysis_tab, '_calib_pixel_default', '') or '',
         'germination_analysis': analysis_tab.germination_checkbox.isChecked(),
         'plant_growth_analysis': analysis_tab.plant_growth_checkbox.isChecked(),
         'show_tracking': analysis_tab.show_tracking_checkbox.isChecked(),
         'germination_each_video': analysis_tab.store_each_video_checkbox.isChecked(),
-        'metric_hypocotyl': analysis_tab.check_hypocotyl.isChecked(),
-        'metric_main_root': analysis_tab.check_main_root.isChecked(),
-        'metric_total_root': analysis_tab.check_total_root.isChecked(),
-        'metric_plant_area': analysis_tab.check_plant_area.isChecked(),
-        'metric_root_area': analysis_tab.check_root_area.isChecked(),
         'do_fpca': analysis_tab.fpca_checkbox.isChecked(),
         'fpca_components': analysis_tab.fpca_components_edit.text(),
         'normalize_fpca': analysis_tab.fpca_normalize_checkbox.isChecked(),
         'groups': groups,
     }
+    if hasattr(analysis_tab, 'current_rpi_cam'):
+        rpi, cam = analysis_tab.current_rpi_cam()
+        payload['rpi'] = rpi
+        payload['cam'] = cam
+    if hasattr(analysis_tab, 'everyXhourField'):
+        if hasattr(analysis_tab, 'exportSvg'):
+            payload['exportSvg'] = analysis_tab.exportSvg.isChecked()
+            payload['exportPdf'] = analysis_tab.exportPdf.isChecked()
+            payload['skipIndividualAnglePlots'] = analysis_tab.skipIndividualAnglePlots.isChecked()
+        payload['measureRelativeToInitial'] = analysis_tab.measureRelativeToInitial.isChecked()
+        payload['everyXhourField'] = analysis_tab.everyXhourField.text()
+        payload['everyXhourFieldFourier'] = analysis_tab.everyXhourFieldFourier.text()
+        payload['everyXhourFieldAngles'] = analysis_tab.everyXhourFieldAngles.text()
+        payload['doFourier'] = analysis_tab.doFourier.isChecked()
+        payload['genotypeAxisLabel'] = analysis_tab.genotypeAxisLabelField.text()
+        payload['plateConditionAxisLabel'] = analysis_tab.plateConditionAxisLabelField.text()
+        payload['extraVariableLabel'] = analysis_tab.extraVariableLabelField.text()
+        payload['timeSyncMode'] = getattr(analysis_tab, 'timeSyncMode', 'clock')
+        payload['timeDurationHours'] = getattr(analysis_tab, 'timeDurationHours', None)
+        payload['reportFolderName'] = getattr(analysis_tab, 'reportFolderName', 'Report')
+        payload['figureClockTicks'] = getattr(analysis_tab, 'figureClockTicks', ['00:00'])
+        payload['showFigureClockTicks'] = getattr(analysis_tab, 'showFigureClockTicks', True)
+        payload['timeGroups'] = getattr(analysis_tab, 'timeGroups', [])
+        payload['timePeriodSources'] = getattr(analysis_tab, 'timePeriodSources', [])
+        for name in (
+            'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
+            'statsByPlateCondition', 'statsByExtraVariable',
+            'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
+            'measureHypocotyl', 'measureMainRoot', 'measureTotalRoot',
+            'measureArea', 'measureDenseRoot', 'measureGermination',
+        ):
+            widget = getattr(analysis_tab, name, None)
+            if widget is not None:
+                payload[name] = widget.isChecked()
+        if getattr(analysis_tab, 'advanced_group', None) is not None:
+            payload['advancedComparisonModes'] = analysis_tab.advanced_group.isChecked()
+    return payload
 
 
 def _rebuild_groups(analysis_tab, groups: List[Dict[str, Any]]) -> None:
@@ -183,24 +221,40 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
         if analysis_id is not None:
             analysis_tab.identifier_edit.setText(str(analysis_id))
 
-        for widget, key, default in (
-            (analysis_tab.time_delta_edit, 'time_delta', ''),
-            (analysis_tab.add_time_edit, 'add_time', ''),
-            (analysis_tab.known_dist_edit, 'known_distance', ''),
-            (analysis_tab.pixel_dist_edit, 'pixel_distance', ''),
-            (analysis_tab.fpca_components_edit, 'fpca_components', '2'),
+        if hasattr(analysis_tab, 'plateConditionName'):
+            plate = data.get('PlateCondition', data.get('plateConditionName', ''))
+            extra = data.get('ExtraVariable', data.get('extraField', ''))
+            analysis_tab.plateConditionName.setText(str(plate or ''))
+            analysis_tab.extraField.setText(str(extra or ''))
+
+        for widget, keys, default in (
+            (analysis_tab.time_delta_edit, ('timeStep', 'time_delta'), ''),
+            (analysis_tab.add_time_edit, ('add_time',), ''),
+            (analysis_tab.fpca_components_edit, ('fpca_components',), '2'),
         ):
-            if key in data and data[key] is not None:
-                widget.setText(str(data[key]))
-            elif key not in data and default:
+            value = None
+            for key in keys:
+                if key in data and data[key] is not None:
+                    value = data[key]
+                    break
+            if value is not None:
+                widget.setText(str(value))
+            elif keys[0] not in data and default:
                 widget.setText(str(default))
+
+        known = data.get('knownDistance', data.get('known_distance'))
+        if known is not None:
+            analysis_tab._calib_known_default = str(known)
+        pixel = data.get('pixelDistance', data.get('pixel_distance'))
+        if pixel is not None:
+            analysis_tab._calib_pixel_default = str(pixel)
 
         if 'germination_time_cut' in data or 'germination_time' in data:
             germ_time = data.get('germination_time_cut', data.get('germination_time', ''))
             if germ_time is not None:
                 analysis_tab.germination_time_edit.setText(str(germ_time))
 
-        _set_checkbox_from_keys(analysis_tab.qr_checkbox, data, ('has_qr',))
+        _set_checkbox_from_keys(analysis_tab.qr_checkbox, data, ('videoHasQR', 'has_qr'))
         _set_checkbox_from_keys(analysis_tab.germination_checkbox, data, ('germination_analysis', 'do_germination'))
         _set_checkbox_from_keys(analysis_tab.plant_growth_checkbox, data, ('plant_growth_analysis', 'do_plant_growth'))
         _set_checkbox_from_keys(analysis_tab.show_tracking_checkbox, data, ('show_tracking',))
@@ -209,13 +263,71 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
             data,
             ('germination_each_video', 'germination-each-video'),
         )
-        _set_checkbox_from_keys(analysis_tab.check_hypocotyl, data, ('metric_hypocotyl',))
-        _set_checkbox_from_keys(analysis_tab.check_main_root, data, ('metric_main_root',))
-        _set_checkbox_from_keys(analysis_tab.check_total_root, data, ('metric_total_root',))
-        _set_checkbox_from_keys(analysis_tab.check_plant_area, data, ('metric_plant_area',))
-        _set_checkbox_from_keys(analysis_tab.check_root_area, data, ('metric_root_area',))
         _set_checkbox_from_keys(analysis_tab.fpca_checkbox, data, ('do_fpca',))
         _set_checkbox_from_keys(analysis_tab.fpca_normalize_checkbox, data, ('normalize_fpca',))
+
+        if hasattr(analysis_tab, 'everyXhourField'):
+            if hasattr(analysis_tab, 'exportSvg'):
+                if 'exportSvg' in data or 'exportPdf' in data:
+                    _set_checkbox_from_keys(analysis_tab.exportSvg, data, ('exportSvg',))
+                    _set_checkbox_from_keys(analysis_tab.exportPdf, data, ('exportPdf',))
+                else:
+                    legacy = str(data.get('figureFormat') or '').strip().lower()
+                    if legacy and not legacy.startswith('.'):
+                        legacy = '.' + legacy
+                    analysis_tab.exportSvg.setChecked(legacy == '.svg')
+                    analysis_tab.exportPdf.setChecked(legacy == '.pdf')
+                _set_checkbox_from_keys(
+                    analysis_tab.skipIndividualAnglePlots, data, ('skipIndividualAnglePlots',),
+                )
+            if getattr(analysis_tab, 'measureRelativeToInitial', None) is not None:
+                _set_checkbox_from_keys(
+                    analysis_tab.measureRelativeToInitial, data, ('measureRelativeToInitial',),
+                )
+            _set_checkbox_from_keys(analysis_tab.doFourier, data, ('doFourier',))
+            for widget, key in (
+                (analysis_tab.everyXhourField, 'everyXhourField'),
+                (analysis_tab.everyXhourFieldFourier, 'everyXhourFieldFourier'),
+                (analysis_tab.everyXhourFieldAngles, 'everyXhourFieldAngles'),
+                (analysis_tab.genotypeAxisLabelField, 'genotypeAxisLabel'),
+                (analysis_tab.plateConditionAxisLabelField, 'plateConditionAxisLabel'),
+                (analysis_tab.extraVariableLabelField, 'extraVariableLabel'),
+            ):
+                if key in data and data[key] is not None:
+                    widget.setText(str(data[key]))
+            for name in (
+                'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
+                'statsByPlateCondition', 'statsByExtraVariable',
+                'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
+                'measureHypocotyl', 'measureMainRoot', 'measureTotalRoot',
+                'measureArea', 'measureDenseRoot', 'measureGermination',
+            ):
+                widget = getattr(analysis_tab, name, None)
+                if widget is not None:
+                    _set_checkbox_from_keys(widget, data, (name,))
+            if getattr(analysis_tab, 'advanced_group', None) is not None:
+                _set_checkbox_from_keys(
+                    analysis_tab.advanced_group, data, ('advancedComparisonModes',),
+                )
+            if 'timeSyncMode' in data:
+                analysis_tab.timeSyncMode = data.get('timeSyncMode') or 'clock'
+            if 'timeDurationHours' in data:
+                analysis_tab.timeDurationHours = data.get('timeDurationHours')
+            if 'reportFolderName' in data:
+                analysis_tab.reportFolderName = data.get('reportFolderName') or 'Report'
+            if 'figureClockTicks' in data:
+                analysis_tab.figureClockTicks = data.get('figureClockTicks') or ['00:00']
+            if 'showFigureClockTicks' in data:
+                analysis_tab.showFigureClockTicks = bool(data.get('showFigureClockTicks'))
+            else:
+                mode = getattr(analysis_tab, 'timeSyncMode', 'clock')
+                analysis_tab.showFigureClockTicks = mode != 'anchor'
+            if 'timeGroups' in data:
+                analysis_tab.timeGroups = data.get('timeGroups') or []
+            if 'timePeriodSources' in data:
+                analysis_tab.timePeriodSources = data.get('timePeriodSources') or []
+            else:
+                analysis_tab.timePeriodSources = []
 
         groups = data.get('groups')
         if groups is None and 'group_names' in data:
@@ -232,6 +344,8 @@ def apply_interface_config(analysis_tab, data: Dict[str, Any]) -> None:
         analysis_tab.toggle_calibration_mode()
         analysis_tab.toggle_plant_growth_options()
         analysis_tab.on_project_dir_changed()
+        if hasattr(analysis_tab, '_remember_auto_identifier'):
+            analysis_tab._remember_auto_identifier()
     finally:
         for widget in signal_widgets:
             widget.blockSignals(False)

@@ -16,10 +16,18 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import json
 import pathlib
 import re
 import os
 import shutil
+
+from .metadata_schema import (
+    SOURCE_SINGLE_PLANT,
+    apply_load_aliases,
+    build_plant_record,
+    dump_json,
+)
 
 def natural_key(string_):
     """See http://www.codinghorror.com/blog/archives/001018.html"""
@@ -45,15 +53,28 @@ def convertFromPathSafe(name):
     return name
 
 
+def result_dir_index(path):
+    """Numeric suffix of a Results_<n> directory, or None."""
+    match = re.fullmatch(r'Results_(\d+)', os.path.basename(os.path.normpath(path or '')))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def list_result_dirs(plant_path):
-    """Return all Results_* directories under a plant slot, naturally sorted."""
+    """Return Results_<n> directories under a plant slot, lowest index first."""
     if not plant_path or not os.path.isdir(plant_path):
         return []
-    return loadPath(plant_path, 'Results_*')
+    found = []
+    for path in loadPath(plant_path, 'Results_*'):
+        if os.path.isdir(path) and result_dir_index(path) is not None:
+            found.append(path)
+    found.sort(key=result_dir_index)
+    return found
 
 
 def get_latest_result_dir(plant_path):
-    """Return the latest Results_* folder for a plant slot, or None."""
+    """Return the highest-numbered Results_<n> folder for a plant slot, or None."""
     results = list_result_dirs(plant_path)
     return results[-1] if results else None
 
@@ -75,6 +96,50 @@ def plant_slot_has_finished_analysis(conf):
         if os.path.exists(log_path):
             return True
     return False
+
+
+def processing_limit_frame_count(conf):
+    """Frame cap for an N-day limit, including the closing hour.
+
+    N days of frames end one capture hour early, because hour 0 uses a full
+    hour of pictures. The extra hour of frames is what reaches hour N*24.
+    """
+    limit = (conf or {}).get('processingLimit', None)
+    if limit in (None, '', 0, '0'):
+        return None
+    try:
+        days = int(round(float(limit)))
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    try:
+        time_step = int((conf or {}).get('timeStep') or 15)
+    except (TypeError, ValueError):
+        time_step = 15
+    if time_step <= 0:
+        time_step = 15
+    frames_per_day = (24 * 60) // time_step
+    frames_per_hour = max(1, int(round(60.0 / float(time_step))))
+    return days * frames_per_day + frames_per_hour
+
+
+def expected_hourly_rows(n_frames, time_step):
+    """How many hourly bins a processing-limit frame cap should produce."""
+    try:
+        step = float(time_step)
+    except (TypeError, ValueError):
+        step = 15.0
+    if step <= 0:
+        step = 15.0
+    frames_per_hour = max(1, int(round(60.0 / step)))
+    try:
+        n_frames = int(n_frames)
+    except (TypeError, ValueError):
+        return None
+    if n_frames <= 0:
+        return None
+    return (n_frames + frames_per_hour - 1) // frames_per_hour
 
 
 def cleanup_superseded_results(plant_path, keep_result_path):
@@ -111,12 +176,21 @@ def createSaveFolder(conf):
     plant_path = os.path.join(cam_path, plant)
     os.makedirs(plant_path, exist_ok=True)
     
-    # Create the folder for the results
-    for j in range(0, 50):
-        result_path = os.path.join(plant_path, 'Results_%s'%j)
+    # Always take the next index after the highest Results_<n> already
+    # present. Reusing a lower free number (Results_0 while Results_2 still
+    # exists) makes the new run invisible: the app treats the highest index
+    # as the current one.
+    next_index = 0
+    for result_dir in list_result_dirs(plant_path):
+        number = result_dir_index(result_dir)
+        if number is not None:
+            next_index = max(next_index, number + 1)
+    while True:
+        result_path = os.path.join(plant_path, 'Results_%s' % next_index)
         if not os.path.exists(result_path):
             os.makedirs(result_path)
             break
+        next_index += 1
     
     # create folders for outputs
     graphsPath = os.path.join(result_path, 'Graphs')
@@ -124,14 +198,8 @@ def createSaveFolder(conf):
     
     imagePath = os.path.join(result_path, 'Images')
     os.makedirs(imagePath, exist_ok=True)
-    
-    outSegPath = os.path.join(imagePath, 'Seg')
-    os.makedirs(outSegPath, exist_ok=True)
-        
-    multiPath = os.path.join(imagePath, 'SegMulti')
-    os.makedirs(multiPath, exist_ok=True)
-    
-    if conf['saveImages']:
+
+    if conf.get('saveImages'):
         inPath = os.path.join(imagePath, 'Input')
         os.makedirs(inPath, exist_ok=True)
 
@@ -143,38 +211,136 @@ def createSaveFolder(conf):
 
     return paths
 
+def resolve_existing_dir(path):
+    """Stored directory path with a leading ~ expanded.
+
+    The path is whatever the project metadata recorded. Nothing here rewrites
+    it for a particular machine or mount.
+    """
+    if not path:
+        return ""
+    return os.path.expanduser(str(path))
+
+
+def _candidate_dirs(conf):
+    folders = []
+    for key in ("ImagePath", "Images"):
+        folder = resolve_existing_dir((conf or {}).get(key) or "")
+        if folder and folder not in folders:
+            folders.append(folder)
+    return folders
+
+
+def find_named_video_png(conf, filename):
+    """One camera PNG, without listing the whole directory.
+
+    Listing every PNG is slow when the camera folder is on another disk,
+    and the overlay only needs the frame named in the local results.
+    """
+    name = os.path.basename(str(filename or ""))
+    if not name:
+        return ""
+    for folder in _candidate_dirs(conf):
+        candidate = os.path.join(folder, name)
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    for folder in _candidate_dirs(conf):
+        metadata_path = os.path.join(folder, "Segmentation", "segmentation_metadata.json")
+        if not os.path.isfile(metadata_path):
+            continue
+        try:
+            with open(metadata_path, "r") as handle:
+                metadata = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            continue
+        images_path = resolve_existing_dir(metadata.get("input_path") or "")
+        if not images_path:
+            continue
+        candidate = os.path.join(images_path, name)
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    return ""
+
+
+def list_video_pngs(conf):
+    """Camera PNG paths, including segmentation_metadata.json input_path fallback."""
+    folders = _candidate_dirs(conf)
+    images = []
+    image_path = folders[0] if folders else ""
+    for folder in folders:
+        if os.path.isdir(folder):
+            found = loadPath(folder, ext="*.png")
+            if found:
+                return found, folder
+    for folder in folders:
+        metadata_path = os.path.join(folder, "Segmentation", "segmentation_metadata.json")
+        if not os.path.isfile(metadata_path):
+            continue
+        try:
+            with open(metadata_path, "r") as handle:
+                metadata = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            continue
+        images_path = resolve_existing_dir(metadata.get("input_path") or "")
+        if images_path and os.path.isdir(images_path):
+            found = loadPath(images_path, ext="*.png")
+            if found:
+                return found, images_path
+    return images, image_path
+
+
+def _segmentation_files(conf):
+    """Ensemble (or legacy Seg) masks, searched from every stored data path."""
+    for folder in _candidate_dirs(conf):
+        ensemble = os.path.join(folder, "Segmentation", "Ensemble")
+        legacy = os.path.join(folder, "Seg")
+        for seg_path in (ensemble, legacy):
+            if not os.path.isdir(seg_path):
+                continue
+            files = loadPath(seg_path, ext="*.png")
+            if files:
+                return files, folder, seg_path
+    return [], "", ""
+
+
+def _pair_frames(images, segmentations):
+    """Keep image order and attach the segmentation with the same file stem."""
+    by_stem = {}
+    for path in segmentations:
+        by_stem[os.path.splitext(os.path.basename(path))[0]] = path
+    paired_images = []
+    paired_segs = []
+    missing = 0
+    for image in images:
+        stem = os.path.splitext(os.path.basename(image))[0]
+        seg = by_stem.get(stem)
+        if seg is None:
+            missing += 1
+            continue
+        paired_images.append(image)
+        paired_segs.append(seg)
+    if missing:
+        print(f"Warning: {missing} images have no segmentation mask and were left out")
+    return paired_images, paired_segs
+
+
 def getImages(conf):
-    # Get the list of images    
-    images = loadPath(conf['Images'], ext = "*.png") 
+    images, image_path = list_video_pngs(conf)
+    conf["ImagePath"] = image_path or resolve_existing_dir(conf.get("Images") or "") or ""
 
-    conf['ImagePath'] = conf['Images']
-                
-    # Check if there is no images, then look for a file called "segmentation_metadata.json"
-    if len(images) == 0:
-        metadata_path = os.path.join(conf['Images'], 'Segmentation', 'segmentation_metadata.json')
-        #print("No images found in the specified folder. Looking for segmentation metadata file at: ", metadata_path)
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            images_path = metadata.get('input_path', None)
-            if images_path and os.path.exists(images_path):
-                images = loadPath(images_path, ext="*.png")
-                conf['ImagePath'] = images_path
-    
-    # Get the list of segmentation images
-    SegPath = os.path.join(conf['Images'], 'Segmentation', 'Ensemble')
-    if not os.path.exists(SegPath):
-        SegPath = os.path.join(conf['Images'], 'Seg')
-    
-    segFiles = loadPath(SegPath, ext = "*.png") 
+    seg_files, seg_root, seg_path = _segmentation_files(conf)
+    if seg_root:
+        conf["Images"] = seg_root
+    conf["SegPath"] = seg_path
 
-    # Save configuration
-    
-    conf['SegPath'] = SegPath
-        
-    return images, segFiles
+    return _pair_frames(images, seg_files)
 
-import json
 
 UNSPECIFIED_FACTOR = "unspecified"
 
@@ -192,7 +358,7 @@ def load_result_metadata(res_folder):
         return {}
     try:
         with open(meta_path, 'r') as f:
-            return json.load(f)
+            return apply_load_aliases(json.load(f))
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -200,7 +366,10 @@ def load_result_metadata(res_folder):
 def attach_plant_metadata_columns(data, meta, rpi_name=None, cam_name=None, plant_name=None,
                                   experiment_fallback=None):
     """Attach experiment and grouping columns from per-plant metadata."""
-    experiment = meta.get('Experiment', experiment_fallback)
+    if experiment_fallback is not None:
+        experiment = experiment_fallback
+    else:
+        experiment = meta.get('Experiment')
     if experiment is not None:
         data['Experiment'] = experiment
     data['PlateCondition'] = normalize_factor_value(meta.get('PlateCondition', ''))
@@ -220,20 +389,9 @@ def build_plant_id(rpi_name, cam_name, plant_name, extra_variable=None):
 
 
 def saveMetadata(bbox, seed, conf):
-    metadata = {}
-    metadata['bounding box'] = bbox
-    metadata['seed'] = seed
-
-    # combine metadata and conf
-    metadata.update(conf)
-
-    metapath = os.path.join(metadata['folders']['result'], 'metadata.json')
-
-    with open(metapath, 'w') as fp:
-        json.dump(metadata, fp)
-
-    metapath = os.path.join(metadata['MainFolder'], 'lastAnalysis.json')
-    with open(metapath, 'w') as fp:
-        json.dump(metadata, fp)
-
-    return metadata
+    """Write slim plant metadata; return conf so the running job keeps in-memory paths."""
+    conf['bounding_box'] = bbox
+    conf['seed'] = seed
+    record = build_plant_record(conf, source=SOURCE_SINGLE_PLANT)
+    dump_json(os.path.join(conf['folders']['result'], 'metadata.json'), record)
+    return conf

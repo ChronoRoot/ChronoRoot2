@@ -4,3 +4,6 @@
 *local.sh
 *.ipynb
 Docker/.gitignore
+tests*
+.cursor*
+/plot_gallery/

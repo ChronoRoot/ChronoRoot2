@@ -1,8 +1,8 @@
-# ChronoRoot 2.0 - Segmentation Module
+# ChronoRoot 2.1 - Segmentation Module
 
 [![Hugging Face Models](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/ngaggion/models)
 
-This directory contains the AI-powered segmentation module for ChronoRoot 2.0, designed to automatically identify plant root structures from images.
+This directory contains the AI-powered segmentation module for ChronoRoot 2.1, designed to automatically identify plant root structures from images.
 
 ## Overview
 
@@ -25,17 +25,10 @@ segmentationApp/
 ├── cli.py                    # Command-line interface for quick processing
 ├── config.json               # Stores user settings (Conda env, alpha, etc.)
 ├── download_weights.sh       # SCRIPT: Syncs model weights from Hugging Face
-├── models/                   # Contains pre-trained nnUNet models
-│   ├── Arabidopsis/          # (Populated after running download_weights.sh)
-│   │   ├── dataset.json
-│   │   ├── plans.json
-│   │   └── fold_0/
-│   │       └── checkpoint_final.pth
-│   └── Tomato/
-│       ├── dataset.json
-│       ├── plans.json
-│       └── fold_0/
-│           └── checkpoint_final.pth
+├── models/                   # Pre-trained nnUNet models (via download_weights.sh)
+│   ├── Arabidopsis/          # Arabidopsis-only weights (SCNP-trained update)
+│   ├── MultiPlant/           # Arabidopsis + tomato + Medicago (petiole→aerial)
+│   └── Tomato/               # Tomato-only weights
 ├── nnUNet_wrapper.py         # Internal script for nnUNet
 ├── postprocess.py            # Script for temporal post-processing
 ├── README.md                 # This file
@@ -73,7 +66,12 @@ chmod +x download_weights.sh
 
 ```
 
-This script handles the connection to Hugging Face, checks for newer versions of the models, and places them correctly into the `models/` directory.
+This script lists Hugging Face repos under `ngaggion/ChronoRoot2-*` (including **MultiPlant**), downloads or updates them into `models/`, and ignores weight files via `.gitignore`.
+
+Official weights:
+* [Arabidopsis](https://huggingface.co/ngaggion/ChronoRoot2-Arabidopsis)
+* [MultiPlant](https://huggingface.co/ngaggion/ChronoRoot2-MultiPlant) — Arabidopsis, tomato, and Medicago; petiole merged into the aerial class
+* [Tomato](https://huggingface.co/ngaggion/ChronoRoot2-Tomato)
 
 ---
 

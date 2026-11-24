@@ -1,0 +1,517 @@
+"""Per-video plate scale (pixel_size) registry under a project folder.
+
+Keyed by absolute ImagePath: each video folder is a distinct imaging geometry.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from collections import defaultdict
+
+from .fileUtilities import get_latest_result_dir
+from .metadata_schema import (
+    apply_load_aliases,
+    dump_json,
+    load_json,
+    video_image_dir,
+)
+
+REGISTRY_FILENAME = "calibrations.json"
+SCHEMA_VERSION = 1
+DEFAULT_PIXEL_SIZE = 0.04
+
+SOURCE_EXISTING = "existing"
+SOURCE_REGISTRY = "registry"
+SOURCE_MANUAL_PROJECT = "manual_project"
+SOURCE_MANUAL = "manual"
+SOURCE_QR = "qr"
+SOURCE_DEFAULT = "default"
+SOURCE_MISMATCH = "mismatch"
+
+STATUS_OK_MANUAL = "ok_manual"
+STATUS_OK_QR = "ok_qr"
+STATUS_OK_EXISTING = "ok_existing"
+STATUS_MISSING = "missing"
+STATUS_DEFAULT = "default_fallback"
+STATUS_MISMATCH = "mismatch"
+STATUS_REGISTRY_ONLY = "registry_only"
+
+
+def normalize_image_path(path):
+    """Absolute path; prefer realpath so symlink aliases (home/net) share one key."""
+    if not path:
+        return ""
+    expanded = os.path.abspath(os.path.expanduser(str(path)))
+    if os.path.exists(expanded):
+        try:
+            return os.path.realpath(expanded)
+        except OSError:
+            return expanded
+    return expanded
+
+
+def resolve_calibration_image_path(image_path):
+    """
+    Canonical video folder for ``calibrations.json`` keys.
+
+    Uses the same PNG discovery as preview: if the selected folder only has
+    Segmentation on a read-write disk, ``input_path`` in
+    ``segmentation_metadata.json`` points at the read-only image folder, and
+    that image folder is the registry key. Data vs Experiments are not treated
+    as path aliases; metadata bridges them.
+    """
+    from .fileUtilities import list_video_pngs
+
+    if not image_path:
+        return ""
+    _images, resolved = list_video_pngs({"Images": image_path})
+    if resolved and os.path.isdir(resolved):
+        return normalize_image_path(resolved)
+    return normalize_image_path(image_path)
+
+
+def registry_path(project_dir):
+    return os.path.join(project_dir, REGISTRY_FILENAME)
+
+
+def empty_registry():
+    return {"schema_version": SCHEMA_VERSION, "by_image_path": {}}
+
+
+def load_registry(project_dir):
+    path = registry_path(project_dir)
+    if not os.path.isfile(path):
+        return empty_registry()
+    try:
+        data = load_json(path)
+    except (OSError, ValueError):
+        return empty_registry()
+    if not isinstance(data, dict):
+        return empty_registry()
+    by_path = data.get("by_image_path")
+    if not isinstance(by_path, dict):
+        by_path = {}
+    return {
+        "schema_version": int(data.get("schema_version") or SCHEMA_VERSION),
+        "by_image_path": by_path,
+    }
+
+
+def save_registry(project_dir, registry):
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "by_image_path": dict((registry or {}).get("by_image_path") or {}),
+    }
+    dump_json(registry_path(project_dir), payload)
+
+
+def _lookup_registry_entry(by_path, image_path, *, resolve_cache=None):
+    """Match by resolved PNG folder (and legacy keys that resolve to it)."""
+    if not isinstance(by_path, dict) or not image_path:
+        return None, ""
+
+    def resolve(path):
+        if resolve_cache is not None and path in resolve_cache:
+            return resolve_cache[path]
+        value = resolve_calibration_image_path(path)
+        if resolve_cache is not None:
+            resolve_cache[path] = value
+        return value
+
+    key = resolve(image_path)
+    if key and key in by_path and isinstance(by_path[key], dict):
+        return dict(by_path[key]), key
+
+    raw = str(image_path).strip()
+    raw_key = normalize_image_path(raw)
+    if raw_key and raw_key in by_path and isinstance(by_path[raw_key], dict):
+        return dict(by_path[raw_key]), key or raw_key
+    if raw and raw in by_path and isinstance(by_path[raw], dict):
+        return dict(by_path[raw]), key or raw_key or raw
+
+    # Legacy entries saved under a RW video folder whose PNGs live elsewhere.
+    if key:
+        for stored_key, entry in by_path.items():
+            if not isinstance(entry, dict):
+                continue
+            if resolve(stored_key) == key:
+                return dict(entry), key
+    return None, key
+
+
+def get_calibration(project_dir, image_path):
+    if not image_path:
+        return None
+    entry, _matched = _lookup_registry_entry(
+        load_registry(project_dir).get("by_image_path", {}), image_path,
+    )
+    return entry
+
+
+def compute_pixel_size(known_distance, pixel_distance):
+    known = float(known_distance)
+    pixels = float(pixel_distance)
+    if known <= 0 or pixels <= 0:
+        raise ValueError("knownDistance and pixelDistance must be positive")
+    return known / pixels
+
+
+def upsert_calibration(
+    project_dir,
+    image_path,
+    *,
+    pixel_size,
+    source,
+    known_distance=None,
+    pixel_distance=None,
+):
+    key = resolve_calibration_image_path(image_path)
+    if not key or not project_dir:
+        return None
+    registry = load_registry(project_dir)
+    entry = {
+        "pixel_size": float(pixel_size),
+        "source": str(source),
+        "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    if known_distance is not None and str(known_distance).strip() != "":
+        entry["knownDistance"] = float(known_distance)
+    if pixel_distance is not None and str(pixel_distance).strip() != "":
+        entry["pixelDistance"] = int(float(pixel_distance))
+    by_path = registry.setdefault("by_image_path", {})
+    # Drop legacy keys that resolve to the same PNG folder so Review stays clean.
+    for stored_key in list(by_path.keys()):
+        if stored_key == key:
+            continue
+        if resolve_calibration_image_path(stored_key) == key:
+            by_path.pop(stored_key, None)
+    by_path[key] = entry
+    save_registry(project_dir, registry)
+    return entry
+
+
+def scale_matches_fields(entry, known_distance, pixel_distance, tol=1e-6):
+    """True if registry entry matches the given manual known/pixel fields."""
+    if not entry:
+        return False
+    try:
+        known = float(known_distance)
+        pixels = int(float(pixel_distance))
+    except (TypeError, ValueError):
+        return False
+    if "knownDistance" in entry and "pixelDistance" in entry:
+        try:
+            return (
+                abs(float(entry["knownDistance"]) - known) <= tol
+                and int(float(entry["pixelDistance"])) == pixels
+            )
+        except (TypeError, ValueError):
+            return False
+    if "pixel_size" not in entry:
+        return False
+    try:
+        expected = known / float(pixels)
+        return abs(float(entry["pixel_size"]) - expected) <= max(tol, abs(expected) * 1e-6)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
+def manual_scale_warning(project_dir, image_path, known_distance, pixel_distance):
+    """
+    Return a warning string if manual plate scale is missing or mismatched
+    for this video, else None.
+    """
+    key = normalize_image_path(image_path)
+    if not key:
+        return (
+            "No video folder is set, so plate scale cannot be checked against "
+            "a saved per-video estimate."
+        )
+    entry = get_calibration(project_dir, key)
+    if entry is None:
+        return (
+            f"No saved plate scale for this video:\n{key}\n\n"
+            "Camera-to-plate distance can change between videos. "
+            "Use the calibration helper (or enter known mm / pixels) for this "
+            "video before analyzing, or continue anyway."
+        )
+    if not scale_matches_fields(entry, known_distance, pixel_distance):
+        return (
+            f"The known/pixel values do not match the saved plate scale for:\n{key}\n\n"
+            "Continue only if you intentionally changed the estimate for this video."
+        )
+    return None
+
+
+def apply_scale_to_plants(
+    plant_paths,
+    pixel_size,
+    *,
+    source,
+    known_distance=None,
+    pixel_distance=None,
+):
+    """Write pixel_size (+ source) into each plant's latest Results metadata."""
+    updated = 0
+    for plant_path in plant_paths:
+        result_dir = get_latest_result_dir(plant_path)
+        if result_dir is None:
+            continue
+        meta_path = os.path.join(result_dir, "metadata.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            meta = apply_load_aliases(load_json(meta_path))
+        except (OSError, ValueError):
+            continue
+        meta["pixel_size"] = float(pixel_size)
+        meta["calibration_source"] = str(source)
+        if known_distance is not None and str(known_distance).strip() != "":
+            meta["knownDistance"] = float(known_distance)
+        if pixel_distance is not None and str(pixel_distance).strip() != "":
+            meta["pixelDistance"] = int(float(pixel_distance))
+        dump_json(meta_path, meta)
+        updated += 1
+    return updated
+
+
+def _load_latest_metadata(plant_path):
+    result_dir = get_latest_result_dir(plant_path)
+    if result_dir is None:
+        return None, None
+    meta_path = os.path.join(result_dir, "metadata.json")
+    if not os.path.isfile(meta_path):
+        return result_dir, None
+    try:
+        return result_dir, apply_load_aliases(load_json(meta_path))
+    except (OSError, ValueError):
+        return result_dir, None
+
+
+def plate_key_from_meta(meta, plant_path):
+    """Same ImagePath + rpi + cam share plate scale across Experiments."""
+    image_path = video_image_dir(meta) if meta else ""
+    if meta and image_path:
+        rpi = str(meta.get("rpi", ""))
+        cam = str(meta.get("cam", ""))
+        if not cam:
+            cam = os.path.basename(os.path.dirname(plant_path))
+        if not rpi:
+            rpi = os.path.basename(os.path.dirname(os.path.dirname(plant_path)))
+        return (normalize_image_path(image_path), rpi, cam)
+    cam_dir = os.path.dirname(plant_path)
+    return (os.path.abspath(cam_dir),)
+
+
+def collect_plate_groups(analysis_root, *, require_raw_csv=False):
+    """
+    Walk Analysis/*/*/*/* and group plant slots by shared video/plate key.
+
+    Returns dict: plate_key -> list of plant_path
+    """
+    import pathlib
+
+    groups = defaultdict(list)
+    if not analysis_root or not os.path.isdir(analysis_root):
+        return groups
+
+    plant_slots = sorted(
+        str(p) for p in pathlib.Path(analysis_root).glob("*/*/*/*") if p.is_dir()
+    )
+    for plant_path in plant_slots:
+        result_dir, meta = _load_latest_metadata(plant_path)
+        if result_dir is None:
+            continue
+        if require_raw_csv:
+            raw = os.path.join(result_dir, "Results_raw.csv")
+            if not os.path.isfile(raw):
+                continue
+        key = plate_key_from_meta(meta, plant_path)
+        groups[key].append(plant_path)
+    return groups
+
+
+def _status_from_sources(sources, pixel_sizes, registry_entry):
+    unique_sizes = {round(float(v), 8) for v in pixel_sizes if v is not None}
+    if len(unique_sizes) > 1:
+        return STATUS_MISMATCH
+    if SOURCE_DEFAULT in sources:
+        return STATUS_DEFAULT
+    if SOURCE_MISMATCH in sources:
+        return STATUS_MISMATCH
+    if not unique_sizes and not registry_entry:
+        return STATUS_MISSING
+    if not unique_sizes:
+        # Registry-only (not yet written to plants)
+        reg_src = (registry_entry or {}).get("source")
+        if reg_src == SOURCE_QR:
+            return STATUS_OK_QR
+        if reg_src in (SOURCE_MANUAL, SOURCE_MANUAL_PROJECT):
+            return STATUS_OK_MANUAL
+        return STATUS_MISSING if not registry_entry else STATUS_OK_EXISTING
+    if SOURCE_QR in sources or (registry_entry or {}).get("source") == SOURCE_QR:
+        return STATUS_OK_QR
+    if SOURCE_MANUAL in sources or SOURCE_MANUAL_PROJECT in sources:
+        return STATUS_OK_MANUAL
+    if (registry_entry or {}).get("source") == SOURCE_MANUAL:
+        return STATUS_OK_MANUAL
+    return STATUS_OK_EXISTING
+
+
+def _row_from_parts(
+    image_path,
+    rpi,
+    cam,
+    plant_paths,
+    registry_entry,
+    *,
+    force_registry_only=False,
+):
+    pixel_sizes = []
+    sources = []
+    for plant_path in plant_paths:
+        _result_dir, meta = _load_latest_metadata(plant_path)
+        if not meta:
+            continue
+        if "pixel_size" in meta:
+            try:
+                pixel_sizes.append(float(meta["pixel_size"]))
+            except (TypeError, ValueError):
+                pass
+        src = meta.get("calibration_source")
+        if src:
+            sources.append(str(src))
+    unique_sizes = sorted({round(float(v), 8) for v in pixel_sizes})
+    display_size = unique_sizes[0] if len(unique_sizes) == 1 else (
+        None if not unique_sizes else unique_sizes[0]
+    )
+    if registry_entry and display_size is None:
+        try:
+            display_size = float(registry_entry.get("pixel_size"))
+        except (TypeError, ValueError):
+            display_size = None
+    if len(unique_sizes) > 1:
+        source = SOURCE_MISMATCH
+    elif sources:
+        non_default = [s for s in sources if s != SOURCE_DEFAULT]
+        source = non_default[0] if non_default else sources[0]
+        if len(set(sources)) > 1 and SOURCE_DEFAULT in sources:
+            source = SOURCE_MISMATCH if len(unique_sizes) > 1 else source
+    elif registry_entry:
+        source = str(registry_entry.get("source") or SOURCE_REGISTRY)
+    else:
+        source = ""
+    status = _status_from_sources(sources, pixel_sizes, registry_entry)
+    if force_registry_only or (not plant_paths and registry_entry):
+        status = STATUS_REGISTRY_ONLY
+    return {
+        "image_path": image_path,
+        "rpi": rpi or "",
+        "cam": cam or "",
+        "plant_paths": list(plant_paths),
+        "plant_count": len(plant_paths),
+        "pixel_size": display_size,
+        "source": source,
+        "status": status,
+        "registry_entry": dict(registry_entry) if registry_entry else None,
+        "pixel_sizes": pixel_sizes,
+    }
+
+
+def list_plate_statuses(project_dir, current_image_path=None):
+    """
+    Return a list of plate status dicts for the Plates & scale dialog.
+
+    Includes registry-only keys (no Analysis plants yet) and optionally the
+    caller's current video so first-time calibrate works from Review.
+
+    Each item: image_path, rpi, cam, plant_paths, plant_count, pixel_size,
+    source, status, registry_entry
+    """
+    analysis_root = os.path.join(project_dir, "Analysis")
+    groups = collect_plate_groups(analysis_root, require_raw_csv=False)
+    registry = load_registry(project_dir)
+    by_path = registry.get("by_image_path") or {}
+    resolve_cache = {}
+    rows = []
+    seen_paths = set()
+    for plate_key in sorted(groups.keys(), key=lambda k: str(k)):
+        plant_paths = groups[plate_key]
+        if len(plate_key) >= 3:
+            image_path, rpi, cam = plate_key[0], plate_key[1], plate_key[2]
+        else:
+            image_path, rpi, cam = plate_key[0], "", ""
+        nkey = resolve_calibration_image_path(image_path) or normalize_image_path(image_path)
+        registry_entry, matched = _lookup_registry_entry(
+            by_path, image_path, resolve_cache=resolve_cache,
+        )
+        rows.append(_row_from_parts(
+            matched or nkey or image_path, rpi, cam, plant_paths, registry_entry,
+        ))
+        for candidate in (nkey, matched, normalize_image_path(image_path)):
+            if candidate:
+                seen_paths.add(candidate)
+
+    for key, entry in sorted(by_path.items()):
+        resolved = resolve_calibration_image_path(key)
+        nkey = resolved or normalize_image_path(key)
+        if not nkey or nkey in seen_paths:
+            continue
+        if not isinstance(entry, dict):
+            entry = None
+        rows.append(
+            _row_from_parts(nkey, "", "", [], entry, force_registry_only=True)
+        )
+        seen_paths.add(nkey)
+
+    if current_image_path:
+        nkey = resolve_calibration_image_path(current_image_path) or normalize_image_path(
+            current_image_path,
+        )
+        if nkey and nkey not in seen_paths:
+            entry, matched = _lookup_registry_entry(
+                by_path, current_image_path, resolve_cache=resolve_cache,
+            )
+            rows.append(
+                _row_from_parts(
+                    matched or nkey, "", "", [], entry,
+                    force_registry_only=bool(entry),
+                )
+            )
+    return rows
+
+
+def try_qr_pixel_size(image_path, max_frames=1):
+    """
+    Scan the first N frames for a QR scale marker (same logic as postprocess).
+
+    Default is one frame: QR decode with gamma sweeps is expensive on large
+    network-backed PNGs, and scanning many frames felt like a hang.
+
+    Uses the same PNG discovery as preview (``list_video_pngs``), including
+    ``Segmentation/segmentation_metadata.json`` → ``input_path`` when frames
+    live outside the selected video folder.
+
+    Returns (pixel_size, detail) on success, or (None, detail) on failure.
+    """
+    from analysis.qr import qr_detect, get_pixel_size
+    from .fileUtilities import list_video_pngs
+
+    if not image_path or not os.path.isdir(image_path):
+        return None, f"Video folder not found: {image_path}"
+    images, resolved = list_video_pngs({"Images": image_path})
+    if not images:
+        return None, f"No PNG frames in {image_path}"
+    n = min(max(1, int(max_frames)), len(images))
+    for image in images[:n]:
+        qr = qr_detect(image)
+        if qr is not None:
+            pixel_size = 10 / get_pixel_size(qr[0])
+            where = resolved or image_path
+            return (
+                float(pixel_size),
+                f"QR detected in {os.path.basename(image)} ({where})",
+            )
+    label = "frame" if n == 1 else f"{n} frames"
+    return None, f"QR not detected in first {label} of {image_path}"

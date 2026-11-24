@@ -7,7 +7,7 @@ it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-This program is distributed in the hope that it will be useful,
+    10|This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
@@ -17,9 +17,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 from analysis.plantAnalysis import plantAnalysis
+from analysis.utils.metadata_schema import (
+    cleanup_pending_config,
+    has_roi,
+    load_run_config,
+    video_has_qr,
+)
 import argparse
-import json
-import sys
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ChronoRoot: High-throughput phenotyping by deep learning reveals novel temporal parameters of plant root system architecture')
@@ -29,28 +33,24 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
         
-    conf = json.load(open(args.config))
+    conf = load_run_config(args.config)
     
     if args.restart:
+        conf.pop('bounding_box', None)
         conf.pop('bounding box', None)
         conf.pop('seed', None)
     
-    try:
-        conf['fileKey'] = conf["Experiment"]
-    except:
-        conf['fileKey'] = conf["identifierField"]
-        conf['Experiment'] = conf["identifierField"]
-        
-    conf['sequenceLabel'] = conf['Experiment'] + "_" + conf['Images'] + "_" + str(conf['plant'])
+    experiment = conf.get("Experiment") or conf.get("identifierField")
+    conf['Experiment'] = experiment
+    conf['fileKey'] = experiment
+    conf['sequenceLabel'] = str(experiment) + "_" + str(conf.get('Images', '')) + "_" + str(conf.get('plant', ''))
     conf['Plant'] = 'Arabidopsis thaliana'
     
-    if not conf.get('videoHasQRbutton', True):
+    if not video_has_qr(conf):
         pixel_size = float(conf['knownDistance']) / float(conf['pixelDistance'])
         conf['pixel_size'] = pixel_size
 
-    has_roi = 'bounding box' in conf and 'seed' in conf
-
-    if has_roi:
-        plantAnalysis(conf, replicate=True)
-    else:
-        plantAnalysis(conf, replicate=False)
+    try:
+        plantAnalysis(conf, replicate=has_roi(conf))
+    finally:
+        cleanup_pending_config(args.config)

@@ -1,4 +1,4 @@
-# ChronoRoot 2.0
+# ChronoRoot 2.1
 
 ![Figure](Documents/images/mainFigure.png)
 
@@ -7,9 +7,10 @@
 [![Docker](https://img.shields.io/docker/pulls/ngaggion/chronoroot.svg)](https://hub.docker.com/r/ngaggion/chronoroot)
 [![Hugging Face Models](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/ngaggion/models)
 
+
 ## An Open AI-Powered Platform for 2D Temporal Plant Phenotyping
 
-**ChronoRoot 2.0** is an integrated open-source platform that combines affordable hardware with advanced artificial intelligence to enable sophisticated temporal plant phenotyping. 
+**ChronoRoot 2.1** builds on the ChronoRoot 2.0 platform: an integrated open-source stack that combines affordable hardware with advanced artificial intelligence for temporal plant phenotyping.
 
 Depending on your research needs, the system offers two distinct workflows: a **Detailed Analysis** for individual plant architecture or a **High-Throughput Screening** for analyzing large populations.
 
@@ -19,18 +20,26 @@ Depending on your research needs, the system offers two distinct workflows: a **
 * **Novel Metrics:** Comprehensive measurements including gravitropic response parameters.
 * **Quality Control:** Interfaces designed for real-time human-in-the-loop validation.
 
+### What's new in 2.1
+
+* **Plate condition and extra variable:** Label each plant with a plate condition and an optional extra variable (run / replica). Reports can compare genotypes across all data, within each plate or extra level, and within genotype — with matching overview, FPCA, and Fourier showcases.
+* **Reworked statistical analysis:** Configure Report Parameters drives advanced comparison modes (on by default), paired plot/stats outputs per mode, optional figure formats, relative-to-initial measurements, germination timing, and cleaner Genotype / plate / extra axis labels.
+* **Time coordination:** A dedicated analysis-period window aligns multiple imaging cohorts (clock or elapsed time), with preview, optional merge of partial overlaps, and consistent Day / elapsed-time axes on figures.
+* **QR calibration quality assurance:** Per-video plate scale registry, Test QR / Set scale review, mismatch warnings, and the same image-path discovery as Preview (including segmentation `input_path` when PNGs live outside the project folder).
+* **Also in this release:** selectable report subsets (who is compared), parallel postprocess and report generation, genotype/identifier remapper, improved lateral-root tracking and angle overlays (plants without laterals are skipped), TIFF stacks for masks/graphs, processing limits, ROI and plant-viewer UX improvements, and a shared report/statistics backend with the Screening App.
+
 ## Workflow Overview
 
 ![Figure](Documents/images/usage_diagram.png)
 
-A typical ChronoRoot 2.0 experiment follows this pipeline:
+A typical ChronoRoot 2.1 experiment follows this pipeline:
 
 1.  **Data Acquisition**: Capture temporal image sequences (typically every 15 mins) using the [ChronoRoot Hardware](https://github.com/ThomasBlein/ChronoRootModuleHardware).
 2.  **Segmentation**: Process raw images using the **Segmentation App**. This utilizes GPU acceleration to automatically identify plant organs.
 3.  **Analysis**: Load the segmented data into one of the analysis interfaces:
-    * **ChronoRoot App**: For detailed architectural analysis of individual plants.
+    * **ChronoRoot App**: For detailed architectural analysis of individual plants (plate/extra labels, time groups, plate-scale review, then postprocess and report).
     * **Screening App**: For high-throughput automated analysis of multiple plants.
-4.  **Reporting**: Export statistical analysis, visualizations, and group comparisons.
+4.  **Reporting**: Export statistical analysis, visualizations, and group comparisons under Configure Report Parameters.
 
 ## System Requirements
 
@@ -47,7 +56,7 @@ Before installing, ensure your system meets the following criteria:
 
 ## Installation & Getting Started
 
-ChronoRoot 2.0 offers automated installers that set up the environment and create **Desktop Shortcuts** for a point-and-click experience. Choose the method that best fits your setup.
+ChronoRoot 2.1 offers automated installers that set up the environment and create **Desktop Shortcuts** for a point-and-click experience. Choose the method that best fits your setup.
 
 Both native and apptainer installations provide three applications, with shortcuts as follows:
 
@@ -215,7 +224,7 @@ For technical details on specific modules, please refer to their internal docume
 
 ## Hardware Specifications
 
-ChronoRoot 2.0 is designed to work with an affordable custom hardware setup that includes:
+ChronoRoot 2.1 is designed to work with an affordable custom hardware setup that includes:
 
 - Raspberry Pi 3B computer
 - Fixed-zoom cameras (RaspiCam v2)
@@ -241,5 +250,5 @@ If you use this platform in your research, please cite:
 
 ### Contact & License
 
-ChronoRoot 2.0 is released under the [GNU General Public License v3.0](https://www.google.com/search?q=LICENSE).
+ChronoRoot 2.1 is released under the [GNU General Public License v3.0](LICENSE).
 For support, please [open an issue](https://github.com/ngaggion/ChronoRoot2/issues).

@@ -5,7 +5,7 @@ import sys
 import pathlib
 from collections import defaultdict
 
-from PyQt5.QtWidgets import QApplication, QMessageBox, QDialog
+from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox
 
 from analysis.utils.fileUtilities import (
     plant_slot_path,
@@ -13,9 +13,12 @@ from analysis.utils.fileUtilities import (
     load_result_metadata,
     convertFromPathSafe,
 )
+from analysis.utils.metadata_schema import get_bounding_box, video_image_dir
 
 
 def _ensure_qapplication():
+    from gui.error_report import install_gui_exception_hook
+    install_gui_exception_hook()
     app = QApplication.instance()
     if app is not None:
         return app
@@ -29,25 +32,31 @@ def _ensure_qapplication():
         return None
 
 
-def _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=None):
+def _run_roi_seed_dialogs(
+    conf, images, seg_files, own_previous_roi=None, first_frame=None, previous_rois=None,
+):
     import plant_viewer
 
-    previous_rois, warnings_text = collect_previous_rois_and_warnings(conf)
-    if warnings_text:
-        QMessageBox.warning(None, "Video path warning", warnings_text)
+    if previous_rois is None:
+        previous_rois, _warnings_text = collect_previous_rois_and_warnings(conf)
 
     experiment = conf.get('Experiment', '')
     plant_num = conf.get('plant', '?')
     plant_label = f"plant_{plant_num} - {experiment}"
 
-    roi_dialog = plant_viewer.PlantROISelectorWindow(
-        images,
-        seg_files,
-        previous_rois,
-        time_delta=conf.get('timeStep', 15),
-        plant_label=plant_label,
-        own_previous_roi=own_previous_roi,
-    )
+    try:
+        roi_dialog = plant_viewer.PlantROISelectorWindow(
+            images,
+            seg_files,
+            previous_rois,
+            time_delta=conf.get('timeStep', 15),
+            plant_label=plant_label,
+            own_previous_roi=own_previous_roi,
+            first_frame=first_frame,
+        )
+    except Exception as exc:
+        QMessageBox.critical(None, "Error", f"Failed to launch analysis:\n{exc}")
+        return None, None
     if roi_dialog.exec_() != QDialog.Accepted:
         return None, None
 
@@ -58,7 +67,33 @@ def _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=None):
     x1, y1, x2, y2 = roi
     bbox = [y1, y2, x1, x2]
 
-    seed_dialog = plant_viewer.SeedSelectorWindow(images, seg_files, bbox, conf)
+    def load():
+        import cv2
+        if not images:
+            return None
+        img = cv2.imread(images[-1])
+        if img is None:
+            return None
+        y1, y2, x1, x2 = bbox
+        height, width = img.shape[:2]
+        if not (0 <= y1 < y2 <= height and 0 <= x1 < x2 <= width):
+            return None
+        return img[y1:y2, x1:x2].copy()
+
+    from gui.background import run_off_main_thread
+    try:
+        seed_frame = run_off_main_thread(QApplication.activeWindow(), "Loading preview…", load)
+    except Exception as exc:
+        QMessageBox.critical(None, "Error", f"Failed to launch analysis:\n{exc}")
+        return None, None
+
+    try:
+        seed_dialog = plant_viewer.SeedSelectorWindow(
+            images, seg_files, bbox, conf, first_frame=seed_frame,
+        )
+    except Exception as exc:
+        QMessageBox.critical(None, "Error", f"Failed to launch analysis:\n{exc}")
+        return None, None
     if seed_dialog.exec_() != QDialog.Accepted:
         return None, None
 
@@ -86,7 +121,13 @@ def _format_warnings(analysis_root, cam_plants, video_slots):
         sections.append('\n'.join(lines))
 
     if sections:
-        sections.insert(0, 'Same camera, different video sources:')
+        sections.insert(
+            0,
+            'Same robot/camera folder, different video sources:\n'
+            'Rename the robot folder with a run suffix (e.g. 20_3_run / 20_3_run2) '
+            'so different biological runs of the same ChronoRoot module do not '
+            'share one Analysis slot.',
+        )
 
     shared_video_sections = []
     for video_abs, slots in sorted(video_slots.items()):
@@ -109,67 +150,161 @@ def _format_warnings(analysis_root, cam_plants, video_slots):
     return 'Video path inconsistencies detected:\n\n' + '\n\n'.join(sections)
 
 
-def collect_previous_rois_and_warnings(conf):
-    """Scan Analysis tree for prior ROIs on the same video and path warnings."""
+def _pending_slot_parts(conf):
+    """Return (slot, video, cam_path, experiment, rpi, cam, plant_folder) or None."""
+    try:
+        current_slot = os.path.abspath(plant_slot_path(conf))
+        video_src = video_image_dir(conf) or conf.get('Images')
+        if not video_src:
+            return None
+        current_video = os.path.abspath(video_src)
+        analysis_root = os.path.join(conf['MainFolder'], 'Analysis')
+        rel = os.path.relpath(current_slot, analysis_root)
+        parts = rel.split(os.sep)
+        if len(parts) < 4:
+            return None
+        experiment_folder, rpi, cam, plant_folder = parts[0], parts[1], parts[2], parts[3]
+        cam_path = os.path.join(analysis_root, experiment_folder, rpi, cam)
+        experiment = convertFromPathSafe(experiment_folder)
+        return current_slot, current_video, cam_path, experiment, rpi, cam, plant_folder
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
+def _inject_pending_plant(cam_plants, video_slots, conf):
+    """Replace this slot's saved video with the plant about to be launched."""
+    pending = _pending_slot_parts(conf)
+    if pending is None:
+        return
+    _slot, current_video, cam_path, experiment, rpi, cam, plant_folder = pending
+
+    if cam_path in cam_plants:
+        cam_plants[cam_path] = [
+            (plant, video) for plant, video in cam_plants[cam_path]
+            if plant != plant_folder
+        ]
+    for video_abs in list(video_slots.keys()):
+        video_slots[video_abs] = [
+            entry for entry in video_slots[video_abs]
+            if not (
+                entry[0] == experiment
+                and entry[1] == rpi
+                and entry[2] == cam
+                and entry[3] == plant_folder
+            )
+        ]
+        if not video_slots[video_abs]:
+            del video_slots[video_abs]
+
+    cam_plants[cam_path].append((plant_folder, current_video))
+    video_slots[current_video].append((experiment, rpi, cam, plant_folder))
+
+
+def collect_previous_rois_and_warnings(conf, include_pending=False, skip_current=True):
+    """Scan Analysis tree for prior ROIs on the same video and path warnings.
+
+    skip_current: when True (analysis launch), omit the plant slot about to be
+    drawn. Preview passes False so every analyzed plant on the video is shown.
+    """
     analysis_root = os.path.join(conf['MainFolder'], 'Analysis')
     current_slot = os.path.abspath(plant_slot_path(conf))
-    current_video = os.path.abspath(conf.get('ImagePath') or conf['Images'])
+    current_video = os.path.abspath(video_image_dir(conf) or conf['Images'])
 
     previous_rois = []
     cam_plants = defaultdict(list)
     video_slots = defaultdict(list)
 
-    if not os.path.isdir(analysis_root):
-        return previous_rois, ''
+    if os.path.isdir(analysis_root):
+        for plant_slot in pathlib.Path(analysis_root).glob('*/*/*/*'):
+            if not plant_slot.is_dir():
+                continue
 
-    for plant_slot in pathlib.Path(analysis_root).glob('*/*/*/*'):
-        if not plant_slot.is_dir():
-            continue
+            slot_str = str(plant_slot)
+            rel = os.path.relpath(slot_str, analysis_root)
+            parts = rel.split(os.sep)
+            if len(parts) < 4:
+                continue
 
-        slot_str = str(plant_slot)
-        rel = os.path.relpath(slot_str, analysis_root)
-        parts = rel.split(os.sep)
-        if len(parts) < 4:
-            continue
+            experiment_folder, rpi, cam, plant_folder = parts[0], parts[1], parts[2], parts[3]
+            cam_path = os.path.join(analysis_root, experiment_folder, rpi, cam)
+            experiment = convertFromPathSafe(experiment_folder)
+            result_dir = get_latest_result_dir(slot_str)
+            meta = load_result_metadata(result_dir) if result_dir else {}
 
-        experiment_folder, rpi, cam, plant_folder = parts[0], parts[1], parts[2], parts[3]
-        cam_path = os.path.join(analysis_root, experiment_folder, rpi, cam)
-        experiment = convertFromPathSafe(experiment_folder)
-        result_dir = get_latest_result_dir(slot_str)
-        meta = load_result_metadata(result_dir) if result_dir else {}
+            video = video_image_dir(meta)
+            if video:
+                video_abs = os.path.abspath(video)
+                cam_plants[cam_path].append((plant_folder, video_abs))
+                video_slots[video_abs].append((experiment, rpi, cam, plant_folder))
 
-        video = meta.get('ImagePath') or meta.get('Images')
-        if video:
-            video_abs = os.path.abspath(video)
-            cam_plants[cam_path].append((plant_folder, video_abs))
-            video_slots[video_abs].append((experiment, rpi, cam, plant_folder))
+            if skip_current and os.path.abspath(slot_str) == current_slot:
+                continue
+            if not result_dir or get_bounding_box(meta) is None:
+                continue
 
-        if os.path.abspath(slot_str) == current_slot:
-            continue
-        if not result_dir or 'bounding box' not in meta:
-            continue
+            meta_video = video_image_dir(meta)
+            if not meta_video or os.path.abspath(meta_video) != current_video:
+                continue
 
-        meta_video = meta.get('ImagePath') or meta.get('Images')
-        if not meta_video or os.path.abspath(meta_video) != current_video:
-            continue
+            y1, y2, x1, x2 = get_bounding_box(meta)
+            plant_num = meta.get('plant', plant_folder.replace('plant_', ''))
+            label = f"{experiment}\nplant_{plant_num}"
+            previous_rois.append((label, x1, y1, x2, y2))
 
-        y1, y2, x1, x2 = meta['bounding box']
-        plant_num = meta.get('plant', plant_folder.replace('plant_', ''))
-        label = f"{experiment}\nplant_{plant_num}"
-        previous_rois.append((label, x1, y1, x2, y2))
+    if include_pending:
+        _inject_pending_plant(cam_plants, video_slots, conf)
 
     warnings_text = _format_warnings(analysis_root, cam_plants, video_slots)
     return previous_rois, warnings_text
 
 
-def select_roi_and_seed(conf, images, seg_files, own_previous_roi=None):
+def video_path_warnings(conf):
+    """Conflict text including the plant about to be launched, or empty."""
+    _rois, warnings_text = collect_previous_rois_and_warnings(conf, include_pending=True)
+    return warnings_text
+
+
+def analysis_module_reuse_warnings(main_folder):
+    """Warn when the same robot/camera Analysis slot mixes different videos."""
+    analysis_root = os.path.join(main_folder or '', 'Analysis')
+    if not os.path.isdir(analysis_root):
+        return ''
+    cam_plants = defaultdict(list)
+    video_slots = defaultdict(list)
+    for plant_slot in pathlib.Path(analysis_root).glob('*/*/*/*'):
+        if not plant_slot.is_dir():
+            continue
+        rel = os.path.relpath(str(plant_slot), analysis_root)
+        parts = rel.split(os.sep)
+        if len(parts) < 4:
+            continue
+        experiment_folder, rpi, cam, plant_folder = parts[0], parts[1], parts[2], parts[3]
+        cam_path = os.path.join(analysis_root, experiment_folder, rpi, cam)
+        experiment = convertFromPathSafe(experiment_folder)
+        result_dir = get_latest_result_dir(str(plant_slot))
+        meta = load_result_metadata(result_dir) if result_dir else {}
+        video = video_image_dir(meta)
+        if not video:
+            continue
+        video_abs = os.path.abspath(video)
+        cam_plants[cam_path].append((plant_folder, video_abs))
+        video_slots[video_abs].append((experiment, rpi, cam, plant_folder))
+    return _format_warnings(analysis_root, cam_plants, video_slots)
+
+
+def select_roi_and_seed(
+    conf, images, seg_files, own_previous_roi=None, first_frame=None, previous_rois=None,
+):
     """
     Interactive ROI and seed selection. Requires an existing QApplication (run.py).
     Returns (bbox, seed) or (None, None) on cancel.
     """
     if QApplication.instance() is None:
         return try_select_roi_and_seed(conf, images, seg_files, own_previous_roi=own_previous_roi)
-    return _run_roi_seed_dialogs(conf, images, seg_files, own_previous_roi=own_previous_roi)
+    return _run_roi_seed_dialogs(
+        conf, images, seg_files, own_previous_roi=own_previous_roi,
+        first_frame=first_frame, previous_rois=previous_rois,
+    )
 
 
 def try_select_roi_and_seed(conf, images, seg_files, own_previous_roi=None):

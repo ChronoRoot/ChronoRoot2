@@ -1,10 +1,9 @@
 import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
 import os
 import numpy as np
 import cv2
-import networkx as nx
 import json
 import scipy.stats as stats
 import logging
@@ -12,8 +11,31 @@ from typing import Tuple, List
 
 # Import shared utilities
 from analysis.utils import report_utils as utils
-from analysis.utils.fileUtilities import convertFromPathSafe, normalize_factor_value
-from analysis.utils.report_style import genotype_palette_for_data, get_genotype_axis_label
+from analysis.utils.fileUtilities import (
+    UNSPECIFIED_FACTOR,
+    convertFromPathSafe,
+    convertToPathSafe,
+    normalize_factor_value,
+)
+from analysis.utils.report_subset import result_dir_in_report
+from analysis.graphUtils.save import GRAPHS_FILENAME, loadGraph
+from analysis.utils.tiff_stack import (
+    graph_path_for_name,
+    mask_stack_paths,
+    read_tiff_page,
+    result_frame_names,
+    tiff_n_frames,
+)
+from analysis.time_windows import (
+    closest_timed_path,
+    datetime_from_filename,
+    match_time_group,
+    parse_datetime,
+    period_frame_indices,
+    resolved_time_groups,
+    format_days_elapsed,
+    snapshot_hours as conf_snapshot_hours,
+)
 from analysis.utils.report_paths import (
     MODULE_CONVEX,
     metric_slug,
@@ -29,7 +51,97 @@ plt.switch_backend('agg')
 PADDING_X = 200 # Pixel padding used for alignment
 PIXEL_SIZE_MM = 0.04 # Conversion factor
 
-def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+
+def _hour_frame_index(n_frames, timestep, hour):
+    imgs_per_day = int(24 * (60 / max(int(timestep or 15), 1)))
+    img_idx = int(hour * imgs_per_day / 24) if hour is not None and hour >= 0 else 0
+    if n_frames <= 0:
+        return 0
+    if img_idx >= n_frames:
+        return n_frames - 1
+    return max(0, img_idx)
+
+
+def _legacy_seg_pngs(seg_folder):
+    return utils.load_paths(seg_folder, "*.png")
+
+
+def load_plant_seg_and_graph(r_path, target=None, timestep=15, hour=None, use_last=False):
+    """Load one binary Seg frame, its graph path, and the frame image name."""
+    layout = mask_stack_paths(r_path)
+    graph_folder = os.path.join(r_path, "Graphs")
+    names = result_frame_names(r_path)
+
+    if layout["kind"] == "tiff" and os.path.isfile(layout["seg"]):
+        n_pages = tiff_n_frames(layout["seg"])
+        if n_pages <= 0:
+            return None, None, None
+        if use_last:
+            idx = n_pages - 1
+        elif target is not None and names:
+            chosen = closest_timed_path(names, target)
+            idx = names.index(chosen) if chosen is not None else _hour_frame_index(n_pages, timestep, hour)
+        else:
+            idx = _hour_frame_index(n_pages, timestep, hour)
+        idx = max(0, min(idx, n_pages - 1))
+        img = read_tiff_page(layout["seg"], idx)
+        if img is None:
+            return None, None, None
+        image_name = names[idx] if idx < len(names) else None
+        graph_file = graph_path_for_name(graph_folder, image_name) if image_name else None
+        return img, graph_file, image_name
+
+    seg_files = _legacy_seg_pngs(layout["seg"])
+    if not seg_files:
+        return None, None, None
+    if use_last:
+        current_seg_file = seg_files[-1]
+    else:
+        current_seg_file = closest_timed_path(seg_files, target) if target is not None else None
+        if current_seg_file is None:
+            current_seg_file = seg_files[_hour_frame_index(len(seg_files), timestep, hour)]
+    img = cv2.imread(current_seg_file, 0)
+    if img is None:
+        return None, None, None
+    image_name = os.path.basename(current_seg_file)
+    graph_file = graph_path_for_name(graph_folder, image_name)
+    if os.path.basename(graph_file) != GRAPHS_FILENAME:
+        graph_file = os.path.join(
+            graph_folder,
+            image_name.replace("png", "xml.gz"),
+        )
+    return img, graph_file, image_name
+
+
+def _read_graph(graph_file, graph_folder, image_name=None):
+    combined = os.path.join(graph_folder, GRAPHS_FILENAME)
+    if os.path.isfile(combined):
+        if image_name:
+            try:
+                return loadGraph(combined, image_name=image_name)
+            except Exception:
+                pass
+        try:
+            return loadGraph(combined, which="last")
+        except Exception:
+            return None
+    if graph_file:
+        try:
+            return loadGraph(graph_file)
+        except Exception:
+            pass
+    fallback_graphs = [
+        path for path in utils.load_paths(graph_folder, "*.xml.gz")
+        if os.path.basename(path) != GRAPHS_FILENAME
+    ]
+    if not fallback_graphs:
+        return None
+    try:
+        return loadGraph(fallback_graphs[-1])
+    except Exception:
+        return None
+
+def calculate_atlas_geometry(experiment_paths: List[str], conf=None) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Scans all experiments to determine the maximum biological bounding box relative to the seed.
     Returns:
@@ -45,27 +157,23 @@ def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, in
         # Load all results folders
         result_paths = utils.load_paths(exp_path, '*/*/*/Results*')
         
-        for r_path in result_paths:            
-            # 1. Load Last Segmentation Image
-            seg_folder = os.path.join(r_path, 'Images/Seg/')
-            seg_files = utils.load_paths(seg_folder, "*.png")
-            if not seg_files: continue
-            
-            # Read image
-            img = cv2.imread(seg_files[-1], 0)
-            
-            # Apply standard padding for alignment
+        for r_path in result_paths:
+            if not result_dir_in_report(conf, r_path):
+                continue
+            names = result_frame_names(r_path)
+            chosen = period_frame_indices(names, conf) if names else []
+            if chosen:
+                target = datetime_from_filename(names[chosen[-1]])
+                img, graph_path, image_name = load_plant_seg_and_graph(r_path, target=target)
+            else:
+                img, graph_path, image_name = load_plant_seg_and_graph(r_path, use_last=True)
+            if img is None:
+                continue
+
             img = np.pad(img, ((0,0), (PADDING_X, 0)))
-            
-            # 2. Load Graph to find tips for rotation
-            graph_folder = os.path.join(r_path, 'Graphs/')
-            # Try to find corresponding graph file
-            graph_filename = os.path.basename(seg_files[-1]).replace('png', 'xml.gz')
-            graph_path = os.path.join(graph_folder, graph_filename)
-            
-            try: 
-                g = nx.read_graphml(graph_path)
-            except: 
+
+            g = _read_graph(graph_path, os.path.join(r_path, 'Graphs/'), image_name=image_name)
+            if g is None:
                 continue
 
             # Find root endpoints (Start and Tip)
@@ -125,43 +233,241 @@ def calculate_atlas_geometry(experiment_paths: List[str]) -> Tuple[Tuple[int, in
     return (canvas_height, canvas_width), (center_y, center_x)
 
 
-def generate_root_atlases(save_path, days, timestep, canvas_shape, center_coords, rotate_root=True):
+def _hour_metric_row(df_temporal, target, hour, final_snapshot=False):
+    """The hourly row for this snapshot, or None when that hour was not imaged.
+
+    The closest row is accepted only when it falls inside the same hour.
+    A missing length is not replaced by the plant's nearest other hour.
+    The final snapshot also keeps a plant whose last hourly row is still
+    inside that last day. Recordings that end at 13:45 are binned at 13:00,
+    sixty minutes before an end time of 14:00, so a 30-minute match misses them.
+    """
+    if df_temporal is None or df_temporal.empty:
+        return None
+    if 'TotalLength (mm)' not in df_temporal.columns:
+        return None
+    row = None
+    if 'Date' in df_temporal.columns and target is not None:
+        dates = pd.to_datetime(df_temporal['Date'], errors='coerce')
+        delta = (dates - target).abs()
+        if delta.notna().any():
+            idx = delta.idxmin()
+            if delta.loc[idx] <= pd.Timedelta(minutes=30):
+                row = df_temporal.loc[idx]
+            elif final_snapshot:
+                earlier = dates[dates.notna() & (dates <= target) & (dates > target - pd.Timedelta(hours=24))]
+                if not earlier.empty:
+                    row = df_temporal.loc[earlier.idxmax()]
+    elif 'ElapsedTime (h)' in df_temporal.columns:
+        elapsed = pd.to_numeric(df_temporal['ElapsedTime (h)'], errors='coerce')
+        match = df_temporal.loc[elapsed == int(hour)]
+        if not match.empty:
+            row = match.iloc[0]
+    if row is None:
+        return None
+    total = pd.to_numeric(row.get('TotalLength (mm)'), errors='coerce')
+    lateral = pd.to_numeric(row.get('LateralRootsLength (mm)'), errors='coerce')
+    if pd.isna(total) or pd.isna(lateral):
+        return None
+    return row
+
+
+def _snapshot_plant(job):
+    """One plant at one snapshot. Safe to run in a worker process."""
+    r_path = job['r_path']
+    hour = job['hour']
+    groups = job['groups']
+    timestep = job['timestep']
+    canvas_shape = job['canvas_shape']
+    dest_seed_y, dest_seed_x = job['center']
+    rotate_root = job['rotate_root']
+    final_snapshot = job['final_snapshot']
+
+    meta_path = os.path.join(r_path, 'metadata.json')
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path) as handle:
+        metadata = json.load(handle)
+
+    csv_files = utils.load_paths(r_path, 'PostProcess_Hour.csv')
+    if not csv_files:
+        return None
+    df_temporal = pd.read_csv(csv_files[0])
+
+    t0 = None
+    if 'Date' in df_temporal.columns:
+        dates = pd.to_datetime(df_temporal['Date'], errors='coerce').dropna()
+        if not dates.empty:
+            group = match_time_group(groups, dates.min(), dates.max()) if groups else None
+            t0 = parse_datetime(group.get('t0')) if group else parse_datetime(dates.min())
+    target = (t0 + pd.Timedelta(hours=hour)) if t0 is not None else None
+    metric_row = _hour_metric_row(df_temporal, target, hour, final_snapshot=final_snapshot)
+    if metric_row is None:
+        return None
+    img, graph_file, image_name = load_plant_seg_and_graph(
+        r_path, target=target, timestep=timestep, hour=hour,
+    )
+    if img is None:
+        return None
+    graph = _read_graph(graph_file, os.path.join(r_path, 'Graphs/'), image_name=image_name)
+    if graph is None:
+        return None
+
+    img = np.pad(img, ((0, 0), (PADDING_X, 0)))
+    end1 = end2 = None
+    for node in graph.nodes():
+        if graph.nodes[node]['type'] == 'FTip':
+            end1 = np.array([graph.nodes[node]["pos_x"], graph.nodes[node]["pos_y"]])
+        if graph.nodes[node]['type'] == 'Ini':
+            end2 = np.array([graph.nodes[node]["pos_x"], graph.nodes[node]["pos_y"]])
+    if end1 is None or end2 is None:
+        return None
+
+    seed = end1 if end1[1] < end2[1] else end2
+    seed = seed.copy()
+    seed[0] += PADDING_X
+    root_tip = end1 if end1[1] > end2[1] else end2
+    root_tip = root_tip.copy()
+    root_tip[0] += PADDING_X
+
+    angle_deg = 0.0
+    if rotate_root:
+        v_vertical = np.array([0, 1])
+        v_root = utils.unit_vector(root_tip - seed)
+        angle_rad = utils.angle_between(v_vertical, v_root)
+        angle_deg = -np.rad2deg(angle_rad) if v_root[0] > 0 else np.rad2deg(angle_rad)
+
+    rot_center = (float(seed[0]), float(seed[1]))
+    rot_mat = cv2.getRotationMatrix2D(rot_center, angle_deg, 1.0)
+    rot_mat[0, 2] += (dest_seed_x - seed[0])
+    rot_mat[1, 2] += (dest_seed_y - seed[1])
+    warped_img = cv2.warpAffine(img, rot_mat, (canvas_shape[1], canvas_shape[0]), flags=cv2.INTER_LINEAR)
+    _, warped_img = cv2.threshold(warped_img, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(warped_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    hulls = [cv2.convexHull(contour, False) for contour in contours]
+
+    metric = None
+    biggest_contour = max(contours, key=cv2.contourArea)
+    is_inside = cv2.pointPolygonTest(biggest_contour, (dest_seed_x, dest_seed_y), False) > 0
+    dist_to_seed = cv2.pointPolygonTest(biggest_contour, (dest_seed_x, dest_seed_y), True)
+    if is_inside or dist_to_seed < 30:
+        hull_big = cv2.convexHull(biggest_contour, False)
+        _x, _y, width, height = cv2.boundingRect(hull_big)
+        area_bbox = width * height * (PIXEL_SIZE_MM ** 2)
+        area_chull = cv2.contourArea(hull_big) * (PIXEL_SIZE_MM ** 2)
+        total_len = pd.to_numeric(metric_row.get('TotalLength (mm)'), errors='coerce')
+        lateral_len = pd.to_numeric(metric_row.get('LateralRootsLength (mm)'), errors='coerce')
+        if pd.notna(total_len) and pd.notna(lateral_len):
+            metric = {
+                'area_bbox': area_bbox,
+                'area_chull': area_chull,
+                'aspect_ratio': height / width if width > 0 else 0,
+                'density_lat': lateral_len / area_chull if area_chull > 0 else 0,
+                'density_tot': total_len / area_chull if area_chull > 0 else 0,
+                'density_lat_bbox': lateral_len / area_bbox if area_bbox > 0 else 0,
+                'density_tot_bbox': total_len / area_bbox if area_bbox > 0 else 0,
+                'width': width * PIXEL_SIZE_MM,
+                'height': height * PIXEL_SIZE_MM,
+                'plate_condition': normalize_factor_value(metadata.get('PlateCondition', '')),
+                'extra_variable': normalize_factor_value(metadata.get('ExtraVariable', '')),
+                'plant_id': (
+                    f"{metadata.get('rpi', '')}_cam_{metadata.get('cam', '')}"
+                    f"_plant_{metadata.get('plant', '')}"
+                ),
+            }
+    return {'hulls': hulls, 'warped': warped_img, 'metric': metric}
+
+
+def _blank_atlas_buffers(canvas_shape):
+    return {
+        'hull': np.zeros(canvas_shape, dtype='uint8'),
+        'contours': np.zeros([canvas_shape[0], canvas_shape[1], 3], dtype='uint8'),
+        'density': np.zeros(canvas_shape, dtype='float64'),
+    }
+
+
+def _reset_atlas_buffers(buffers):
+    buffers['contours'].fill(255)
+    buffers['hull'].fill(0)
+    buffers['density'].fill(0)
+
+
+def _composite_plant_into_atlas(buffers, item, temp_mask):
+    temp_mask.fill(0)
+    for index, _hull in enumerate(item['hulls']):
+        cv2.drawContours(temp_mask, item['hulls'], index, 1, -1)
+        cv2.drawContours(buffers['contours'], item['hulls'], index, (255, 0, 0), 3)
+    buffers['hull'] += temp_mask
+    buffers['density'] += item['warped'] / 255.0
+
+
+def _copy_atlas_triplet(buffers):
+    return [buffers['hull'].copy(), buffers['contours'].copy(), buffers['density'].copy()]
+
+
+def _factor_bucket(store, key, canvas_shape):
+    if key not in store:
+        store[key] = _blank_atlas_buffers(canvas_shape)
+        _reset_atlas_buffers(store[key])
+    return store[key]
+
+
+def generate_root_atlases(save_path, snapshot_hours=None, timestep=15, canvas_shape=None, center_coords=None, rotate_root=True, conf=None, days=None):
     """
     Generates the accumulated heatmaps (atlases) and calculates convex hull metrics.
+    snapshot_hours are elapsed hours relative to each plant group's t0.
+
+    Returns ``(atlas_bundle, final_df)`` where ``atlas_bundle`` is
+    ``{'all': [...], 'by_plate': {plate: [...]}, 'by_extra': {extra: [...]}}``.
+    Each atlas entry is ``[hull_mask, contours_rgb, root_density]``.
     """
-    dest_seed_y, dest_seed_x = center_coords 
+    dest_seed_y, dest_seed_x = center_coords
     exp_dir_name = os.path.basename(save_path)
-    
+
     real_exp_name = convertFromPathSafe(exp_dir_name)
-    sample_meta = utils.load_paths(save_path, '*/*/*/metadata.json')
-    if sample_meta:
-        try:
-            with open(sample_meta[0], 'r') as f:
-                real_exp_name = json.load(f).get('Experiment', real_exp_name)
-        except: pass
-    
-    # Initialize Accumulators
-    atlas_hull_mask = np.zeros(canvas_shape, dtype='uint8')
+
+    all_buffers = _blank_atlas_buffers(canvas_shape)
     temp_mask = np.zeros(canvas_shape, dtype='uint8')
-    atlas_contours_rgb = np.zeros([canvas_shape[0], canvas_shape[1], 3], dtype='uint8')
-    atlas_root_density = np.zeros(canvas_shape, dtype='float64')
 
     result_paths = utils.load_paths(save_path, '*/*/*/Results*')
-    imgs_per_day = int(24 * (60 / timestep))
+    result_paths = [r_path for r_path in result_paths if result_dir_in_report(conf, r_path)]
+    hours = list(snapshot_hours if snapshot_hours is not None else (days or []))
+    groups, _mode = resolved_time_groups(conf, None) if conf else ([], 'clock')
+    if not groups:
+        hourly_frames = []
+        for r_path in result_paths:
+            csv_files = utils.load_paths(r_path, 'PostProcess_Hour.csv')
+            if csv_files:
+                try:
+                    hourly_frames.append(pd.read_csv(csv_files[0]))
+                except Exception:
+                    continue
+        if hourly_frames:
+            groups, _mode = resolved_time_groups(conf or {}, pd.concat(hourly_frames, ignore_index=True))
 
     all_frames_list = []
     set_of_atlases = []
+    atlases_by_plate = {}
+    atlases_by_extra = {}
+    blank = _blank_atlas_buffers(canvas_shape)
+    _reset_atlas_buffers(blank)
+    blank_triplet = _copy_atlas_triplet(blank)
 
-    for day in days:
-        day = int(day)
-        
-        # Reset Atlases for the new day
-        atlas_contours_rgb.fill(255) # White background
-        atlas_hull_mask.fill(0)
-        temp_mask.fill(0)
-        atlas_root_density.fill(0)
-        
-        # Metrics storage for this day
+    def _append_factor_atlas(store, key, buffers, hour_idx):
+        series = store.setdefault(key, [])
+        while len(series) < hour_idx:
+            series.append([layer.copy() for layer in blank_triplet])
+        series.append(_copy_atlas_triplet(buffers))
+
+    for hour_idx, hour in enumerate(hours):
+        hour = int(hour)
+
+        _reset_atlas_buffers(all_buffers)
+        plate_buffers = {}
+        extra_buffers = {}
+
         metrics = {
             'area_bbox': [], 'area_chull': [], 'aspect_ratio': [],
             'density_lat': [], 'density_tot': [],
@@ -169,147 +475,56 @@ def generate_root_atlases(save_path, days, timestep, canvas_shape, center_coords
             'width': [], 'height': [],
             'plate_condition': [], 'extra_variable': [], 'plant_id': [],
         }
-        
-        for r_path in result_paths:
-            # --- Load Data ---
-            meta_path = os.path.join(r_path, 'metadata.json')
-            if not os.path.exists(meta_path): continue
-            with open(meta_path) as f: metadata = json.load(f)
 
-            csv_files = utils.load_paths(r_path, 'PostProcess_Hour.csv')
-            if not csv_files: continue
-            df_temporal = pd.read_csv(csv_files[0])
+        # Plants at one hour do not depend on each other. Draw them afterwards
+        # in path order so the atlas does not change with worker completion.
+        final_snapshot = bool(hours) and hour == int(hours[-1])
+        jobs = [{
+            'r_path': r_path,
+            'hour': hour,
+            'groups': groups,
+            'timestep': timestep,
+            'canvas_shape': canvas_shape,
+            'center': (dest_seed_y, dest_seed_x),
+            'rotate_root': rotate_root,
+            'final_snapshot': final_snapshot,
+        } for r_path in result_paths]
+        if len(jobs) > 1:
+            workers = min(4, len(jobs))
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                plant_results = list(pool.map(_snapshot_plant, jobs))
+        else:
+            plant_results = [_snapshot_plant(job) for job in jobs]
+        for item in plant_results:
+            if not item:
+                continue
+            _composite_plant_into_atlas(all_buffers, item, temp_mask)
+            metric = item.get('metric') or {}
+            plate = normalize_factor_value(metric.get('plate_condition', ''))
+            extra = normalize_factor_value(metric.get('extra_variable', ''))
+            if plate != UNSPECIFIED_FACTOR:
+                _composite_plant_into_atlas(
+                    _factor_bucket(plate_buffers, plate, canvas_shape), item, temp_mask,
+                )
+            if extra != UNSPECIFIED_FACTOR:
+                _composite_plant_into_atlas(
+                    _factor_bucket(extra_buffers, extra, canvas_shape), item, temp_mask,
+                )
+            if not metric:
+                continue
+            metrics['area_bbox'].append(metric['area_bbox'])
+            metrics['area_chull'].append(metric['area_chull'])
+            metrics['aspect_ratio'].append(metric['aspect_ratio'])
+            metrics['density_lat'].append(metric['density_lat'])
+            metrics['density_tot'].append(metric['density_tot'])
+            metrics['density_lat_bbox'].append(metric['density_lat_bbox'])
+            metrics['density_tot_bbox'].append(metric['density_tot_bbox'])
+            metrics['width'].append(metric['width'])
+            metrics['height'].append(metric['height'])
+            metrics['plate_condition'].append(metric['plate_condition'])
+            metrics['extra_variable'].append(metric['extra_variable'])
+            metrics['plant_id'].append(metric['plant_id'])
 
-            seg_path = os.path.join(r_path, 'Images/Seg/')
-            seg_files = utils.load_paths(seg_path, "*.png")
-            
-            # Select specific image index based on day
-            img_idx = int(day * imgs_per_day)
-            
-            # Handle case where experiment ended early
-            if img_idx >= len(seg_files):
-                current_seg_file = seg_files[-1]
-            else:
-                current_seg_file = seg_files[img_idx]
-            
-            img = cv2.imread(current_seg_file, 0)
-            
-            # Load Graph
-            graph_folder = os.path.join(r_path, 'Graphs/')
-            graph_file = current_seg_file.replace(seg_path, graph_folder).replace('png', 'xml.gz')
-            
-            try: 
-                g = nx.read_graphml(graph_file)
-            except: 
-                # Fallback to last available graph
-                fallback_graphs = utils.load_paths(graph_folder, "*.xml.gz")
-                if not fallback_graphs: continue
-                g = nx.read_graphml(fallback_graphs[-1])
-
-            # --- Pre-processing (Padding) ---
-            img = np.pad(img, ((0,0), (PADDING_X, 0)))
-            
-            # Find endpoints
-            end1 = end2 = None
-            for n in g.nodes():
-                if g.nodes[n]['type'] == 'FTip': end1 = np.array([g.nodes[n]["pos_x"], g.nodes[n]["pos_y"]])
-                if g.nodes[n]['type'] == 'Ini': end2 = np.array([g.nodes[n]["pos_x"], g.nodes[n]["pos_y"]])
-            
-            if end1 is None or end2 is None: continue
-            
-            # Determine seed
-            seed = end1 if end1[1] < end2[1] else end2
-            seed[0] += PADDING_X
-            
-            # Determine tip
-            root_tip = end1 if end1[1] > end2[1] else end2
-            root_tip[0] += PADDING_X
-
-            # --- Rotation Logic ---
-            angle_deg = 0.0
-            if rotate_root:
-                v_vertical = np.array([0, 1])
-                v_root = utils.unit_vector(root_tip - seed)
-                angle_rad = utils.angle_between(v_vertical, v_root)
-                angle_deg = -np.rad2deg(angle_rad) if v_root[0] > 0 else np.rad2deg(angle_rad)
-
-            # --- Spatial Transformation ---
-            # 1. Rotation Matrix around original seed
-            rot_center = (float(seed[0]), float(seed[1]))
-            rot_mat = cv2.getRotationMatrix2D(rot_center, angle_deg, 1.0)
-
-            # 2. Translate to align seed with destination center
-            rot_mat[0, 2] += (dest_seed_x - seed[0])
-            rot_mat[1, 2] += (dest_seed_y - seed[1])
-
-            # 3. Warp to final canvas
-            warped_img = cv2.warpAffine(img, rot_mat, (canvas_shape[1], canvas_shape[0]), flags=cv2.INTER_LINEAR)
-            _, warped_img = cv2.threshold(warped_img, 10, 255, cv2.THRESH_BINARY)
-            
-            # --- Hull & Atlas Calculation ---
-            contours, _ = cv2.findContours(warped_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours: continue
-            
-            # Calculate Convex Hulls for all fragments (usually just one main root)
-            hulls = [cv2.convexHull(c, False) for c in contours]
-            
-            temp_mask.fill(0)
-            for j in range(len(contours)):
-                cv2.drawContours(temp_mask, hulls, j, 1, -1)
-                # Draw outline on the RGB map
-                cv2.drawContours(atlas_contours_rgb, hulls, j, (255, 0, 0), 3)
-            
-            atlas_hull_mask += temp_mask
-            atlas_root_density += warped_img / 255.0
-            
-            # --- Metrics Calculation ---
-            # Find largest contour for analysis
-            contour_sizes = [(cv2.contourArea(c), c) for c in contours]
-            biggest_contour = max(contour_sizes, key=lambda x: x[0])[1]
-            
-            # Check if root is actually connected to the seed area
-            is_inside = cv2.pointPolygonTest(biggest_contour, (dest_seed_x, dest_seed_y), False) > 0
-            dist_to_seed = cv2.pointPolygonTest(biggest_contour, (dest_seed_x, dest_seed_y), True)
-            
-            if is_inside or dist_to_seed < 30:
-                hull_big = cv2.convexHull(biggest_contour, False)
-                _,_,w,h = cv2.boundingRect(hull_big)
-                
-                area_bbox = w * h * (PIXEL_SIZE_MM**2)
-                area_chull = cv2.contourArea(hull_big) * (PIXEL_SIZE_MM**2)
-                
-                # Match temporal data index
-                csv_idx = int(img_idx * timestep / 60)
-                if csv_idx >= len(df_temporal['TotalLength (mm)']) or img_idx == -1:
-                    csv_idx = len(df_temporal['TotalLength (mm)']) - 1
-                
-                try:
-                    total_len = df_temporal['TotalLength (mm)'][csv_idx]
-                    lateral_len = df_temporal['LateralRootsLength (mm)'][csv_idx]
-                    
-                    # Store Metrics
-                    metrics['area_bbox'].append(area_bbox)
-                    metrics['area_chull'].append(area_chull)
-                    metrics['aspect_ratio'].append(h/w if w > 0 else 0)
-                    metrics['density_lat'].append(lateral_len/area_chull if area_chull > 0 else 0)
-                    metrics['density_tot'].append(total_len/area_chull if area_chull > 0 else 0)
-                    metrics['density_lat_bbox'].append(lateral_len/area_bbox if area_bbox > 0 else 0)
-                    metrics['density_tot_bbox'].append(total_len/area_bbox if area_bbox > 0 else 0)
-                    metrics['width'].append(w * PIXEL_SIZE_MM)
-                    metrics['height'].append(h * PIXEL_SIZE_MM)
-                    metrics['plate_condition'].append(
-                        normalize_factor_value(metadata.get('PlateCondition', ''))
-                    )
-                    metrics['extra_variable'].append(
-                        normalize_factor_value(metadata.get('ExtraVariable', ''))
-                    )
-                    metrics['plant_id'].append(
-                        f"{metadata.get('rpi', '')}_cam_{metadata.get('cam', '')}_plant_{metadata.get('plant', '')}"
-                    )
-                except Exception as e:
-                    pass
-
-        # Construct DataFrame for the day
         day_df = pd.DataFrame({
             'Convex Hull Aspect Ratio': metrics['aspect_ratio'],
             'Lateral Root Area Density': metrics['density_lat'],
@@ -321,21 +536,84 @@ def generate_root_atlases(save_path, days, timestep, canvas_shape, center_coords
             'Convex Hull Width': metrics['width'],
             'Convex Hull Height': metrics['height']
         })
-        day_df['Day'] = day
+        day_df['ElapsedTime (h)'] = hour
+        day_df['Day'] = hour
         day_df['Experiment'] = real_exp_name
         day_df['PlateCondition'] = metrics['plate_condition']
         day_df['ExtraVariable'] = metrics['extra_variable']
         day_df['Plant_id'] = metrics['plant_id']
-        
+
         all_frames_list.append(day_df)
-        set_of_atlases.append([atlas_hull_mask.copy(), atlas_contours_rgb.copy(), atlas_root_density.copy()])
-    
+        set_of_atlases.append(_copy_atlas_triplet(all_buffers))
+        for plate, buffers in plate_buffers.items():
+            _append_factor_atlas(atlases_by_plate, plate, buffers, hour_idx)
+        for extra, buffers in extra_buffers.items():
+            _append_factor_atlas(atlases_by_extra, extra, buffers, hour_idx)
+
+    n_hours = len(set_of_atlases)
+    for store in (atlases_by_plate, atlases_by_extra):
+        for key, series in list(store.items()):
+            while len(series) < n_hours:
+                series.append([layer.copy() for layer in blank_triplet])
+
     final_df = pd.concat(all_frames_list, ignore_index=True) if all_frames_list else pd.DataFrame()
-    return set_of_atlases, final_df
+    atlas_bundle = {
+        'all': set_of_atlases,
+        'by_plate': atlases_by_plate,
+        'by_extra': atlases_by_extra,
+    }
+    return atlas_bundle, final_df
 
 
-def visualize_single_atlas(atlas_hull, atlas_contours, atlas_roots, save_path, exp_dir_name, day=None):
-    """Plots the three-panel atlas visualization."""
+def snapshot_day_and_hour(hour):
+    """Elapsed hour of a snapshot, and the day after t0 that hour falls on.
+
+    192 h is day 8. A snapshot that is not a whole number of days keeps the
+    fractional day, such as 1.5.
+    """
+    if hour is None:
+        return None, None
+    try:
+        hour_value = float(hour)
+    except (TypeError, ValueError):
+        return str(hour), None
+    if not np.isfinite(hour_value):
+        return str(hour), None
+    hour_text = str(int(hour_value)) if hour_value == int(hour_value) else f'{hour_value:g}'
+    day = format_days_elapsed(hour_value)
+    return hour_text, day or None
+
+
+def atlas_snapshot_title(name, hour, condition=None):
+    """Figure title with both the day and the elapsed hour."""
+    head = str(name)
+    if condition:
+        head = f'{head} — {condition}'
+    if hour is None:
+        return f"{head} — Last snapshot"
+    hour_text, day = snapshot_day_and_hour(hour)
+    if day:
+        return f"{head} — Day {day} ({hour_text} h)"
+    return f"{head} — {hour_text} h"
+
+
+def atlas_snapshot_filename(exp_dir_name, hour):
+    """File name carrying the day and the elapsed hour of one snapshot."""
+    if hour is None:
+        return f"{exp_dir_name}_Last_Day.png"
+    hour_text, day = snapshot_day_and_hour(hour)
+    if day:
+        return f"{exp_dir_name}_day_{day}_t_{hour_text}.png"
+    return f"{exp_dir_name}_t_{hour_text}.png"
+
+
+def visualize_single_atlas(atlas_hull, atlas_contours, atlas_roots, save_path, exp_dir_name,
+                           day=None, condition=None):
+    """Plots the three-panel atlas visualization.
+
+    `day` is the elapsed hour of the snapshot. The title and file name also
+    record which day after t0 that hour belongs to.
+    """
     readable_name = convertFromPathSafe(exp_dir_name)
     plt.ioff()
     plt.figure(figsize=(9, 4))
@@ -355,45 +633,91 @@ def visualize_single_atlas(atlas_hull, atlas_contours, atlas_roots, save_path, e
     plt.title("Accumulated Convex Hulls")
     plt.axis('off')
 
-    title_suffix = f" - Day: {day}" if day is not None else " - Last Day"
-    full_title = f"{readable_name}{title_suffix}"
-    plt.suptitle(full_title)
-    
-    save_filename = f"{exp_dir_name}_Day_{day}.png" if day is not None else f"{exp_dir_name}_Last_Day.png"
+    plt.suptitle(atlas_snapshot_title(readable_name, day, condition=condition))
+
+    save_filename = atlas_snapshot_filename(exp_dir_name, day)
     plt.savefig(os.path.join(save_path, save_filename), dpi=300, bbox_inches='tight')
     plt.close('all')
 
 
-def visualize_combined_atlases(conf):
-    """Stacks atlas images vertically for qualitative comparison across days."""
-    folder = overview_dir(conf, MODULE_CONVEX)
-    images_per_day = {}
+def _hour_sort_key(hour_text):
+    try:
+        return float(hour_text)
+    except (TypeError, ValueError):
+        return 0.0
 
-    if not os.path.exists(folder):
+
+def _snapshot_key_from_filename(filename):
+    """Return (elapsed hour, day label) from an atlas file name.
+
+    Accepts the current `name_day_8_t_192.png` and the older `name_t_192.png`,
+    where 192 was the hour stored under a day-style name.
+    """
+    stem = filename
+    for ext in ('.png', '.jpg', '.jpeg'):
+        if stem.lower().endswith(ext):
+            stem = stem[:-len(ext)]
+            break
+    if 'Last_Day' in stem:
+        return ('Last', 'Last')
+    hour = None
+    day = None
+    if '_day_' in stem and '_t_' in stem:
+        day = stem.split('_day_', 1)[1].split('_t_', 1)[0]
+        hour = stem.rsplit('_t_', 1)[1]
+    elif '_t_' in stem:
+        hour = stem.rsplit('_t_', 1)[1]
+        day = format_days_elapsed(hour)
+    elif '_Day_' in stem:
+        day = stem.split('_Day_', 1)[1]
+        hour = day
+    else:
+        return None
+    if not hour:
+        return None
+    return (hour, day or None)
+
+
+def _combined_atlas_title(hour_key, day_label, condition=None):
+    if hour_key == 'Last':
+        snapshot = 'Last snapshot'
+    elif day_label:
+        snapshot = f'Day {day_label} ({hour_key} h)'
+    else:
+        snapshot = f'{hour_key} h'
+    if condition:
+        return f'{condition} — {snapshot}'
+    return snapshot
+
+
+def _combine_atlases_in_folder(folder, condition=None):
+    """Build combined_atlas_* stacks from genotype atlases in one folder."""
+    if not os.path.isdir(folder):
         return
 
+    images_per_day = {}
     for filename in os.listdir(folder):
         if not filename.endswith(('png', 'jpg', 'jpeg')):
             continue
-        if "_Day_" in filename:
-            try:
-                day = filename.split('_Day_')[1].split('.png')[0]
-            except Exception:
-                continue
-        elif "Last_Day" in filename:
-            day = "Last"
-        else:
+        if filename.startswith('combined_atlas'):
             continue
+        if os.path.isdir(os.path.join(folder, filename)):
+            continue
+        parsed = _snapshot_key_from_filename(filename)
+        if parsed is None:
+            continue
+        images_per_day.setdefault(parsed, []).append(filename)
 
-        images_per_day.setdefault(day, []).append(filename)
+    sorted_days = sorted(
+        images_per_day,
+        key=lambda item: (item[0] == 'Last', _hour_sort_key(item[0])),
+    )
 
-    sorted_days = sorted([d for d in images_per_day.keys() if d != "Last"], key=lambda x: int(x))
-    if "Last" in images_per_day:
-        sorted_days.append("Last")
-
-    for day in sorted_days:
-        images = images_per_day[day]
+    for hour_key, day_label in sorted_days:
+        images = images_per_day[(hour_key, day_label)]
         images.sort(key=utils.natural_key)
+        if not images:
+            continue
 
         fig, axs = plt.subplots(len(images), 1, figsize=(9, 4 * len(images)))
         if len(images) == 1:
@@ -402,17 +726,125 @@ def visualize_combined_atlases(conf):
         for i, image_name in enumerate(images):
             image_path = os.path.join(folder, image_name)
             img = cv2.imread(image_path)
+            if img is None:
+                continue
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             axs[i].imshow(img)
             axs[i].axis('off')
 
+        fig.suptitle(_combined_atlas_title(hour_key, day_label, condition=condition))
+        if hour_key == 'Last':
+            combined_name = 'combined_atlas_Last_Day.png'
+        elif day_label:
+            combined_name = f'combined_atlas_day_{day_label}_t_{hour_key}.png'
+        else:
+            combined_name = f'combined_atlas_t_{hour_key}.png'
         plt.subplots_adjust(wspace=0, hspace=0)
-        plt.savefig(os.path.join(overview_dir(conf, MODULE_CONVEX), f'combined_atlas_day_{day}.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(folder, combined_name), dpi=300, bbox_inches='tight')
         plt.close('all')
 
 
+def visualize_combined_atlases(conf):
+    """Stacks atlas images vertically for qualitative comparison across days.
+
+    Writes combined overviews in the genotype-only overview folder, and also in
+    each ``by_plate/{plate}`` / ``by_extra/{extra}`` subfolder when present.
+    """
+    from analysis.utils.report_style import get_extra_axis_label, get_plate_axis_label
+
+    folder = overview_dir(conf, MODULE_CONVEX)
+    _combine_atlases_in_folder(folder)
+    split_labels = {
+        'by_plate': get_plate_axis_label(conf),
+        'by_extra': get_extra_axis_label(conf),
+    }
+    for split_name, factor_label in split_labels.items():
+        split_root = os.path.join(folder, split_name)
+        if not os.path.isdir(split_root):
+            continue
+        for level in sorted(os.listdir(split_root), key=utils.natural_key):
+            level_dir = os.path.join(split_root, level)
+            if not os.path.isdir(level_dir):
+                continue
+            readable = convertFromPathSafe(level)
+            condition = f'{factor_label}: {readable}'
+            _combine_atlases_in_folder(level_dir, condition=condition)
+
+
+def usable_atlas_factor_levels(series):
+    """Distinct non-unspecified factor values, sorted."""
+    levels = []
+    seen = set()
+    for value in pd.Series(series).dropna().unique():
+        normalized = normalize_factor_value(value)
+        if normalized == UNSPECIFIED_FACTOR or normalized in seen:
+            continue
+        seen.add(normalized)
+        levels.append(normalized)
+    return sorted(levels, key=str)
+
+
+def write_experiment_atlases(atlas_bundle, convex_overview, exp_dir_name, hours,
+                             *, split_plates=False, split_extras=False, write_all=False):
+    """Write qualitative atlases for one genotype, optionally under by_plate/by_extra.
+
+    ``write_all`` keeps the genotype-pooled overview (all data) even when
+    plate/extra splits are also written — matching “Compare genotypes (all data)”.
+    """
+    if not atlas_bundle:
+        return
+    all_atlases = atlas_bundle.get('all') or []
+    if not all_atlases:
+        return
+
+    def _write_series(atlases, save_dir, hour_list, condition=None):
+        utils.ensure_directory(save_dir)
+        if hour_list:
+            for i, hour in enumerate(hour_list):
+                if i >= len(atlases):
+                    break
+                at_hull, at_cont, at_root = atlases[i]
+                visualize_single_atlas(
+                    at_hull, at_cont, at_root, save_dir, exp_dir_name, hour,
+                    condition=condition,
+                )
+        else:
+            at_hull, at_cont, at_root = atlases[-1]
+            visualize_single_atlas(
+                at_hull, at_cont, at_root, save_dir, exp_dir_name, None,
+                condition=condition,
+            )
+
+    if split_plates:
+        for plate, series in (atlas_bundle.get('by_plate') or {}).items():
+            plate_dir = os.path.join(
+                convex_overview, 'by_plate', convertToPathSafe(str(plate)),
+            )
+            _write_series(series, plate_dir, hours, condition=str(plate))
+    if split_extras:
+        for extra, series in (atlas_bundle.get('by_extra') or {}).items():
+            extra_dir = os.path.join(
+                convex_overview, 'by_extra', convertToPathSafe(str(extra)),
+            )
+            _write_series(series, extra_dir, hours, condition=str(extra))
+    if write_all or (not split_plates and not split_extras):
+        _write_series(all_atlases, convex_overview, hours)
+
+
+# Length is millimetres and hull area is millimetres squared, so density is
+# mm/mm² rather than a count per area.
+HULL_AXIS_LABELS = {
+    'Convex Hull Area': 'Area (mm²)',
+    'Lateral Root Area Density': 'Lateral root length / area (mm/mm²)',
+    'Total Root Area Density': 'Total root length / area (mm/mm²)',
+    'Convex Hull Aspect Ratio': 'Height / width',
+    'Convex Hull Width': 'Width (mm)',
+    'Convex Hull Height': 'Height (mm)',
+}
+
+
 def plot_hull_metrics_summary(conf, frame):
-    """Generates per-metric violin plots and overview summary CSV."""
+    """Overview summary CSV. Comparison figures are written per metric afterwards."""
     plt.ioff()
 
     metrics_config = [
@@ -424,53 +856,70 @@ def plot_hull_metrics_summary(conf, frame):
         ('Convex Hull Height', 'Height', 'Height (mm)', False),
     ]
 
-    geno_palette = genotype_palette_for_data(frame)
-    geno_label = get_genotype_axis_label(conf)
-
-    for y_col, title, y_label, filter_zeros in metrics_config:
+    for y_col, _title, _y_label, _filter_zeros in metrics_config:
         slug = metric_slug(y_col)
-        plt.figure()
-        plot_data = frame.copy()
-        if filter_zeros:
-            plot_data = plot_data[plot_data[y_col] > 0].reset_index(drop=True)
-
-        sns.violinplot(x='Day', y=y_col, data=plot_data, hue='Experiment', inner='quartile',
-                       palette=geno_palette)
-        plt.title(f'{y_col} — {title}')
-        plt.ylabel(y_label)
-        leg = plt.gca().get_legend()
-        if leg is not None:
-            leg.set_title(geno_label)
-        plt.savefig(plot_file(conf, MODULE_CONVEX, slug, f'{slug}_violin.png'), dpi=300, bbox_inches='tight')
-        plt.close('all')
+        retired = plot_file(conf, MODULE_CONVEX, slug, f'{slug}_violin.png')
+        if os.path.isfile(retired):
+            os.remove(retired)
 
     numeric_cols = [c for c, *_ in metrics_config]
-    summary = frame.groupby(['Day', 'Experiment'])[numeric_cols].agg(['mean', 'std']).round(3)
+    summary = frame.groupby(['ElapsedTime (h)', 'Experiment'])[numeric_cols].agg(['mean', 'std']).round(3)
     summary.to_csv(os.path.join(overview_dir(conf, MODULE_CONVEX), 'Summary_table.csv'))
 
 
 def analyze_hull_statistics(conf, data, metric):
-    from .stats_utils import perform_interval_pairwise_stats
+    from .stats_utils import iter_replica_runs, perform_interval_pairwise_stats
     from .report_plots import emit_interval_comparison_plots
-    from .utils.report_paths import metric_dir, table_file
+    from .utils.report_paths import (
+        REPLICAS_DIR,
+        analysis_dir,
+        clear_replicas_subdir,
+        metric_dir,
+        table_file,
+    )
 
     data = data.copy()
-    data['Day'] = data['Day'].astype(str)
-    days = [d.strip() for d in conf['daysConvexHull'].split(',') if d.strip()]
+    if 'ElapsedTime (h)' not in data.columns and 'Day' in data.columns:
+        data['ElapsedTime (h)'] = data['Day']
+    data['ElapsedTime (h)'] = data['ElapsedTime (h)'].astype(str)
+    hours = [str(h) for h in conf_snapshot_hours(conf, kind='convex')]
     slug = metric_slug(metric)
     table_path = table_file(conf, MODULE_CONVEX, slug, 'summary_table.csv')
+    ylabel = HULL_AXIS_LABELS.get(metric, metric)
+    base_dir = metric_dir(conf, MODULE_CONVEX, slug)
     perform_interval_pairwise_stats(
         conf, data, metric, output_dir=None,
-        interval_col='Day',
-        intervals=days,
+        interval_col='ElapsedTime (h)',
+        intervals=hours,
         plant_id_col='Plant_id',
-        interval_label='Day',
+        interval_label='ElapsedTime (h)',
         module=MODULE_CONVEX,
         metric_slug_name=slug,
         table_file_path=table_path,
     )
     emit_interval_comparison_plots(
-        conf, data, metric, metric_dir(conf, MODULE_CONVEX, slug),
+        conf, data, metric, base_dir,
         module=MODULE_CONVEX, metric_slug_name=slug,
-        metric_label=metric,
+        metric_label=metric, x_col='ElapsedTime (h)',
+        ylabel=ylabel,
     )
+    clear_replicas_subdir(base_dir)
+    for _extra, extra_slug, subset, replica_conf in iter_replica_runs(conf, data):
+        replica_dir = analysis_dir(conf, MODULE_CONVEX, slug, REPLICAS_DIR, extra_slug)
+        replica_subpath = (REPLICAS_DIR, extra_slug)
+        perform_interval_pairwise_stats(
+            replica_conf, subset, metric, output_dir=None,
+            interval_col='ElapsedTime (h)',
+            intervals=hours,
+            plant_id_col='Plant_id',
+            interval_label='ElapsedTime (h)',
+            module=MODULE_CONVEX,
+            metric_slug_name=slug,
+            subpath=replica_subpath,
+        )
+        emit_interval_comparison_plots(
+            replica_conf, subset, metric, replica_dir,
+            module=MODULE_CONVEX, metric_slug_name=slug,
+            metric_label=metric, x_col='ElapsedTime (h)',
+            ylabel=ylabel,
+        )

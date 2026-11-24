@@ -1,0 +1,1241 @@
+"""Detect clock-overlap groups, align elapsed time, and crop report windows."""
+
+import csv
+import json
+import os
+import re
+from collections import defaultdict
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+SYNTHETIC_YEAR = 2000
+DEFAULT_CLOCK_TICKS = ['00:00']
+ID_COLUMNS = (
+    'Experiment', 'Plant_id', 'PlateCondition', 'ExtraVariable',
+    'Video', 'rpi', 'cam',
+)
+_FILENAME_DIGITS = re.compile(r'\d+')
+
+
+def closest_timed_path(paths, target):
+    """Return the path whose filename timestamp is closest to target."""
+    target = parse_datetime(target)
+    if target is None:
+        return None
+    best = None
+    best_delta = None
+    for path in paths or []:
+        ts = datetime_from_filename(path)
+        if ts is None:
+            continue
+        delta = abs((ts - target).total_seconds())
+        if best is None or delta < best_delta:
+            best = path
+            best_delta = delta
+    return best
+
+
+def datetime_from_filename(name):
+    """Parse YYYY-MM-DD_HH-MM style stamps from an image or csv filename."""
+    nums = _FILENAME_DIGITS.findall(os.path.basename(str(name)))
+    if len(nums) < 5:
+        return None
+    try:
+        return pd.Timestamp(
+            int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3]), int(nums[4]),
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def elapsed_day_clock(names, step_minutes=15):
+    """Day and HH:MM elapsed from the first timestamped filename.
+
+    The viewers used to advance one capture interval per frame. A missing
+    picture then still counted as that interval, so the day ran ahead of the
+    clocks written in the filenames. Each name is parsed with
+    datetime_from_filename and measured from the first stamp that parses.
+
+    A name with no stamp adds step_minutes to the previous frame. Frames
+    before the first real stamp stay at zero. When nothing parses, every
+    frame uses that constant interval, which is the old clock. Returns
+    three int arrays (days, hours, minutes).
+    """
+    try:
+        step = int(step_minutes)
+    except (TypeError, ValueError):
+        step = 15
+    if step <= 0:
+        step = 15
+
+    stamps = [datetime_from_filename(name) for name in (names or [])]
+    n = len(stamps)
+    days = np.zeros(n, dtype=int)
+    hours = np.zeros(n, dtype=int)
+    minutes = np.zeros(n, dtype=int)
+    origin = None
+    for ts in stamps:
+        if ts is not None:
+            origin = ts
+            break
+    if origin is None:
+        elapsed = np.arange(n, dtype=int) * step
+        days[:] = elapsed // 1440
+        hours[:] = (elapsed // 60) % 24
+        minutes[:] = elapsed % 60
+        return days, hours, minutes
+
+    # Frames before the first real stamp stay at 0. A later name with no
+    # stamp moves one capture interval past the previous frame; the next
+    # real stamp replaces that guess.
+    previous = None
+    for i, ts in enumerate(stamps):
+        if ts is None:
+            if previous is None:
+                elapsed_min = 0
+            else:
+                previous = previous + pd.Timedelta(minutes=step)
+                elapsed_min = int((previous - origin).total_seconds() // 60)
+        else:
+            previous = ts
+            elapsed_min = int((ts - origin).total_seconds() // 60)
+        if elapsed_min < 0:
+            elapsed_min = 0
+        days[i] = elapsed_min // 1440
+        hours[i] = (elapsed_min // 60) % 24
+        minutes[i] = elapsed_min % 60
+    return days, hours, minutes
+
+
+def parse_datetime(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, pd.Timestamp):
+        ts = value
+    elif isinstance(value, datetime):
+        ts = pd.Timestamp(value)
+    else:
+        ts = pd.to_datetime(value, errors='coerce')
+    if ts is None or pd.isna(ts):
+        return None
+    if getattr(ts, 'tzinfo', None) is not None:
+        ts = ts.tz_localize(None)
+    return pd.Timestamp(ts).floor('min')
+
+
+def format_datetime(value):
+    ts = parse_datetime(value)
+    if ts is None:
+        return ''
+    return ts.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def is_synthetic_date(value):
+    ts = parse_datetime(value)
+    return ts is not None and int(ts.year) <= SYNTHETIC_YEAR
+
+
+def report_folder_name(conf):
+    name = str((conf or {}).get('reportFolderName') or 'Report').strip() or 'Report'
+    name = os.path.basename(name.replace('\\', '/'))
+    if name in ('.', '..', ''):
+        name = 'Report'
+    return name
+
+
+def figure_clock_ticks_enabled(conf):
+    """Clock-time markers: saved flag, else on for real-time sync and off for anchor."""
+    conf = conf or {}
+    if conf.get('showFigureClockTicks') is not None:
+        return bool(conf.get('showFigureClockTicks'))
+    return (conf.get('timeSyncMode') or 'clock') != 'anchor'
+
+
+def parse_clock_ticks(conf):
+    if not figure_clock_ticks_enabled(conf):
+        return []
+    raw = (conf or {}).get('figureClockTicks')
+    if raw in (None, ''):
+        raw = DEFAULT_CLOCK_TICKS
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.replace(';', ',').split(',') if p.strip()]
+    else:
+        parts = [str(p).strip() for p in raw if str(p).strip()]
+    ticks = []
+    for part in parts:
+        try:
+            hour_s, minute_s = part.split(':', 1)
+            hour = int(hour_s)
+            minute = int(minute_s)
+        except (ValueError, TypeError):
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            ticks.append((hour, minute, f'{hour:02d}:{minute:02d}'))
+    return ticks
+
+
+def parse_hour_list(raw):
+    if raw in (None, ''):
+        return []
+    if isinstance(raw, (list, tuple)):
+        parts = raw
+    else:
+        parts = str(raw).replace(';', ',').split(',')
+    hours = []
+    for part in parts:
+        text = str(part).strip()
+        if not text:
+            continue
+        try:
+            hours.append(int(round(float(text))))
+        except (TypeError, ValueError):
+            continue
+    return hours
+
+
+def snapshot_hours(conf, kind='convex'):
+    """Elapsed snapshot hours for convex-hull or lateral-angle figures."""
+    if conf is None:
+        return []
+    kind = 'angles' if kind == 'angles' else 'convex'
+    specific = 'snapshotHoursAngles' if kind == 'angles' else 'snapshotHoursConvex'
+    hours = parse_hour_list(conf.get(specific))
+    if hours:
+        return hours
+    hours = parse_hour_list(conf.get('snapshotHours'))
+    if hours:
+        return hours
+    legacy = 'daysAngles' if kind == 'angles' else 'daysConvexHull'
+    return parse_hour_list(conf.get(legacy))
+
+
+def elapsed_hour_windows(data, dt, hour_col='ElapsedTime (h)'):
+    """Yield (start, end) integer hour bins covering the elapsed range."""
+    if data is None or data.empty or hour_col not in data.columns:
+        return
+    try:
+        dt = max(int(dt), 1)
+    except (TypeError, ValueError):
+        dt = 1
+    series = pd.to_numeric(data[hour_col], errors='coerce').dropna()
+    if series.empty:
+        return
+    min_h = int(np.floor(series.min()))
+    max_h = int(np.floor(series.max()))
+    start = min_h
+    while start <= max_h:
+        end = min(start + dt, max_h + 1)
+        yield start, end
+        start = end
+
+
+def _ensure_dates(series):
+    return pd.to_datetime(series, errors='coerce')
+
+
+def elapsed_hours_from_t0(dates, t0):
+    """Integer hour bins: floor((Date - t0) / 1 hour).
+
+    pandas/NumPy .round uses banker's rounding (half to even). Offsets of
+    n + 0.5 hours then collapse onto even elapsed hours and odd hours become
+    empty after reindex. Floor keeps consecutive hourly stamps 1 h apart.
+    """
+    series = pd.to_datetime(pd.Series(dates), errors='coerce')
+    t0_ts = parse_datetime(t0)
+    if t0_ts is None:
+        return pd.Series(np.nan, index=series.index, dtype='float64')
+    delta = series - t0_ts
+    hours = delta.dt.total_seconds() / 3600.0
+    elapsed = np.floor(hours.to_numpy(dtype=float))
+    result = pd.Series(elapsed, index=series.index, dtype='float64')
+    return result.where(series.notna(), np.nan)
+
+
+def _plant_key_columns(data):
+    cols = [c for c in ('Experiment', 'Video', 'Plant_id') if c in data.columns]
+    if 'Plant_id' not in cols:
+        raise ValueError('Elapsed-time alignment requires a Plant_id column')
+    return cols
+
+
+def plant_date_spans(data):
+    """Return a DataFrame of per-plant Date min/max (and optional Video)."""
+    if data is None or data.empty or 'Date' not in data.columns:
+        return pd.DataFrame(columns=['Experiment', 'Plant_id', 'Video', 'date_min', 'date_max'])
+    work = data.copy()
+    work['Date'] = _ensure_dates(work['Date'])
+    work = work.dropna(subset=['Date'])
+    if work.empty:
+        return pd.DataFrame(columns=['Experiment', 'Plant_id', 'Video', 'date_min', 'date_max'])
+    if 'Plant_id' not in work.columns:
+        work['Plant_id'] = 'plant'
+    if 'Experiment' not in work.columns:
+        work['Experiment'] = 'unspecified'
+    group_cols = _plant_key_columns(work)
+    rows = []
+    for key, part in work.groupby(group_cols, sort=False):
+        if not isinstance(key, tuple):
+            key = (key,)
+        record = dict(zip(group_cols, key))
+        record['date_min'] = part['Date'].min()
+        record['date_max'] = part['Date'].max()
+        if 'Video' in part.columns:
+            record['Video'] = part['Video'].iloc[0]
+        else:
+            record['Video'] = ''
+        record['n_plants'] = 1
+        rows.append(record)
+    return pd.DataFrame(rows)
+
+
+START_COHORT_HOURS = 12
+
+
+def _union_find_clusters(spans, *, merge_partial_overlaps=True, start_window_hours=START_COHORT_HOURS):
+    """Cluster date spans.
+
+    merge_partial_overlaps=True: any calendar overlap joins plants (legacy).
+    False: only plants whose starts are within start_window_hours join, so
+    staggered biological replicates with long partial overlap stay separate.
+    """
+    n = len(spans)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    if merge_partial_overlaps:
+        for i in range(n):
+            start_i, end_i = spans[i]
+            for j in range(i + 1, n):
+                start_j, end_j = spans[j]
+                if start_i <= end_j and start_j <= end_i:
+                    union(i, j)
+    else:
+        window = pd.Timedelta(hours=float(start_window_hours))
+        starts = [span[0] for span in spans]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if abs(starts[i] - starts[j]) <= window:
+                    union(i, j)
+
+    clusters = defaultdict(list)
+    for i in range(n):
+        clusters[find(i)].append(i)
+    return list(clusters.values())
+
+
+def _group_dict(group_id, members, mode='clock'):
+    date_min = min(m['date_min'] for m in members)
+    date_max = max(m['date_max'] for m in members)
+    start = date_min
+    t0 = start
+    n_plants = 0
+    for member in members:
+        try:
+            n_plants += int(member.get('n_plants') or 1)
+        except (TypeError, ValueError):
+            n_plants += 1
+    return {
+        'id': int(group_id),
+        'n_plants': max(n_plants, len(members)),
+        'spanStart': format_datetime(date_min),
+        'spanEnd': format_datetime(date_max),
+        'start': format_datetime(start),
+        't0': format_datetime(t0),
+        'synthetic': bool(members and is_synthetic_date(members[0]['date_min'])),
+    }
+
+
+def _spans_frame(data):
+    if data is None or (hasattr(data, 'empty') and data.empty):
+        return pd.DataFrame()
+    if 'date_min' in data.columns and 'date_max' in data.columns:
+        work = data.copy()
+        work['date_min'] = work['date_min'].map(parse_datetime)
+        work['date_max'] = work['date_max'].map(parse_datetime)
+        work = work.dropna(subset=['date_min', 'date_max'])
+        if 'n_plants' not in work.columns:
+            work['n_plants'] = 1
+        if 'Video' not in work.columns:
+            work['Video'] = ''
+        if 'Experiment' not in work.columns:
+            work['Experiment'] = 'unspecified'
+        if 'Plant_id' not in work.columns:
+            work['Plant_id'] = work.get('Video', pd.Series(['plant'] * len(work)))
+        return work
+    return plant_date_spans(data)
+
+
+def detect_time_groups(data, mode='clock', merge_partial_overlaps=True):
+    """Cluster plants into analysis-period groups.
+
+    merge_partial_overlaps=True merges any overlapping calendar ranges.
+    False keeps separate start cohorts (starts more than ~12h apart).
+    Synthetic dates are still bucketed by Video.
+    """
+    spans = _spans_frame(data)
+    if spans.empty:
+        return []
+
+    real_rows = []
+    synthetic_buckets = defaultdict(list)
+    records = spans.to_dict('records')
+    for rec in records:
+        if is_synthetic_date(rec['date_min']) and is_synthetic_date(rec['date_max']):
+            bucket = rec.get('Video') or rec.get('Experiment') or 'synthetic'
+            synthetic_buckets[str(bucket)].append(rec)
+        else:
+            real_rows.append(rec)
+
+    groups = []
+    group_id = 1
+    if real_rows:
+        intervals = [(r['date_min'], r['date_max']) for r in real_rows]
+        for cluster in _union_find_clusters(
+            intervals, merge_partial_overlaps=bool(merge_partial_overlaps),
+        ):
+            members = [real_rows[i] for i in cluster]
+            groups.append(_group_dict(group_id, members, mode=mode))
+            group_id += 1
+    for _bucket, members in sorted(synthetic_buckets.items(), key=lambda kv: kv[0]):
+        groups.append(_group_dict(group_id, members, mode='clock'))
+        group_id += 1
+
+    groups.sort(key=lambda g: g['spanStart'] or '')
+    for i, group in enumerate(groups, start=1):
+        group['id'] = i
+    return groups
+
+
+def _intervals_overlap(a_start, a_end, b_start, b_end):
+    if None in (a_start, a_end, b_start, b_end):
+        return False
+    return a_start <= b_end and b_start <= a_end
+
+
+def match_time_group(groups, date_min, date_max):
+    """Pick the saved group whose stored span overlaps this plant the most."""
+    if not groups:
+        return None
+    date_min = parse_datetime(date_min)
+    date_max = parse_datetime(date_max)
+    best = None
+    best_overlap = pd.Timedelta(0)
+    for group in groups:
+        span_start = parse_datetime(group.get('spanStart'))
+        span_end = parse_datetime(group.get('spanEnd'))
+        if not _intervals_overlap(date_min, date_max, span_start, span_end):
+            continue
+        overlap_start = max(date_min, span_start)
+        overlap_end = min(date_max, span_end)
+        overlap = overlap_end - overlap_start
+        if best is None or overlap > best_overlap:
+            best = group
+            best_overlap = overlap
+    return best
+
+
+def default_duration_hours(groups, data=None):
+    lengths = []
+    for group in groups or []:
+        start = parse_datetime(group.get('spanStart'))
+        end = parse_datetime(group.get('spanEnd'))
+        if start is not None and end is not None:
+            lengths.append((end - start).total_seconds() / 3600.0)
+    if lengths:
+        return int(max(1, int(np.ceil(min(lengths)))))
+    if data is not None and 'ElapsedTime (h)' in data.columns:
+        series = pd.to_numeric(data['ElapsedTime (h)'], errors='coerce').dropna()
+        if not series.empty:
+            return int(max(1, round(series.max() - series.min() + 1)))
+    return 40
+
+
+def shared_clock_origin(groups):
+    """Earliest group start; used as t0 when synchronizing by real time."""
+    starts = []
+    for group in groups or []:
+        ts = parse_datetime(group.get('start')) or parse_datetime(group.get('spanStart'))
+        if ts is not None:
+            starts.append(ts)
+    if not starts:
+        return None
+    return min(starts)
+
+
+def resolved_time_groups(conf, data=None):
+    mode = (conf or {}).get('timeSyncMode') or 'clock'
+    saved = list((conf or {}).get('timeGroups') or [])
+    if saved:
+        return saved, mode
+    merge = True if conf is None else conf.get('timeMergePartialOverlaps', True)
+    detected = (
+        detect_time_groups(data, mode=mode, merge_partial_overlaps=bool(merge))
+        if data is not None else []
+    )
+    return detected, mode
+
+
+def _end_opens_new_hour(t0, end):
+    """True when `end` is a whole number of hours after t0.
+
+    A photo stamped exactly at that instant is the only sample in a new
+    hourly bin. Keeping it adds one last point that only the timelapses
+    with a frame at `end` contribute to, and the genotype mean moves
+    because the other plants are missing, not because those roots changed.
+    """
+    t0_ts = parse_datetime(t0)
+    end_ts = parse_datetime(end)
+    if t0_ts is None or end_ts is None:
+        return False
+    delta_h = (end_ts - t0_ts).total_seconds() / 3600.0
+    if not np.isfinite(delta_h):
+        return False
+    return abs(delta_h - round(delta_h)) < 1e-6
+
+
+def _window_for_group(group, duration_hours, t0_override=None):
+    start = parse_datetime(group.get('start')) or parse_datetime(group.get('spanStart'))
+    if t0_override is not None:
+        t0 = parse_datetime(t0_override)
+    else:
+        t0 = parse_datetime(group.get('t0')) or start
+    if start is None:
+        return None
+    if duration_hours is None:
+        span_end = parse_datetime(group.get('spanEnd')) or start
+        end = span_end
+    else:
+        end = start + pd.Timedelta(hours=float(duration_hours))
+    if t0 is None:
+        t0 = start
+    return start, t0, end
+
+
+def period_frame_indices(names, conf):
+    """Indices of filenames that fall inside the saved analysis period.
+
+    Processing limit decides how much of the recording is tracked. The
+    analysis period then keeps only the timelapse that should be measured
+    and shown. With no saved groups, every index is returned. The last
+    index is the last picture of that timelapse.
+    """
+    names = list(names or [])
+    count = len(names)
+    if count == 0:
+        return []
+    groups = list((conf or {}).get('timeGroups') or [])
+    if not groups:
+        return list(range(count))
+    stamps = [datetime_from_filename(name) for name in names]
+    parsed = [ts for ts in stamps if ts is not None]
+    if not parsed:
+        return list(range(count))
+    duration = (conf or {}).get('timeDurationHours')
+    if duration in (None, ''):
+        duration_hours = default_duration_hours(groups)
+    else:
+        try:
+            duration_hours = float(duration)
+        except (TypeError, ValueError):
+            duration_hours = default_duration_hours(groups)
+    group = match_time_group(groups, min(parsed), max(parsed))
+    if group is None:
+        return list(range(count))
+    window = _window_for_group(group, duration_hours)
+    if window is None:
+        return list(range(count))
+    start, _t0, end = window
+    return [
+        i for i, ts in enumerate(stamps)
+        if ts is not None and start <= ts <= end
+    ]
+
+
+def apply_time_windows(data, conf):
+    """Recompute ElapsedTime from each group's t0, crop, and pad a shared grid."""
+    if data is None or data.empty:
+        return data
+    if 'Date' not in data.columns:
+        print('Analysis period skipped: no Date column in hourly data', flush=True)
+        return data
+
+    work = data.copy()
+    work['Date'] = _ensure_dates(work['Date'])
+    if 'Plant_id' not in work.columns:
+        work['Plant_id'] = np.arange(len(work)).astype(str)
+    if 'Video' in work.columns:
+        work['Video'] = work['Video'].fillna('').astype(str)
+    if 'Experiment' in work.columns:
+        work['Experiment'] = work['Experiment'].fillna('').astype(str)
+
+    groups = list((conf or {}).get('timeGroups') or [])
+    if not groups:
+        print(
+            'Analysis period skipped: no saved time groups '
+            '(set analysis period first)',
+            flush=True,
+        )
+        return work
+
+    duration = (conf or {}).get('timeDurationHours')
+    if duration in (None, ''):
+        duration_hours = default_duration_hours(groups, work)
+    else:
+        duration_hours = float(duration)
+
+    mode = (conf or {}).get('timeSyncMode') or 'clock'
+    clock_t0 = shared_clock_origin(groups) if mode != 'anchor' else None
+
+    key_cols = _plant_key_columns(work)
+    aligned = []
+    elapsed_bounds = []
+    n_empty = 0
+    n_unmatched = 0
+    for key, part in work.groupby(key_cols, sort=False):
+        part = part.sort_values('Date')
+        dates = part['Date'].dropna()
+        if dates.empty:
+            print(f'Skipping plant {key}: no Date values', flush=True)
+            continue
+        group = match_time_group(groups, dates.min(), dates.max())
+        if group is None:
+            print(
+                f'Skipping plant {key}: no overlapping analysis-period group',
+                flush=True,
+            )
+            n_unmatched += 1
+            continue
+        window = _window_for_group(group, duration_hours, t0_override=clock_t0)
+        if window is None:
+            print(f'Skipping plant {key}: analysis-period group has no start', flush=True)
+            n_unmatched += 1
+            continue
+        start, t0, end = window
+        # A duration that lands on the hour is [start, end). The frame at
+        # exactly `end` would otherwise become its own one-sample hour.
+        if _end_opens_new_hour(t0, end):
+            cropped = part[(part['Date'] >= start) & (part['Date'] < end)].copy()
+        else:
+            cropped = part[(part['Date'] >= start) & (part['Date'] <= end)].copy()
+        if cropped.empty:
+            print(
+                f'Skipping plant {key}: no samples in analysis window '
+                f'{format_datetime(start)}–{format_datetime(end)}',
+                flush=True,
+            )
+            n_empty += 1
+            continue
+        elapsed = elapsed_hours_from_t0(cropped['Date'], t0)
+        cropped = cropped.loc[elapsed.notna()].copy()
+        if cropped.empty:
+            print(f'Skipping plant {key}: elapsed hours could not be computed', flush=True)
+            n_empty += 1
+            continue
+        cropped['ElapsedTime (h)'] = elapsed.loc[cropped.index].astype(int)
+        cropped['_t0'] = t0
+        bound_hours = elapsed_hours_from_t0(pd.Series([start]), t0)
+        if bound_hours.isna().any():
+            continue
+        e0 = int(bound_hours.iloc[0])
+        real_max = int(cropped['ElapsedTime (h)'].max())
+        elapsed_bounds.append((e0, real_max))
+        aligned.append(cropped)
+
+    if n_empty or n_unmatched:
+        print(
+            f'Analysis period dropped {n_empty} plants with empty windows '
+            f'and {n_unmatched} unmatched plants',
+            flush=True,
+        )
+
+    if not aligned:
+        print('Analysis period: no plants overlapped the configured window', flush=True)
+        return work.iloc[0:0].copy()
+
+    grid_start = min(b[0] for b in elapsed_bounds)
+    grid_end = max(b[1] for b in elapsed_bounds)
+    if grid_end < grid_start:
+        grid_end = grid_start
+    target_hours = list(range(int(grid_start), int(grid_end) + 1))
+
+    padded = []
+    for frame in aligned:
+        t0 = frame['_t0'].iloc[0]
+        identity = {}
+        for col in ID_COLUMNS:
+            if col in frame.columns and len(frame[col].dropna()):
+                identity[col] = frame[col].dropna().iloc[0]
+        indexed = frame.drop(columns=['_t0']).drop_duplicates('ElapsedTime (h)', keep='last')
+        indexed = indexed.set_index('ElapsedTime (h)')
+        reindexed = indexed.reindex(target_hours)
+        for col, value in identity.items():
+            reindexed[col] = reindexed[col].fillna(value)
+        reindexed = reindexed.reset_index()
+        if 'index' in reindexed.columns and 'ElapsedTime (h)' not in reindexed.columns:
+            reindexed = reindexed.rename(columns={'index': 'ElapsedTime (h)'})
+        kept_dates = reindexed['Date'].copy() if 'Date' in reindexed.columns else None
+        reindexed['Date'] = pd.to_datetime(t0) + pd.to_timedelta(
+            pd.to_numeric(reindexed['ElapsedTime (h)'], errors='coerce'), unit='h'
+        )
+        if kept_dates is not None:
+            real = kept_dates.notna()
+            reindexed.loc[real, 'Date'] = pd.to_datetime(kept_dates.loc[real])
+        padded.append(reindexed)
+
+    result = pd.concat(padded, ignore_index=True)
+    if 'NewDay' in result.columns:
+        dates = pd.to_datetime(result['Date'])
+        result['NewDay'] = (dates.dt.hour == 0) & (dates.dt.minute == 0)
+    return result
+
+
+INITIAL_STAGE_COLUMNS = (
+    'MainRootLength (mm)',
+    'LateralRootsLength (mm)',
+    'TotalLength (mm)',
+    'HypocotylLength (mm)',
+    'NumberOfLateralRoots',
+    'Area (mm2)',
+    'DenseRootArea (mm2)',
+    'Area',
+    'DenseRootArea',
+)
+
+
+def subtract_initial_stage(data, conf):
+    """Subtract each plant's first in-window non-NaN from length/area/LR series."""
+    if data is None or data.empty:
+        return data
+    if not (conf or {}).get('measureRelativeToInitial'):
+        return data
+    work = data.copy()
+    cols = [c for c in INITIAL_STAGE_COLUMNS if c in work.columns]
+    if not cols:
+        return work
+    for col in cols:
+        work[col] = pd.to_numeric(work[col], errors='coerce')
+    key_cols = _plant_key_columns(work)
+    for _key, part in work.groupby(key_cols, sort=False):
+        idx = part.index
+        for col in cols:
+            series = work.loc[idx, col]
+            first = series.first_valid_index()
+            if first is None:
+                continue
+            baseline = series.loc[first]
+            if pd.isna(baseline):
+                continue
+            work.loc[idx, col] = series - baseline
+    return work
+
+
+def hourly_covers_analysis_period(hourly_df, conf):
+    """True if each group's [start, start+duration] lies inside Hour Date spans."""
+    if hourly_df is None or hourly_df.empty or 'Date' not in hourly_df.columns:
+        return False
+    groups = list((conf or {}).get('timeGroups') or [])
+    if not groups:
+        return False
+    duration = (conf or {}).get('timeDurationHours')
+    if duration in (None, ''):
+        duration_hours = default_duration_hours(groups, hourly_df)
+    else:
+        duration_hours = float(duration)
+
+    mode = (conf or {}).get('timeSyncMode') or 'clock'
+    clock_t0 = shared_clock_origin(groups) if mode != 'anchor' else None
+
+    work = hourly_df.copy()
+    work['Date'] = _ensure_dates(work['Date'])
+    if 'Plant_id' not in work.columns:
+        return False
+    key_cols = _plant_key_columns(work)
+    group_bounds = {}
+    for _key, part in work.groupby(key_cols, sort=False):
+        dates = part['Date'].dropna()
+        if dates.empty:
+            continue
+        group = match_time_group(groups, dates.min(), dates.max())
+        if group is None:
+            continue
+        gid = group.get('id')
+        dmin, dmax = dates.min(), dates.max()
+        if gid not in group_bounds:
+            group_bounds[gid] = [dmin, dmax]
+        else:
+            group_bounds[gid][0] = min(group_bounds[gid][0], dmin)
+            group_bounds[gid][1] = max(group_bounds[gid][1], dmax)
+
+    if not group_bounds:
+        return False
+    for i, group in enumerate(groups):
+        window = _window_for_group(group, duration_hours, t0_override=clock_t0)
+        if window is None:
+            return False
+        start, _t0, end = window
+        gid = group.get('id')
+        if gid is None:
+            gid = i + 1
+        bounds = group_bounds.get(gid)
+        if bounds is None:
+            bounds = group_bounds.get(i + 1)
+        if bounds is None:
+            return False
+        if bounds[0] > start or bounds[1] < end:
+            return False
+    return True
+
+
+def elapsed_clock_ticks(data, conf=None, clock_times=None):
+    """Elapsed hours whose Date matches configured clock times of day."""
+    if data is None or data.empty:
+        return []
+    if 'ElapsedTime (h)' not in data.columns:
+        return []
+    ticks = parse_clock_ticks(conf) if clock_times is None else clock_times
+    if not ticks:
+        return []
+    if 'Date' not in data.columns:
+        return []
+    dates = _ensure_dates(data['Date'])
+    hours = pd.to_numeric(data['ElapsedTime (h)'], errors='coerce')
+    elapsed_int = pd.Series(np.floor(hours.to_numpy(dtype=float)), index=hours.index)
+    elapsed_int = elapsed_int.where(hours.notna())
+    found = []
+    seen = set()
+    for clock_h, clock_m, _label in ticks:
+        mask = (dates.dt.hour == clock_h) & (dates.dt.minute == clock_m)
+        if not mask.any() and clock_m == 0:
+            mask = dates.dt.hour == clock_h
+        values = elapsed_int[mask].dropna().astype(int)
+        for value in sorted(values.unique()):
+            value = int(value)
+            if value in seen:
+                continue
+            at_h = dates[elapsed_int == value].dropna()
+            if at_h.empty:
+                continue
+            clocks = {
+                (int(ts.hour), int(ts.minute)) for ts in at_h
+            }
+            if len(clocks) != 1:
+                continue
+            seen.add(value)
+            found.append(value)
+    return found
+
+
+def clock_tick_label(data, elapsed_hour):
+    if data is None or data.empty or 'Date' not in data.columns:
+        return '00:00'
+    hours = pd.to_numeric(data['ElapsedTime (h)'], errors='coerce')
+    match = data.loc[hours.round(0) == int(elapsed_hour)]
+    if match.empty:
+        return '00:00'
+    ts = parse_datetime(match['Date'].iloc[0])
+    if ts is None:
+        return '00:00'
+    return ts.strftime('%H:%M')
+
+
+def day_ticks_for_limits(x_min, x_max):
+    """Day N at N * 24 h. Skip Day 0 (same as the original report guide)."""
+    if x_min is None or x_max is None:
+        return [], []
+    try:
+        x_min = float(x_min)
+        x_max = float(x_max)
+    except (TypeError, ValueError):
+        return [], []
+    if not np.isfinite(x_min) or not np.isfinite(x_max):
+        return [], []
+    if x_max < x_min:
+        x_min, x_max = x_max, x_min
+    first = int(np.ceil(x_min / 24.0))
+    last = int(np.floor(x_max / 24.0))
+    ticks = []
+    labels = []
+    for day in range(first, last + 1):
+        if day == 0:
+            continue
+        ticks.append(day * 24)
+        labels.append(f'Day {day}')
+    return ticks, labels
+
+
+def format_days_elapsed(hours):
+    """Compact hour/24 label: 24 -> '1', 36 -> '1.5'."""
+    try:
+        days = float(hours) / 24.0
+    except (TypeError, ValueError):
+        return ''
+    if not np.isfinite(days):
+        return ''
+    rounded = round(days)
+    if abs(days - rounded) < 1e-9:
+        return str(int(rounded))
+    return f'{days:.2f}'.rstrip('0').rstrip('.')
+
+
+def hourly_files_exist(main_folder):
+    """True if any PostProcess_Hour.csv exists under Analysis/ (does not read files)."""
+    analysis = os.path.join(main_folder, 'Analysis') if main_folder else ''
+    if not analysis or not os.path.isdir(analysis):
+        return False
+    for _dirpath, _dirnames, filenames in os.walk(analysis):
+        if 'PostProcess_Hour.csv' in filenames:
+            return True
+    return False
+
+
+def collect_hourly_frames(analysis_folder):
+    """Load PostProcess_Hour.csv frames (Date fallback from Results_raw names)."""
+    frames = []
+    if not analysis_folder or not os.path.isdir(analysis_folder):
+        return frames
+    for dirpath, _dirnames, filenames in os.walk(analysis_folder):
+        if 'PostProcess_Hour.csv' not in filenames:
+            continue
+        path = os.path.join(dirpath, 'PostProcess_Hour.csv')
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if 'Date' not in df.columns or df['Date'].isna().all():
+            raw_path = os.path.join(dirpath, 'Results_raw.csv')
+            dates = []
+            if os.path.isfile(raw_path):
+                try:
+                    raw = pd.read_csv(raw_path, usecols=lambda c: c in ('FileName',))
+                    dates = [datetime_from_filename(n) for n in raw['FileName']]
+                except Exception:
+                    dates = []
+            if dates and any(d is not None for d in dates):
+                df = df.copy()
+                if len(dates) >= len(df):
+                    df['Date'] = dates[:len(df)]
+                else:
+                    continue
+            else:
+                continue
+        df = df.copy()
+        df['Date'] = _ensure_dates(df['Date'])
+        if 'Plant_id' not in df.columns:
+            plant_folder = os.path.basename(os.path.dirname(dirpath))
+            df['Plant_id'] = plant_folder
+        frames.append(df)
+    return frames
+
+
+def collect_hourly_data(main_folder):
+    analysis = os.path.join(main_folder, 'Analysis') if main_folder else ''
+    frames = collect_hourly_frames(analysis)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_hourly_tables(conf):
+    """Load PostProcess_Hour.csv tables from the project's Analysis tree."""
+    return collect_hourly_data((conf or {}).get('MainFolder') or '')
+
+
+def collect_acquisition_spans(main_folder):
+    """Earliest and latest clock time for each tracked plant or screening video.
+
+    Tracking writes Results_raw.csv in time order, so the first and last data
+    rows are the whole span. The same edge read is used for a screening seeds
+    file and, only when no results file has a stamp, for PostProcess_Hour.csv.
+    Group detection still sees one row per plant, not one row per frame.
+    """
+    if not main_folder:
+        return pd.DataFrame()
+
+    def edge_column(path, column, delimiter=','):
+        """First and last non-empty values of one CSV column, or (None, None).
+
+        The body of the file is not parsed. Tracking writes rows in time
+        order, so these two cells are the start and end of the recording.
+        """
+        try:
+            with open(path, 'r', newline='') as handle:
+                header_line = handle.readline()
+                if not header_line:
+                    return None, None
+                header = next(csv.reader([header_line], delimiter=delimiter))
+                if column not in header:
+                    return None, None
+                index = header.index(column)
+                first_line = ''
+                while True:
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        first_line = line
+                        break
+            with open(path, 'rb') as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                chunk = min(size, 65536)
+                handle.seek(size - chunk)
+                tail = handle.read().decode('utf-8', errors='replace')
+        except (OSError, UnicodeError, csv.Error, StopIteration):
+            return None, None
+        first_val = ''
+        if first_line:
+            try:
+                parsed = next(csv.reader([first_line], delimiter=delimiter))
+            except (csv.Error, StopIteration):
+                parsed = []
+            if len(parsed) > index:
+                first_val = parsed[index].strip()
+        parts = tail.splitlines()
+        if size > chunk and parts:
+            parts = parts[1:]
+        last_val = ''
+        for line in reversed(parts):
+            if not line.strip():
+                continue
+            try:
+                parsed = next(csv.reader([line], delimiter=delimiter))
+            except (csv.Error, StopIteration):
+                continue
+            if len(parsed) > index and parsed[index].strip():
+                last_val = parsed[index].strip()
+                break
+        return first_val or None, last_val or None
+
+    def span_from_edges(first_name, last_name, plant_id, experiment, video, n_plants=1):
+        date_min = datetime_from_filename(first_name) or parse_datetime(first_name)
+        date_max = datetime_from_filename(last_name) or parse_datetime(last_name)
+        if date_min is None or date_max is None:
+            return None
+        if date_max < date_min:
+            date_min, date_max = date_max, date_min
+        return {
+            'Experiment': experiment or 'unspecified',
+            'Plant_id': str(plant_id),
+            'Video': video or '',
+            'date_min': date_min,
+            'date_max': date_max,
+            'n_plants': int(n_plants or 1),
+        }
+
+    rows = []
+
+    # Screening projects keep one folder per video under analysis/, with the
+    # clock range already stored on metadata when the video was processed.
+    screening_root = os.path.join(main_folder, 'analysis')
+    if os.path.isdir(screening_root):
+        for analysis_id in sorted(os.listdir(screening_root)):
+            analysis_dir = os.path.join(screening_root, analysis_id)
+            if not os.path.isdir(analysis_dir):
+                continue
+            meta = {}
+            meta_path = os.path.join(analysis_dir, 'metadata.json')
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, 'r') as handle:
+                        meta = json.load(handle) or {}
+                except (OSError, json.JSONDecodeError):
+                    meta = {}
+            date_min = parse_datetime(meta.get('first_datetime'))
+            date_max = parse_datetime(meta.get('last_datetime'))
+            if date_min is None or date_max is None:
+                date_min = datetime_from_filename(meta.get('first_image'))
+                date_max = datetime_from_filename(meta.get('last_image'))
+            if date_min is None or date_max is None:
+                seeds_path = os.path.join(analysis_dir, 'seeds.tsv')
+                if os.path.isfile(seeds_path):
+                    first_name, last_name = edge_column(seeds_path, 'FileName', delimiter='\t')
+                    date_min = datetime_from_filename(first_name)
+                    date_max = datetime_from_filename(last_name)
+            n_plants = 1
+            counted_plants = False
+            seeds_path = os.path.join(analysis_dir, 'seeds.tsv')
+            if os.path.isfile(seeds_path):
+                try:
+                    with open(seeds_path, 'r', newline='') as handle:
+                        reader = csv.DictReader(handle, delimiter='\t')
+                        if reader.fieldnames and 'Plant_id' in reader.fieldnames:
+                            n_plants = len({
+                                (row.get('Plant_id') or '').strip()
+                                for row in reader
+                                if (row.get('Plant_id') or '').strip()
+                            }) or 1
+                            counted_plants = True
+                except OSError:
+                    n_plants = 1
+            if not counted_plants:
+                info = meta
+                group_path = os.path.join(analysis_dir, 'group_info.json')
+                if os.path.isfile(group_path):
+                    try:
+                        with open(group_path, 'r') as handle:
+                            info = json.load(handle) or meta
+                    except (OSError, json.JSONDecodeError):
+                        info = meta
+                counts = info.get('seed_counts') if isinstance(info, dict) else None
+                if counts:
+                    try:
+                        n_plants = int(sum(int(c or 0) for c in counts)) or 1
+                    except (TypeError, ValueError):
+                        n_plants = 1
+            if date_min is None or date_max is None:
+                continue
+            if date_max < date_min:
+                date_min, date_max = date_max, date_min
+            rows.append({
+                'Experiment': str(meta.get('analysis_id') or analysis_id),
+                'Plant_id': str(analysis_id),
+                'Video': str(analysis_id),
+                'date_min': date_min,
+                'date_max': date_max,
+                'n_plants': n_plants,
+            })
+        if rows:
+            return pd.DataFrame(rows)
+
+    # Standard projects: one Results_raw.csv per plant, rows in capture order.
+    analysis = os.path.join(main_folder, 'Analysis')
+    if os.path.isdir(analysis):
+        for dirpath, _dirnames, filenames in os.walk(analysis):
+            if 'Results_raw.csv' not in filenames:
+                continue
+            raw_path = os.path.join(dirpath, 'Results_raw.csv')
+            first_name, last_name = edge_column(raw_path, 'FileName')
+            plant_id = os.path.basename(os.path.dirname(dirpath))
+            experiment = os.path.basename(analysis)
+            video = ''
+            meta_path = os.path.join(dirpath, 'metadata.json')
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, 'r') as handle:
+                        meta = json.load(handle) or {}
+                    experiment = str(meta.get('Experiment') or experiment)
+                    video = str(meta.get('Video') or '')
+                    plant_id = str(meta.get('Plant_id') or plant_id)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            record = span_from_edges(first_name, last_name, plant_id, experiment, video)
+            if record is not None:
+                rows.append(record)
+        if rows:
+            return pd.DataFrame(rows)
+
+        # No raw file had a stamp. Hourly files are the last place a clock
+        # range is written; again only the first and last Date are needed.
+        for dirpath, _dirnames, filenames in os.walk(analysis):
+            if 'PostProcess_Hour.csv' not in filenames:
+                continue
+            hour_path = os.path.join(dirpath, 'PostProcess_Hour.csv')
+            first_value, last_value = edge_column(hour_path, 'Date')
+            if not first_value or not last_value:
+                raw_path = os.path.join(dirpath, 'Results_raw.csv')
+                if os.path.isfile(raw_path):
+                    first_value, last_value = edge_column(raw_path, 'FileName')
+            plant_id = os.path.basename(os.path.dirname(dirpath))
+            record = span_from_edges(
+                first_value, last_value, plant_id, os.path.basename(analysis), '',
+            )
+            if record is not None:
+                rows.append(record)
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+PERIOD_GATE_MESSAGE = (
+    "Set an analysis period for the current videos/plants before postprocessing. "
+    "The period is missing or was saved for a different set of analyses."
+)
+
+
+def time_period_sources(main_folder, spans=None):
+    """Fingerprint of the acquisition set used to set the analysis period.
+
+    Pass spans already loaded by the caller to avoid walking the project twice.
+    """
+    if spans is None:
+        spans = collect_acquisition_spans(main_folder)
+    if spans is None or spans.empty:
+        return []
+    analysis_root = os.path.join(main_folder, 'analysis') if main_folder else ''
+    if os.path.isdir(analysis_root) and 'Video' in spans.columns:
+        videos = sorted({
+            str(v).strip() for v in spans['Video'].dropna() if str(v).strip()
+        })
+        if videos:
+            return videos
+    keys = []
+    for _, row in spans.iterrows():
+        keys.append('\t'.join([
+            str(row.get('Experiment') or '').strip(),
+            str(row.get('Video') or '').strip(),
+            str(row.get('Plant_id') or '').strip(),
+        ]))
+    return sorted(keys)
+
+
+def analysis_period_is_current(conf, main_folder):
+    """True when the saved period was built for the videos in this folder.
+
+    The fingerprint is the plant list. The same names are reused from project
+    to project, so a matching list is not enough on its own: the saved
+    acquisition spans also have to overlap the dates on disk. A previous
+    project's windows then stop counting as the period for the new folder.
+    """
+    groups = list((conf or {}).get('timeGroups') or [])
+    saved = [str(s) for s in list((conf or {}).get('timePeriodSources') or [])]
+    spans = collect_acquisition_spans(main_folder)
+    current = [str(s) for s in time_period_sources(main_folder, spans=spans)]
+    if not groups or not saved or not current or saved != current:
+        return False
+    if spans is None or spans.empty or 'date_min' not in getattr(spans, 'columns', []):
+        return False
+    data_start = None
+    data_end = None
+    for value in spans['date_min']:
+        parsed = parse_datetime(value)
+        if parsed is not None and (data_start is None or parsed < data_start):
+            data_start = parsed
+    for value in spans['date_max']:
+        parsed = parse_datetime(value)
+        if parsed is not None and (data_end is None or parsed > data_end):
+            data_end = parsed
+    if data_start is None or data_end is None:
+        return False
+    for group in groups:
+        span_start = parse_datetime(group.get('spanStart')) or parse_datetime(group.get('start'))
+        span_end = parse_datetime(group.get('spanEnd')) or span_start
+        if span_start is None or span_end is None:
+            continue
+        if span_start <= data_end and data_start <= span_end:
+            return True
+    return False
+
+
+def groups_to_config(groups):
+    payload = []
+    for group in groups or []:
+        payload.append({
+            'id': int(group.get('id') or 0),
+            'spanStart': group.get('spanStart') or '',
+            'spanEnd': group.get('spanEnd') or '',
+            'start': group.get('start') or group.get('spanStart') or '',
+            't0': group.get('t0') or group.get('start') or '',
+            'n_plants': int(group.get('n_plants') or 0),
+        })
+    return payload

@@ -14,11 +14,22 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLabel, QLineEdit, QPushButton, QCheckBox,
                            QFileDialog, QGroupBox, QMessageBox, QScrollArea,
-                           QTabWidget, QTableWidget, QTableWidgetItem, QMenu, QComboBox, QDialog)
+                           QTabWidget, QTableWidget, QTableWidgetItem, QMenu, QComboBox, QDialog,
+                           QTreeWidget, QTreeWidgetItem)
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QPixmap, QIntValidator, QDoubleValidator
+from PyQt5.QtGui import QColor, QPixmap, QIntValidator
 import ui_errors
 import interface_config
+import chrono_root_backend  # noqa: F401
+from analysis.utils.fileUtilities import getImages
+from analysis.time_windows import (
+    PERIOD_GATE_MESSAGE,
+    analysis_period_is_current,
+    hourly_files_exist,
+    report_folder_name,
+)
+from robot_ids import identifier_from_rpi_cam, parse_robot_video_path, resolve_rpi_cam
+from stats_config_dialog import ScreeningStatsConfigDialog
 
 # --- CONFIGURATION CONSTANTS ---
 APP_NAME = "chronoRootScreening"
@@ -67,8 +78,10 @@ class AnalysisTab(QWidget):
         self.group_entries = []
         self.preview_window = None
         self.calibration_window = None
-        self.process_launcher = None
+        self.process_launchers = []
         self.report_launcher = None
+        self.postprocess_launcher = None
+        self._auto_identifier = ''
         self._loading_config = False
         self._ui_ready = False
         self.initUI()
@@ -121,6 +134,7 @@ class AnalysisTab(QWidget):
         # Video path
         video_layout = QHBoxLayout()
         self.video_path_edit = QLineEdit()
+        self.video_path_edit.textChanged.connect(self.on_video_path_changed)
         video_path_btn = QPushButton('Browse')
         video_path_btn.clicked.connect(self.browse_video_path)
         video_layout.addWidget(QLabel('Video Directory:'))
@@ -131,10 +145,33 @@ class AnalysisTab(QWidget):
         # Analysis identifier
         identifier_layout = QHBoxLayout()
         self.identifier_edit = QLineEdit()
-        self.identifier_edit.setPlaceholderText('analysis_name')
+        self.identifier_edit.setPlaceholderText('rpi3_cam_0')
         identifier_layout.addWidget(QLabel('Analysis Identifier:'))
         identifier_layout.addWidget(self.identifier_edit)
         proj_layout.addLayout(identifier_layout)
+
+        factor_layout = QHBoxLayout()
+        self.plateConditionName = QLineEdit()
+        self.plateConditionName.setObjectName("plateConditionName")
+        self.plateConditionName.setPlaceholderText('Control')
+        factor_layout.addWidget(QLabel('Plate Growth Condition:'))
+        factor_layout.addWidget(self.plateConditionName)
+        plate_hint = QLabel('(Optional, e.g. "Control", "Treatment")')
+        plate_hint.setStyleSheet('color: #666; font-size: 9pt;')
+        factor_layout.addWidget(plate_hint)
+        proj_layout.addLayout(factor_layout)
+
+        extra_layout = QHBoxLayout()
+        self.extraField = QLineEdit()
+        self.extraField.setObjectName("extraField")
+        self.extraField.setPlaceholderText('Run 1')
+        extra_layout.addWidget(QLabel('Extra Variable:'))
+        extra_layout.addWidget(self.extraField)
+        extra_hint = QLabel('(Optional value, e.g. Run 1, Run 2.)')
+        extra_hint.setStyleSheet('color: #666; font-size: 9pt;')
+        extra_layout.addWidget(extra_hint)
+        proj_layout.addLayout(extra_layout)
+        self.extraField.textChanged.connect(self._maybe_autofill_identifier)
 
         # Time delta field
         time_settings = QHBoxLayout()
@@ -168,40 +205,35 @@ class AnalysisTab(QWidget):
         calib_group = QGroupBox('Calibration Settings')
         calib_layout = QHBoxLayout()
 
-        # QR Code toggle and calibration options
         self.qr_checkbox = QCheckBox('Video has QR codes for calibration')
         self.qr_checkbox.stateChanged.connect(self.toggle_calibration_mode)
         calib_layout.addWidget(self.qr_checkbox)
 
-        # Manual calibration widget (hidden by default)
-        self.manual_calib_widget = QWidget()
-        manual_calib_layout = QHBoxLayout()
-        
-        # Calibration helper button
-        self.calibrate_btn = QPushButton('Open Calibration Helper')
+        # Defaults passed into Calibration Helper only (not shown on the form).
+        self._calib_known_default = "10"
+        self._calib_pixel_default = ""
+
+        self.calibrate_btn = QPushButton('Calibrate current video…')
+        self.calibrate_btn.setToolTip(
+            "Measure a known distance on the current video and save plate scale."
+        )
         self.calibrate_btn.clicked.connect(self.open_calibration_helper)
-        manual_calib_layout.addWidget(self.calibrate_btn)
-        
-        # Known distance input
-        known_dist_layout = QHBoxLayout()
-        self.known_dist_edit = QLineEdit()
-        self.known_dist_edit.setPlaceholderText('10')
-        self.known_dist_edit.setValidator(QDoubleValidator(0.0, 1000.0, 2))
-        known_dist_layout.addWidget(QLabel('Known distance (mm):'))
-        known_dist_layout.addWidget(self.known_dist_edit)
-        manual_calib_layout.addLayout(known_dist_layout)
+        calib_layout.addWidget(self.calibrate_btn)
 
-        # Pixel distance input
-        pixel_dist_layout = QHBoxLayout()
-        self.pixel_dist_edit = QLineEdit()
-        self.pixel_dist_edit.setPlaceholderText('240')
-        self.pixel_dist_edit.setValidator(QIntValidator(1, 10000))
-        pixel_dist_layout.addWidget(QLabel('Corresponding pixels:'))
-        pixel_dist_layout.addWidget(self.pixel_dist_edit)
-        manual_calib_layout.addLayout(pixel_dist_layout)
+        self.test_qr_btn = QPushButton('Test QR detection…')
+        self.test_qr_btn.setToolTip(
+            "Scan the current video for a QR scale marker and optionally save it."
+        )
+        self.test_qr_btn.clicked.connect(self.test_qr_current_video)
+        calib_layout.addWidget(self.test_qr_btn)
 
-        self.manual_calib_widget.setLayout(manual_calib_layout)
-        calib_layout.addWidget(self.manual_calib_widget)
+        self.review_plates_btn = QPushButton('Review plate calibrations')
+        self.review_plates_btn.setToolTip(
+            "Review plate scale (pixel size) per video. "
+            "Test QR or Set scale on bad plates, then re-process."
+        )
+        self.review_plates_btn.clicked.connect(self.open_plates_scale_dialog)
+        calib_layout.addWidget(self.review_plates_btn)
         calib_group.setLayout(calib_layout)
         
         proj_group.setLayout(proj_layout)
@@ -210,8 +242,6 @@ class AnalysisTab(QWidget):
         
         # Process customization options
         process_group = QGroupBox('Processing Options')
-        process_vertical_layout = QVBoxLayout()
-        
         process_layout = QHBoxLayout()
         
         # 1 Do germination analysis
@@ -235,41 +265,7 @@ class AnalysisTab(QWidget):
         self.store_each_video_checkbox.setChecked(False)
         process_layout.addWidget(self.store_each_video_checkbox)
         
-        process_vertical_layout.addLayout(process_layout)
-        
-        self.plant_growth_widget = QWidget()
-        plant_process_layout = QHBoxLayout() # Use VBox to stack the rows
-        
-        # Metric selection row
-        self.check_hypocotyl = QCheckBox('Hypocotyl Length')
-        self.check_main_root = QCheckBox('Main Root Length')
-        self.check_total_root = QCheckBox('Total Root Length')
-        self.check_plant_area = QCheckBox('Plant Area')
-        self.check_root_area = QCheckBox('Dense Root Area')
-        
-        for cb in [self.check_hypocotyl, self.check_main_root, self.check_total_root, 
-                   self.check_plant_area, self.check_root_area]:
-            cb.setChecked(True)
-            plant_process_layout.addWidget(cb)
-        
-        # FPCA row
-        self.fpca_checkbox = QCheckBox('Perform FPCA analysis')
-        plant_process_layout.addWidget(self.fpca_checkbox)
-        plant_process_layout.addWidget(QLabel('Components:'))
-        self.fpca_components_edit = QLineEdit("2")
-        self.fpca_components_edit.setFixedWidth(40)
-        self.fpca_components_edit.setValidator(QIntValidator(2, 10))
-        plant_process_layout.addWidget(self.fpca_components_edit)
-        self.fpca_normalize_checkbox = QCheckBox('Normalize FPCA data')
-        self.fpca_normalize_checkbox.setChecked(False)
-        plant_process_layout.addWidget(self.fpca_normalize_checkbox)
-        
-        self.plant_growth_widget.setLayout(plant_process_layout)
-        
-        process_vertical_layout.addWidget(self.plant_growth_widget)
-        
-        process_group.setLayout(process_vertical_layout)     
-        self.plant_growth_widget.setLayout(plant_process_layout)
+        process_group.setLayout(process_layout)
         layout.addWidget(process_group)
         
         # Group Names
@@ -302,12 +298,29 @@ class AnalysisTab(QWidget):
         buttons_layout.addWidget(self.preview_btn)
         
         # Process Button
+        # Process Video → Set analysis period → Postprocess → Configure → Generate Report
         self.process_btn = QPushButton('Process Video')
         self.process_btn.clicked.connect(self.process_video)
         buttons_layout.addWidget(self.process_btn)
 
-        # Generate Report Button
+        self.time_windows_btn = QPushButton('Set analysis period')
+        self.time_windows_btn.clicked.connect(self.open_time_window_dialog)
+        buttons_layout.addWidget(self.time_windows_btn)
+
+        self.postprocess_btn = QPushButton('Postprocess')
+        self.postprocess_btn.clicked.connect(self.postprocess_plants)
+        buttons_layout.addWidget(self.postprocess_btn)
+
+        self.configure_stats_btn = QPushButton('Configure Report Parameters')
+        self.configure_stats_btn.clicked.connect(self.open_stats_config_dialog)
+        buttons_layout.addWidget(self.configure_stats_btn)
+
         self.generate_report_btn = QPushButton('Generate Report')
+        self.generate_report_btn.setToolTip(
+            'Generate charts and statistics from existing hourly files. '
+            'Re-applies the current analysis period; Postprocess is not required '
+            'when that period is already covered.'
+        )
         self.generate_report_btn.clicked.connect(self.generate_report)
         buttons_layout.addWidget(self.generate_report_btn)
         
@@ -325,6 +338,17 @@ class AnalysisTab(QWidget):
             self._append_group_entry()
 
         # Initialize calibration mode
+        self.stats_config_dialog = ScreeningStatsConfigDialog(self)
+        self.stats_config_dialog.register_on_host(self)
+        self.stats_config_dialog.set_defaults()
+        self.timeSyncMode = 'clock'
+        self.timeDurationHours = None
+        self.reportFolderName = 'Report'
+        self.figureClockTicks = ['00:00']
+        self.showFigureClockTicks = True
+        self.snapshotHours = None
+        self.timeGroups = []
+        self.timePeriodSources = []
         self.toggle_calibration_mode()
         self.toggle_plant_growth_options()
         self._ui_ready = True
@@ -447,14 +471,49 @@ class AnalysisTab(QWidget):
             self.main_window.set_project_dir(project_dir)
 
     def toggle_calibration_mode(self):
-        """Toggle between QR and manual calibration modes"""
+        """QR on → Test QR; QR off → Calibrate current video."""
         has_qr = self.qr_checkbox.isChecked()
-        self.manual_calib_widget.setVisible(not has_qr)
+        self.calibrate_btn.setVisible(not has_qr)
+        self.test_qr_btn.setVisible(has_qr)
     
     def toggle_plant_growth_options(self):
-        """Enable or disable plant growth analysis options"""
+        """Enable or disable plant growth analysis options in the report dialog."""
         enabled = self.plant_growth_checkbox.isChecked()
-        self.plant_growth_widget.setVisible(enabled)
+        if hasattr(self, 'stats_config_dialog'):
+            self.stats_config_dialog.set_plant_growth_enabled(enabled)
+
+    def on_video_path_changed(self):
+        self._maybe_autofill_identifier()
+
+    def current_rpi_cam(self):
+        return resolve_rpi_cam(
+            video_dir=self.video_path_edit.text().strip(),
+            analysis_id=self.identifier_edit.text().strip(),
+        )
+
+    def _suggested_identifier(self):
+        rpi, cam = parse_robot_video_path(self.video_path_edit.text().strip())
+        if not rpi or not cam:
+            return ''
+        return identifier_from_rpi_cam(rpi, cam, self.extraField.text().strip())
+
+    def _maybe_autofill_identifier(self):
+        if self._loading_config:
+            return
+        suggested = self._suggested_identifier()
+        if not suggested:
+            return
+        current = self.identifier_edit.text().strip()
+        if current and current != self._auto_identifier:
+            return
+        self._auto_identifier = suggested
+        if current != suggested:
+            self.identifier_edit.setText(suggested)
+
+    def _remember_auto_identifier(self):
+        suggested = self._suggested_identifier()
+        if suggested and self.identifier_edit.text().strip() == suggested:
+            self._auto_identifier = suggested
 
     def open_calibration_helper(self):
         """Opens a helper window to assist with manual calibration"""
@@ -487,8 +546,17 @@ class AnalysisTab(QWidget):
             self.calibration_window = None
 
         try:
-            self.calibration_window = calibration_helper.CalibrationHelper(video_dir)
-            self.calibration_window.distance_measured.connect(self._on_calibration_distance)
+            project = self.proj_dir_edit.text().strip()
+            known = (getattr(self, "_calib_known_default", None) or "").strip() or "10"
+            self.calibration_window = calibration_helper.CalibrationHelper(
+                video_dir,
+                dialog_parent=self.window(),
+                known_distance=known,
+                project_dir=project or None,
+                image_path=video_dir,
+                plate_label=os.path.basename(video_dir.rstrip(os.sep)) or video_dir,
+            )
+            self.calibration_window.scale_saved.connect(self._on_calibration_saved)
             self.calibration_window.destroyed.connect(
                 lambda: setattr(self, 'calibration_window', None)
             )
@@ -496,28 +564,99 @@ class AnalysisTab(QWidget):
         except Exception as e:
             ui_errors.show_critical(self, 'Error', f'Failed to open calibration helper:\n{e}')
 
-    def _on_calibration_distance(self, pixels: int):
-        self.pixel_dist_edit.setText(f"{pixels}")
+    def _on_calibration_saved(self, pixel_size, known, pixels):
+        self._calib_known_default = f"{known:g}"
+        self._calib_pixel_default = str(int(pixels))
+
+    def test_qr_current_video(self):
+        """Test QR detection on the current video and optionally save plate scale."""
+        video = self.video_path_edit.text().strip()
+        if not video:
+            ui_errors.show_warning(self, 'Error', 'Please select a video directory first!')
+            return
+        if not os.path.exists(video):
+            ui_errors.show_warning(self, 'Error', 'Video directory does not exist!')
+            return
+        project = self.proj_dir_edit.text().strip()
+        try:
+            from gui.plates_calibration_dialog import run_test_qr_flow
+        except Exception as e:
+            ui_errors.show_critical(self, 'Error', f'Failed to load QR test UI:\n{e}')
+            return
+        run_test_qr_flow(
+            self,
+            project,
+            video,
+            title="Test QR detection",
+            progress_parent=self.window(),
+            on_set_scale=self.open_calibration_helper,
+        )
+
+    def open_plates_scale_dialog(self):
+        project = self.proj_dir_edit.text().strip()
+        if not project or not os.path.isdir(project):
+            ui_errors.show_warning(
+                self, 'Review plate calibrations',
+                'Open a valid project folder first.',
+            )
+            return
+        try:
+            from gui.plates_calibration_dialog import PlatesCalibrationDialog
+        except Exception as e:
+            ui_errors.show_critical(
+                self, 'Error', f'Failed to load plate calibrations UI:\n{e}',
+            )
+            return
+        known = (getattr(self, "_calib_known_default", None) or "").strip() or "10"
+        video = self.video_path_edit.text().strip() or None
+        self._plates_calib_dialog = PlatesCalibrationDialog(
+            project,
+            parent=self.window(),
+            known_distance_default=known,
+            current_image_path=video,
+        )
+        self._plates_calib_dialog.show()
 
     def validate_inputs(self):
         """Updated validation to include calibration checks"""
         if not self.basic_validation():
             return False
 
-        # Validate calibration settings
+        # Manual mode: offer calibrate if this video has no saved plate scale.
         if not self.qr_checkbox.isChecked():
-            if not self.known_dist_edit.text() or not self.pixel_dist_edit.text():
-                QMessageBox.warning(self, 'Error', 'Please provide both known distance and pixel distance for manual calibration!')
-                return False
             try:
-                known_dist = float(self.known_dist_edit.text())
-                pixel_dist = int(self.pixel_dist_edit.text())
-                if known_dist <= 0 or pixel_dist <= 0:
-                    QMessageBox.warning(self, 'Error', 'Calibration values must be positive numbers!')
+                from analysis.utils.calibration_registry import get_calibration
+            except Exception:
+                get_calibration = None
+            project = self.proj_dir_edit.text().strip()
+            video = self.video_path_edit.text().strip()
+            entry = None
+            if get_calibration is not None and project and video:
+                entry = get_calibration(project, video)
+            if entry is None:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle('Plate scale needed')
+                box.setText(
+                    'No saved plate scale for this video.\n\n'
+                    'Calibrate the current video (recommended), continue without '
+                    'scale (fix later in Review plate calibrations), or cancel.'
+                )
+                calibrate_btn = box.addButton(
+                    'Calibrate current video…', QMessageBox.AcceptRole,
+                )
+                continue_btn = box.addButton(
+                    'Continue anyway', QMessageBox.DestructiveRole,
+                )
+                box.addButton(QMessageBox.Cancel)
+                box.exec_()
+                clicked = box.clickedButton()
+                if clicked is None or clicked == box.button(QMessageBox.Cancel):
                     return False
-            except ValueError:
-                QMessageBox.warning(self, 'Error', 'Invalid calibration values!')
-                return False
+                if clicked == calibrate_btn:
+                    self.open_calibration_helper()
+                    return False
+                # continue_btn: allow process without form fields
 
         return True
 
@@ -616,10 +755,9 @@ class AnalysisTab(QWidget):
             return 15.0
 
     def _validate_video_dataset(self):
-        import plant_viewer
-        video_folder, segmentation_dir, images, seg_files = plant_viewer.resolve_screening_paths(
-            self.video_path_edit.text()
-        )
+        video_folder = self.video_path_edit.text()
+        conf = {'Images': video_folder, 'timeStep': self._get_time_delta()}
+        images, seg_files = getImages(conf)
         if not images:
             ui_errors.show_warning(
                 self,
@@ -635,7 +773,7 @@ class AnalysisTab(QWidget):
                 'The images may not have been properly segmented.'
             )
             return None
-        return video_folder, segmentation_dir
+        return conf, images, seg_files
 
     def browse_video_path(self):
         dir_path = QFileDialog.getExistingDirectory(self, 'Select Video Directory')
@@ -649,14 +787,12 @@ class AnalysisTab(QWidget):
 
         self._autosave_config()
 
-        if self.process_launcher and self.process_launcher.is_running():
-            ui_errors.show_warning(self, "Busy", "Video processing is already running.")
-            return
-
         dataset = self._validate_video_dataset()
         if not dataset:
             return
-        video_folder, segmentation_dir = dataset
+        conf, images, seg_files = dataset
+        video_folder = conf['ImagePath']
+        segmentation_dir = os.path.dirname(conf['SegPath'])
 
         project_dir = self.proj_dir_edit.text()
         identifier = self.identifier_edit.text().strip()
@@ -668,14 +804,6 @@ class AnalysisTab(QWidget):
         except Exception as e:
             ui_errors.show_critical(self, "Error", f"Failed to load images plant viewer:\n{e}")
             return 
-            
-        try:
-            images, seg_files, _ = plant_viewer.load_screening_sequence(
-                video_folder, segmentation_dir, time_delta
-            )
-        except Exception as e:
-            ui_errors.show_critical(self, "Error", f"Failed to load images for ROI selection:\n{e}")
-            return
 
         roi_dialog = plant_viewer.GroupROISelectorWindow(
             images, seg_files, group_names, time_delta=time_delta, parent=self
@@ -690,21 +818,36 @@ class AnalysisTab(QWidget):
             return
 
         seed_counts = [entry.get_seed_count() for entry in self.group_entries]
+        rpi, cam = self.current_rpi_cam()
         config = interface_config.build_interface_config(self)
         config.update({
             'video_dir': video_folder,
             'segmentation_dir': segmentation_dir,
             'project_dir': project_dir,
             'analysis_id': identifier,
-            'time_delta': time_delta,
+            'timeStep': time_delta,
             'group_names': group_names,
             'seed_counts': [count if count is not None else 0 for count in seed_counts],
             'group_rois': {name: list(coords) for name, coords in group_rois.items()},
+            'PlateCondition': self.plateConditionName.text().strip(),
+            'ExtraVariable': self.extraField.text().strip(),
+            'rpi': rpi,
+            'cam': cam,
         })
 
-        if not config['has_qr']:
-            config['known_distance'] = float(self.known_dist_edit.text())
-            config['pixel_distance'] = int(self.pixel_dist_edit.text())
+        if not config.get('videoHasQR', True):
+            try:
+                from analysis.utils.calibration_registry import get_calibration
+                entry = get_calibration(project_dir, video_folder)
+            except Exception:
+                entry = None
+            if entry:
+                if entry.get('pixel_size') is not None:
+                    config['pixel_size'] = entry['pixel_size']
+                if entry.get('knownDistance') is not None:
+                    config['knownDistance'] = entry['knownDistance']
+                if entry.get('pixelDistance') is not None:
+                    config['pixelDistance'] = entry['pixelDistance']
 
         analysis_dir = os.path.join(project_dir, 'analysis', identifier)
         os.makedirs(analysis_dir, exist_ok=True)
@@ -718,7 +861,8 @@ class AnalysisTab(QWidget):
 
         app_dir = os.path.dirname(os.path.abspath(__file__))
         args = ["python", "process_video.py", "--config", config_path]
-        self.process_launcher = ui_errors.launch_worker(
+        self._drop_finished_process_launchers()
+        launcher = ui_errors.launch_worker(
             args,
             parent=self,
             working_directory=app_dir,
@@ -729,6 +873,17 @@ class AnalysisTab(QWidget):
             ),
             error_title="Video Processing Error",
         )
+        launcher.process.finished.connect(lambda *_args: self._drop_finished_process_launchers())
+        self.process_launchers.append(launcher)
+
+    def _drop_finished_process_launchers(self):
+        still_running = []
+        for launcher in self.process_launchers:
+            if launcher.is_running():
+                still_running.append(launcher)
+            else:
+                launcher.deleteLater()
+        self.process_launchers = still_running
 
     def preview_video(self):
         dataset = self._validate_video_dataset()
@@ -737,8 +892,7 @@ class AnalysisTab(QWidget):
 
         self._autosave_config()
 
-        video_folder, segmentation_dir = dataset
-        time_delta = self._get_time_delta()
+        conf, images, seg_files = dataset
 
         try:
             import plant_viewer
@@ -747,9 +901,6 @@ class AnalysisTab(QWidget):
             return 
         
         try:            
-            images, seg_files, conf = plant_viewer.load_screening_sequence(
-                video_folder, segmentation_dir, time_delta
-            )
             self.preview_window = plant_viewer.ChronoViewWindow(
                 images, seg_files, None, conf, parent=None
             )
@@ -757,89 +908,256 @@ class AnalysisTab(QWidget):
         except Exception as e:
             ui_errors.show_critical(self, "Error", f"Failed to launch preview:\n{e}")
 
+    def open_stats_config_dialog(self):
+        snapshot = self.stats_config_dialog.snapshot_values()
+        if self.stats_config_dialog.exec_() != QDialog.Accepted:
+            self.stats_config_dialog.restore_values(snapshot)
+            return
+        self._autosave_config()
+
+    def open_time_window_dialog(self):
+        from gui.time_window_dialog import TimeWindowDialog
+        dialog = TimeWindowDialog(self)
+        dialog.set_main_folder(self.proj_dir_edit.text().strip())
+        conf = {
+            'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),
+            'timeDurationHours': getattr(self, 'timeDurationHours', None),
+            'reportFolderName': getattr(self, 'reportFolderName', 'Report'),
+            'figureClockTicks': getattr(self, 'figureClockTicks', ['00:00']),
+            'showFigureClockTicks': getattr(self, 'showFigureClockTicks', True),
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
+        }
+        dialog.load_from_conf(conf)
+        if dialog.exec_() != QDialog.Accepted:
+            return False
+        for key, value in dialog.to_conf().items():
+            setattr(self, key, value)
+        self._autosave_config()
+        if self.main_window is not None:
+            self.main_window.set_project_dir(self.proj_dir_edit.text().strip())
+        return True
+
+    def _int_field(self, widget, default):
+        text = widget.text().strip() if hasattr(widget, 'text') else str(default)
+        try:
+            return int(float(text)) if text else default
+        except ValueError:
+            return default
+
+    def _build_report_config(self):
+        selected = self.stats_config_dialog.selected_metric_columns()
+        if not self.germination_checkbox.isChecked():
+            selected = [col for col in selected if col != 'GerminationTime']
+        if not self.plant_growth_checkbox.isChecked():
+            selected = [col for col in selected if col == 'GerminationTime']
+
+        conf = {
+            'MainFolder': self.proj_dir_edit.text(),
+            'timeStep': self._get_time_delta(),
+            'everyXhourField': self._int_field(self.everyXhourField, 6),
+            'everyXhourFieldFourier': self._int_field(self.everyXhourFieldFourier, 6),
+            'everyXhourFieldAngles': self._int_field(self.everyXhourFieldAngles, 6),
+            'exportSvg': self.exportSvg.isChecked(),
+            'exportPdf': self.exportPdf.isChecked(),
+            'skipIndividualAnglePlots': self.skipIndividualAnglePlots.isChecked(),
+            'measureRelativeToInitial': self.measureRelativeToInitial.isChecked(),
+            'doFPCA': self.fpca_checkbox.isChecked() and self.plant_growth_checkbox.isChecked(),
+            'normFPCA': self.fpca_normalize_checkbox.isChecked(),
+            'numComponentsFPCAField': self._int_field(self.fpca_components_edit, 2),
+            'doFourier': self.doFourier.isChecked(),
+            'doPlantGrowth': self.plant_growth_checkbox.isChecked(),
+            'doGermination': self.germination_checkbox.isChecked(),
+            'selectedMetrics': selected,
+            'includeLateralRootPlots': False,
+            'temporalOverviewMetrics': [col for col in selected if col != 'GerminationTime'],
+            'fpcaMetrics': [
+                col for col in selected
+                if col in ('MainRootLength (mm)', 'TotalLength (mm)', 'HypocotylLength (mm)')
+            ],
+            'genotypeAxisLabel': self.genotypeAxisLabelField.text().strip() or 'Group',
+            'plateConditionAxisLabel': self.plateConditionAxisLabelField.text().strip() or 'Plate condition',
+            'extraVariableLabel': self.extraVariableLabelField.text().strip() or 'Run',
+            'addTimeBeforePhoto': self._int_field(self.add_time_edit, 0),
+            'germinationTimeCut': self._int_field(self.germination_time_edit, 0),
+            'germinationEachVideo': self.store_each_video_checkbox.isChecked(),
+            'timeSyncMode': getattr(self, 'timeSyncMode', 'clock'),
+            'timeDurationHours': getattr(self, 'timeDurationHours', None),
+            'reportFolderName': getattr(self, 'reportFolderName', 'Report'),
+            'figureClockTicks': getattr(self, 'figureClockTicks', ['00:00']),
+            'showFigureClockTicks': getattr(self, 'showFigureClockTicks', True),
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
+        }
+        for name in (
+            'statsByGenotype', 'statsGenotypeByPlate', 'statsGenotypeByExtra',
+            'statsByPlateCondition', 'statsByExtraVariable',
+            'statsPlateWithinGenotype', 'statsExtraWithinGenotype',
+        ):
+            conf[name] = getattr(self, name).isChecked()
+        conf['advancedComparisonModes'] = self.advanced_group.isChecked()
+        mapping_file = os.path.join(self.proj_dir_edit.text(), 'name_mapping.json')
+        if os.path.exists(mapping_file):
+            conf['nameMapping'] = mapping_file
+        return conf
+
+    def _cleanup_launcher(self, attr):
+        launcher = getattr(self, attr, None)
+        if launcher is None:
+            return None
+        if launcher.is_running():
+            return launcher
+        launcher.deleteLater()
+        setattr(self, attr, None)
+        return None
+
+    def _write_report_config_file(self):
+        project_dir = self.proj_dir_edit.text()
+        conf = self._build_report_config()
+        config_path = os.path.join(project_dir, 'report_config.json')
+        with open(config_path, 'w') as handle:
+            json.dump(conf, handle, indent=4)
+        return conf, config_path
+
+    def postprocess_plants(self):
+        if not self.proj_dir_edit.text():
+            ui_errors.show_warning(self, 'Error', 'Please select a project directory first!')
+            return
+        self._autosave_config()
+        if self._cleanup_launcher('postprocess_launcher') is not None:
+            ui_errors.show_warning(self, 'Busy', 'Postprocess is already running.')
+            return
+        if self._cleanup_launcher('report_launcher') is not None:
+            ui_errors.show_warning(self, 'Busy', 'Report generation is already running.')
+            return
+
+        project_dir = self.proj_dir_edit.text()
+        analysis_dir = os.path.join(project_dir, 'analysis')
+        if not os.path.isdir(analysis_dir):
+            ui_errors.show_warning(self, 'Error', 'No analysis directory found!')
+            return
+        analyses = [d for d in os.listdir(analysis_dir)
+                    if os.path.isdir(os.path.join(analysis_dir, d))]
+        if not analyses:
+            ui_errors.show_warning(self, 'Error', 'No analyses found to process!')
+            return
+
+        period_conf = {
+            'timeGroups': getattr(self, 'timeGroups', []),
+            'timePeriodSources': getattr(self, 'timePeriodSources', []),
+        }
+        if not analysis_period_is_current(period_conf, project_dir):
+            reply = QMessageBox.question(
+                self,
+                'Analysis period required',
+                PERIOD_GATE_MESSAGE + '\n\nOpen Set analysis period now?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            if not self.open_time_window_dialog():
+                return
+            period_conf = {
+                'timeGroups': getattr(self, 'timeGroups', []),
+                'timePeriodSources': getattr(self, 'timePeriodSources', []),
+            }
+            if not analysis_period_is_current(period_conf, project_dir):
+                ui_errors.show_warning(
+                    self, 'Analysis period required',
+                    'Postprocess was cancelled. '
+                    'Set an analysis period for this set of videos first.',
+                )
+                return
+
+        try:
+            conf, config_path = self._write_report_config_file()
+        except OSError as exc:
+            ui_errors.show_critical(self, 'Error', f'Failed to write report config:\n{exc}')
+            return
+
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        args = ["python", "generate_report.py", "--config", config_path, "--postprocess-only"]
+        log_dialog = ui_errors.WorkerLogDialog("Postprocessing…", parent=self)
+        self.postprocess_launcher = ui_errors.launch_worker(
+            args,
+            parent=self,
+            working_directory=app_dir,
+            error_title="Postprocess Error",
+            log_dialog=log_dialog,
+        )
+        if self.postprocess_launcher.is_running():
+            log_dialog.append_text(
+                "Postprocess started.\n"
+                f"Hourly tables will be written under: "
+                f"{os.path.join(project_dir, report_folder_name(conf))}\n\n"
+            )
+
     def generate_report(self):
-        """
-        Generate report on all completed experiments.
-        """
+        """Generate report on all completed experiments."""
         if not self.proj_dir_edit.text():
             ui_errors.show_warning(self, 'Error', 'Please select a project directory first!')
             return
 
         self._autosave_config()
 
-        if self.report_launcher and self.report_launcher.is_running():
+        if self._cleanup_launcher('report_launcher') is not None:
             ui_errors.show_warning(self, "Busy", "Report generation is already running.")
+            return
+        if self._cleanup_launcher('postprocess_launcher') is not None:
+            ui_errors.show_warning(self, "Busy", "Postprocess is already running.")
             return
 
         project_dir = self.proj_dir_edit.text()
-        time_delta = self._get_time_delta()
-
-        try:
-            add_time = int(self.add_time_edit.text() or '0')
-        except ValueError:
-            add_time = 0
-
         analysis_dir = os.path.join(project_dir, 'analysis')
         if not os.path.exists(analysis_dir):
             ui_errors.show_warning(self, 'Error', 'No analysis directory found!')
             return
 
         analyses = [d for d in os.listdir(analysis_dir)
-                      if os.path.isdir(os.path.join(analysis_dir, d))]
-
+                    if os.path.isdir(os.path.join(analysis_dir, d))]
         if not analyses:
             ui_errors.show_warning(self, 'Error', 'No analyses found to process!')
             return
 
-        mapping_file = os.path.join(project_dir, 'name_mapping.json')
+        conf = self._build_report_config()
+        report_dir = os.path.join(project_dir, report_folder_name(conf))
+        raw_path = os.path.join(report_dir, 'data', 'Raw_Data.tsv')
+        missing = []
+        if not os.path.isfile(raw_path):
+            missing.append('Raw_Data.tsv')
+        if conf.get('doPlantGrowth', True) and not hourly_files_exist(project_dir):
+            missing.append('PostProcess_Hour.csv')
+        if missing:
+            ui_errors.show_warning(
+                self,
+                'Postprocess required',
+                'Run Postprocess before generating a report.\n\nMissing: ' + ', '.join(missing),
+            )
+            return
 
-        active_parts = []
-        mapping = [
-            ("HypocotylLength", self.check_hypocotyl),
-            ("MainRootLength", self.check_main_root),
-            ("TotalRootLength", self.check_total_root),
-            ("Area", self.check_plant_area),
-            ("DenseRootArea", self.check_root_area)
-        ]
-        for name, cb in mapping:
-            if cb.isChecked():
-                active_parts.append(name)
+        try:
+            conf, config_path = self._write_report_config_file()
+        except OSError as exc:
+            ui_errors.show_critical(self, 'Error', f'Failed to write report config:\n{exc}')
+            return
 
-        do_fpca = self.fpca_checkbox.isChecked()
-        fpca_comps = self.fpca_components_edit.text() or "2"
-        germ_cut = self.germination_time_edit.text() or "0"
-
-        args = [
-            "python", "generate_report.py",
-            "--project-dir", project_dir,
-            "--dt", str(time_delta),
-            "--add-time-before-photo", str(add_time),
-            "--germination-time-cut", str(germ_cut),
-            "--do-germination", str(self.germination_checkbox.isChecked()),
-            "--germination-each-video", str(self.store_each_video_checkbox.isChecked()),
-            "--do-plant-growth", str(self.plant_growth_checkbox.isChecked()),
-            "--selected-metrics", ",".join(active_parts),
-            "--do-fpca", str(do_fpca),
-            "--fpca-components", fpca_comps,
-            "--normalize-fpca", str(self.fpca_normalize_checkbox.isChecked())
-        ]
-
-        if os.path.exists(mapping_file):
-            args.extend(["--name-mapping", mapping_file])
-
-        mapping_msg = " with name mapping" if os.path.exists(mapping_file) else ""
+        mapping_msg = " with name mapping" if conf.get('nameMapping') else ""
         app_dir = os.path.dirname(os.path.abspath(__file__))
+        args = ["python", "generate_report.py", "--config", config_path]
+        log_dialog = ui_errors.WorkerLogDialog("Generating report…", parent=self)
         self.report_launcher = ui_errors.launch_worker(
             args,
             parent=self,
             working_directory=app_dir,
-            started_title="Report Generation Started",
-            started_message=(
-                f"Report generation has been started{mapping_msg}.\n"
-                f"Results will be saved in: {os.path.join(project_dir, 'results')}"
-            ),
             error_title="Report Generation Error",
+            log_dialog=log_dialog,
         )
+        if self.report_launcher.is_running():
+            log_dialog.append_text(
+                f"Report generation started{mapping_msg}.\n"
+                f"Results will be saved in: {os.path.join(project_dir, report_folder_name(conf))}\n\n"
+            )
 
 class ResultsTab(QWidget):
     def __init__(self, parent=None):
@@ -1076,225 +1394,117 @@ class ResultsTab(QWidget):
         self.table.resizeColumnsToContents()
 
 class ReportsTab(QWidget):
-    PARAMETERS = [
-        "Germination",
-        "Area",
-        "DenseRootArea",
-        "HypocotylLength", 
-        "MainRootLength", 
-        "TotalRootLength"
-    ]
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.project_dir = None
-        self.current_image_index = 0
-        self.image_paths = []
+        self.report_root = None
+        self.report_folder_name = 'Report'
+        self.current_plot = ''
+        self.current_stats = ''
         self.initUI()
-        
+
     def initUI(self):
-        layout = QVBoxLayout()
-        
-        # Controls layout
-        controls_layout = QHBoxLayout()
-        
-        # Parameter selector
-        self.parameter_selector = QComboBox()
-        self.parameter_selector.addItems(self.PARAMETERS)
-        controls_layout.addWidget(QLabel('Parameter:'))
-        controls_layout.addWidget(self.parameter_selector)
+        layout = QHBoxLayout()
 
-        # Connect parameter selector
-        self.parameter_selector.currentTextChanged.connect(self.update_plot_types)
-
-        # Plot type selector (will be populated dynamically)
-        self.plot_type = QComboBox()
-        self.plot_type.currentTextChanged.connect(self.update_image_list)
-        controls_layout.addWidget(QLabel('Plot Type:'))
-        controls_layout.addWidget(self.plot_type)
-
-        # Image selector
-        self.image_selector = QComboBox()
-        self.image_selector.currentIndexChanged.connect(self.display_selected_image)
-        controls_layout.addWidget(QLabel('Select Image:'))
-        controls_layout.addWidget(self.image_selector)
-        
-        # Navigation buttons
-        self.prev_btn = QPushButton('←')
-        self.next_btn = QPushButton('→')
-        self.prev_btn.clicked.connect(self.show_previous)
-        self.next_btn.clicked.connect(self.show_next)
-        self.prev_btn.setFixedWidth(40)
-        self.next_btn.setFixedWidth(40)
-        controls_layout.addWidget(self.prev_btn)
-        controls_layout.addWidget(self.next_btn)
-        
-        # Refresh button
+        side = QVBoxLayout()
         self.refresh_btn = QPushButton('Refresh')
         self.refresh_btn.clicked.connect(self.refresh_images)
-        controls_layout.addWidget(self.refresh_btn)
-        
-        # Current path label for debugging
+        side.addWidget(self.refresh_btn)
+        self.open_stats_btn = QPushButton('Open stats')
+        self.open_stats_btn.clicked.connect(self.open_stats)
+        self.open_stats_btn.setEnabled(False)
+        side.addWidget(self.open_stats_btn)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabel('Report figures')
+        self.tree.itemClicked.connect(self.on_item_clicked)
+        side.addWidget(self.tree)
+
+        right = QVBoxLayout()
         self.path_label = QLabel()
         self.path_label.setWordWrap(True)
-        controls_layout.addWidget(self.path_label)
-        
-        controls_layout.addStretch()
-        layout.addLayout(controls_layout)
-        
-        # Image display area
+        right.addWidget(self.path_label)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
-        self.image_label = QLabel()
+        self.image_label = QLabel('Select a figure in the report tree')
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll_area.setWidget(self.image_label)
-        
-        layout.addWidget(self.scroll_area)
-        
+        right.addWidget(self.scroll_area)
+
+        layout.addLayout(side, 1)
+        layout.addLayout(right, 3)
         self.setLayout(layout)
-        self.update_button_states()
-        
-    def set_project_dir(self, dir_path):
+
+    def set_project_dir(self, dir_path, report_folder=None):
         self.project_dir = dir_path
+        if report_folder is not None:
+            self.report_folder_name = report_folder
         self.refresh_images()
-        
-    def get_image_folder(self):
-        if not self.project_dir:
-            print("No project directory set")
-            return None
-            
-        results_dir = os.path.join(self.project_dir, 'results')
-        if not os.path.exists(results_dir):
-            return None
-            
-        current_parameter = self.parameter_selector.currentText()
-        current_plot_type = self.plot_type.currentText()
-        
-        if not current_parameter or not current_plot_type:
-            return None
-            
-        image_folder = os.path.join(
-            results_dir,
-            current_parameter,
-            current_plot_type
-        )
-        
-        return image_folder if os.path.exists(image_folder) else None
 
-    def update_plot_types(self):
-        if not self.project_dir:
-            return
-                
-        current_parameter = self.parameter_selector.currentText()
-        if not current_parameter:
-            return
-                
-        parameter_dir = os.path.join(self.project_dir, 'results', current_parameter)
-        
-        plot_types = []
-        if os.path.exists(parameter_dir):
-            for folder in os.listdir(parameter_dir):
-                folder_path = os.path.join(parameter_dir, folder)
-                if os.path.isdir(folder_path) and not folder.endswith('ProcessedData'):
-                    plot_types.append(folder)
-        
-        # Block signals to prevent multiple redundant image updates
-        self.plot_type.blockSignals(True)
-        self.plot_type.clear()
-        self.plot_type.addItems(plot_types)
-        self.plot_type.blockSignals(False)
-        
-        if plot_types:
-            # Default to the first one if current selection is gone
-            self.plot_type.setCurrentIndex(0)
-        
-        # Manually trigger image list update
-        self.update_image_list()
+    def _populate_tree(self, parent, nodes):
+        from gui.report_browser import ReportBranch, ReportLeaf
+        for node in nodes:
+            item = QTreeWidgetItem(parent, [node.label])
+            if isinstance(node, ReportLeaf):
+                item.setData(0, Qt.UserRole, {
+                    'plot': node.plot_file,
+                    'stats': node.stats_file,
+                })
+            elif isinstance(node, ReportBranch):
+                self._populate_tree(item, node.children)
 
-    def update_image_list(self):
-        self.image_paths = []
-        image_folder = self.get_image_folder()
-        
-        if image_folder and os.path.exists(image_folder):
-            for f in os.listdir(image_folder):
-                if f.lower().endswith('.png'):
-                    full_path = os.path.join(image_folder, f)
-                    self.image_paths.append(full_path)
-            
-            self.image_paths.sort()
-        
-        # Update image selector
-        self.image_selector.blockSignals(True)
-        self.image_selector.clear()
-        if self.image_paths:
-            self.image_selector.addItems([os.path.basename(p) for p in self.image_paths])
-            self.image_selector.blockSignals(False)
-            self.image_selector.setCurrentIndex(0) # Force selection of first image
-        else:
-            self.image_selector.blockSignals(False)
-            self.image_label.setText("No images found in the selected directory")
-            self.image_label.setPixmap(QPixmap()) # Clear old image
-        
-        self.current_image_index = 0
-        self.display_current_image()
-        self.update_button_states()
-        
-    def display_selected_image(self):
-        self.current_image_index = self.image_selector.currentIndex()
-        self.display_current_image()
-        self.update_button_states()
-        
-    def display_current_image(self):
-        if not self.image_paths or self.current_image_index < 0:
-            self.image_label.setText("No images available")
-            self.path_label.setText("No image selected")
-            return
-            
-        if self.current_image_index >= len(self.image_paths):
-            self.current_image_index = len(self.image_paths) - 1
-            
-        image_path = self.image_paths[self.current_image_index]
-        self.path_label.setText(f"Current image: {image_path}")
-                    
-        # Load and display image
-        pixmap = QPixmap(image_path)
-        if not pixmap.isNull():
-            # Scale image to fit the window while maintaining aspect ratio
-            scaled_pixmap = pixmap.scaled(
-                self.scroll_area.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled_pixmap)
-        else:
-            error_msg = f"Error loading image: {image_path}"
-            self.image_label.setText(error_msg)
-            
-    def show_previous(self):
-        if self.current_image_index > 0:
-            self.current_image_index -= 1
-            self.image_selector.setCurrentIndex(self.current_image_index)
-            
-    def show_next(self):
-        if self.current_image_index < len(self.image_paths) - 1:
-            self.current_image_index += 1
-            self.image_selector.setCurrentIndex(self.current_image_index)
-            
-    def update_button_states(self):
-        self.prev_btn.setEnabled(self.current_image_index > 0)
-        self.next_btn.setEnabled(self.current_image_index < len(self.image_paths) - 1)
-        
     def refresh_images(self):
+        self.tree.clear()
+        self.current_plot = ''
+        self.current_stats = ''
+        self.open_stats_btn.setEnabled(False)
         if not self.project_dir:
             return
-        self.update_plot_types() 
-        
+        self.report_root = os.path.join(
+            self.project_dir,
+            report_folder_name({'reportFolderName': getattr(self, 'report_folder_name', 'Report')}),
+        )
+        if not os.path.isdir(self.report_root):
+            self.image_label.setText('No Report folder yet. Generate a report first.')
+            self.image_label.setPixmap(QPixmap())
+            return
+        from gui.report_browser import load_report_catalog
+        catalog = load_report_catalog(self.report_root)
+        self._populate_tree(self.tree.invisibleRootItem(), catalog)
+        self.tree.expandToDepth(1)
+
+    def on_item_clicked(self, item, _column):
+        payload = item.data(0, Qt.UserRole)
+        if not payload:
+            return
+        self.current_plot = os.path.join(self.report_root, payload['plot'])
+        self.current_stats = os.path.join(self.report_root, payload['stats']) if payload.get('stats') else ''
+        self.open_stats_btn.setEnabled(bool(self.current_stats and os.path.isfile(self.current_stats)))
+        self.display_current_image()
+
+    def open_stats(self):
+        if self.current_stats and os.path.isfile(self.current_stats):
+            subprocess.Popen(['xdg-open', self.current_stats])
+
+    def display_current_image(self):
+        if not self.current_plot or not os.path.isfile(self.current_plot):
+            self.image_label.setText('No image selected')
+            self.path_label.setText('')
+            return
+        self.path_label.setText(self.current_plot)
+        pixmap = QPixmap(self.current_plot)
+        if pixmap.isNull():
+            self.image_label.setText(f'Error loading image: {self.current_plot}')
+            return
+        scaled = pixmap.scaled(
+            self.scroll_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.image_label.setText('')
+        self.image_label.setPixmap(scaled)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.display_current_image()
+        if self.current_plot:
+            self.display_current_image()
 
 
 class NameMappingDialog(QDialog):
@@ -1561,14 +1771,14 @@ class ScreeningGUI(QMainWindow):
     def set_project_dir(self, dir_path):
         """Update project directory for all tabs"""
         self.project_dir = dir_path
-        # Update Results tab
+        folder = 'Report'
+        if hasattr(self, 'analysis_tab'):
+            folder = getattr(self.analysis_tab, 'reportFolderName', 'Report') or 'Report'
         if hasattr(self, 'results_tab'):
             self.results_tab.set_project_dir(dir_path)
-            self.results_tab.refresh_results()  # Explicitly refresh the results
-        # Update Reports tab
+            self.results_tab.refresh_results()
         if hasattr(self, 'reports_tab'):
-            self.reports_tab.set_project_dir(dir_path)
-            self.reports_tab.refresh_images()  # Explicitly refresh the reports
+            self.reports_tab.set_project_dir(dir_path, report_folder=folder)
 
 def main():
     app = QApplication(sys.argv)

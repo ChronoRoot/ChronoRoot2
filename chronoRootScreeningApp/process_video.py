@@ -10,11 +10,30 @@ from datetime import datetime
 from typing import Dict, Any, Tuple, List
 import matplotlib
 import sys
-from qr import qr_detect, get_pixel_size
-from collections import defaultdict
 matplotlib.use('Agg')
+import chrono_root_backend  # noqa: F401
+from analysis.qr import qr_detect, get_pixel_size
+from analysis.utils.metadata_schema import (
+    SCREENING_JOB_KIND,
+    apply_load_aliases,
+    dump_json,
+    load_json,
+    video_has_qr,
+)
+from analysis.utils.calibration_registry import (
+    DEFAULT_PIXEL_SIZE,
+    SOURCE_DEFAULT,
+    SOURCE_MANUAL,
+    SOURCE_QR,
+    SOURCE_REGISTRY,
+    get_calibration,
+    normalize_image_path,
+    upsert_calibration,
+)
+from collections import defaultdict
 
 from skimage.morphology import skeletonize
+from robot_ids import resolve_rpi_cam
 
 # ignore future warnings from pandas
 import warnings
@@ -115,6 +134,42 @@ class GroupROISelector:
 def natural_sort_key(s):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
 
+
+def _datetime_from_image_name(name):
+    nums = re.findall(r'\d+', os.path.basename(str(name)))
+    if len(nums) < 5:
+        return None
+    try:
+        return datetime(int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3]), int(nums[4]))
+    except (ValueError, TypeError):
+        return None
+
+
+def record_acquisition_span(analysis_dir, image_files):
+    """Store first/last picture names and parsed clock times on tracking metadata."""
+    names = [f for f in (image_files or []) if f]
+    if not names:
+        return
+    first_image = os.path.basename(str(names[0]))
+    last_image = os.path.basename(str(names[-1]))
+    first_dt = _datetime_from_image_name(first_image)
+    last_dt = _datetime_from_image_name(last_image)
+    metadata_path = os.path.join(analysis_dir, 'metadata.json')
+    metadata = {}
+    if os.path.isfile(metadata_path):
+        try:
+            metadata = load_json(metadata_path) or {}
+        except Exception:
+            metadata = {}
+    metadata['first_image'] = first_image
+    metadata['last_image'] = last_image
+    if first_dt is not None:
+        metadata['first_datetime'] = first_dt.strftime('%Y-%m-%dT%H:%M:%S')
+    if last_dt is not None:
+        metadata['last_datetime'] = last_dt.strftime('%Y-%m-%dT%H:%M:%S')
+    dump_json(metadata_path, metadata)
+
+
 def get_group_for_position(x: int, y: int, groups: Dict[str, Tuple[int, int, int, int]]) -> str:
     for group_name, (x1, y1, x2, y2) in groups.items():
         if x1 <= x <= x2 and y1 <= y <= y2:
@@ -137,19 +192,22 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
     if start_time:
         # Create new metadata file
         metadata = {
+            'kind': SCREENING_JOB_KIND,
             'analysis_id': params['analysis_id'],
             'group_names': params['group_names'],
             'num_groups': len(params['group_names']),
-            'video_directory': params['video_dir'],
+            'PlateCondition': params.get('PlateCondition', '') or '',
+            'ExtraVariable': params.get('ExtraVariable', '') or '',
+            'Images': params['video_dir'],
             'segmentation_directory': params['segmentation_dir'],
+            'rpi': params.get('rpi', ''),
+            'cam': params.get('cam', ''),
             'start_time': start_time,
             'completion_time': None,
             'status': 'In Progress'
         }
     else:
-        # Update existing metadata
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
+        metadata = load_json(metadata_path)
         
         if completion_time:
             metadata['completion_time'] = completion_time
@@ -157,29 +215,27 @@ def save_metadata(analysis_dir: str, params: Dict[str, Any], start_time: str = N
         if error is not None:
             metadata['error'] = error
     
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=4)
+    dump_json(metadata_path, metadata)
 
 
 def mark_analysis_failed(analysis_dir: str, params: Dict[str, Any], error: str) -> None:
     metadata_path = os.path.join(analysis_dir, 'metadata.json')
     if os.path.exists(metadata_path):
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
+        metadata = load_json(metadata_path)
     else:
         metadata = {
+            'kind': SCREENING_JOB_KIND,
             'analysis_id': params.get('analysis_id'),
             'group_names': params.get('group_names', []),
             'num_groups': len(params.get('group_names', [])),
-            'video_directory': params.get('video_dir'),
+            'Images': params.get('video_dir'),
             'segmentation_directory': params.get('segmentation_dir'),
             'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     metadata['completion_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     metadata['status'] = 'Failed'
     metadata['error'] = error
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=4)
+    dump_json(metadata_path, metadata)
 
 
 def load_group_rois(group_rois: Any, group_names: List[str]) -> Dict[str, Tuple[int, int, int, int]]:
@@ -273,11 +329,15 @@ def process_video(params: Dict[str, Any]):
 
     group_info = {
         'group_names': params['group_names'],
-        'seed_counts': params['seed_counts']
+        'seed_counts': params['seed_counts'],
+        'PlateCondition': params.get('PlateCondition', '') or '',
+        'ExtraVariable': params.get('ExtraVariable', '') or '',
+        'timeStep': params.get('timeStep', params.get('time_delta')),
+        'rpi': params.get('rpi', ''),
+        'cam': params.get('cam', ''),
     }
 
-    with open(os.path.join(analysis_dir, 'group_info.json'), 'w') as f:
-        json.dump(group_info, f, indent=4)
+    dump_json(os.path.join(analysis_dir, 'group_info.json'), group_info)
 
     image_files = [f for f in os.listdir(params['video_dir'])
                   if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp'))]
@@ -285,6 +345,8 @@ def process_video(params: Dict[str, Any]):
 
     if not image_files:
         raise ValueError("No image files found in the video directory")
+
+    record_acquisition_span(analysis_dir, image_files)
 
     if params.get('group_rois'):
         groups = load_group_rois(params['group_rois'], params['group_names'])
@@ -311,45 +373,99 @@ def process_video(params: Dict[str, Any]):
     
     # Use list instead of DataFrame for accumulation 
     all_data_rows = []
-    column_names = ["UID", "Group", "ElapsedHours", "Area",
-                    "Perim.", "Slice", "SeedPos", "Date",
-                    "HypocotylLength", "MainRootLength", "TotalRootLength", 
-                    "DenseRootArea", 
-                    "BoundingBox_X", "BoundingBox_Y", "BoundingBox_Width", "BoundingBox_Height",
-                    "ImageFile"]
+    column_names = [
+        "Plant_id", "Experiment", "ElapsedHours", "Area",
+        "Perim.", "Frame", "SeedPos", "FileName",
+        "HypocotylLength", "MainRootLength", "TotalLength",
+        "LateralRootsLength", "NumberOfLateralRoots",
+        "DenseRootArea",
+        "PlateCondition", "ExtraVariable", "pixel_size", "calibration_source",
+        "BoundingBox_X", "BoundingBox_Y", "BoundingBox_Width", "BoundingBox_Height",
+    ]
 
 
-    # Calculate pixel size from calibration method
-    pixel_size = 0.004  # Default value in case something fails
+    # Calculate pixel size: params → registry → QR → manual → shared default
+    pixel_size = DEFAULT_PIXEL_SIZE
+    calibration_source = SOURCE_DEFAULT
+    video_abs = normalize_image_path(params['video_dir'])
+    project_dir = params['project_dir']
     try:
-        if params['has_qr']:
-            # QR code calibration
-            j = 0
-            for img_file in image_files:
-                image_file = os.path.join(params['video_dir'], img_file)
-                qr = qr_detect(image_file)
-                if qr is not None:
-                    pixel_size = 10 / get_pixel_size(qr[0])
-                    print(f"Pixel size calculated from QR code: {pixel_size:.6f} mm/pixel")
-                    break
-                j += 1
-                if j > 10:
-                    print("No QR code found in the first 10 images, using default value")
-                    break
-
+        if params.get('pixel_size') not in (None, ''):
+            pixel_size = float(params['pixel_size'])
+            calibration_source = str(params.get('calibration_source') or 'params')
+            print(f"Using stored pixel size: {pixel_size:.6f} mm/pixel ({calibration_source})")
         else:
-            # Manual calibration
-            known_distance = params['known_distance']  # in mm
-            pixel_distance = params['pixel_distance']  # in pixels
-            pixel_size = known_distance / pixel_distance
-            print(f"Pixel size from manual calibration: {pixel_size:.6f} mm/pixel")
-            
+            registry_entry = get_calibration(project_dir, video_abs)
+            if registry_entry and 'pixel_size' in registry_entry:
+                pixel_size = float(registry_entry['pixel_size'])
+                calibration_source = SOURCE_REGISTRY
+                print(
+                    f"Pixel size from calibrations.json: {pixel_size:.6f} mm/pixel"
+                )
+            elif params['has_qr']:
+                found_qr = False
+                for j, img_file in enumerate(image_files[:20]):
+                    image_file = os.path.join(params['video_dir'], img_file)
+                    qr = qr_detect(image_file)
+                    if qr is not None:
+                        pixel_size = 10 / get_pixel_size(qr[0])
+                        calibration_source = SOURCE_QR
+                        found_qr = True
+                        upsert_calibration(
+                            project_dir, video_abs,
+                            pixel_size=pixel_size, source=SOURCE_QR,
+                        )
+                        print(f"Pixel size from QR code: {pixel_size:.6f} mm/pixel")
+                        break
+                if not found_qr:
+                    pixel_size = DEFAULT_PIXEL_SIZE
+                    calibration_source = SOURCE_DEFAULT
+                    print(
+                        f"QR not detected in first frames; using default "
+                        f"{pixel_size:.6f} mm/pixel"
+                    )
+            else:
+                known_distance = params.get('known_distance')
+                pixel_distance = params.get('pixel_distance')
+                if known_distance not in (None, '') and pixel_distance not in (None, ''):
+                    pixel_size = float(known_distance) / float(pixel_distance)
+                    calibration_source = SOURCE_MANUAL
+                    upsert_calibration(
+                        project_dir, video_abs,
+                        pixel_size=pixel_size, source=SOURCE_MANUAL,
+                        known_distance=known_distance,
+                        pixel_distance=pixel_distance,
+                    )
+                    print(
+                        f"Pixel size from manual calibration: "
+                        f"{pixel_size:.6f} mm/pixel"
+                    )
+                else:
+                    pixel_size = DEFAULT_PIXEL_SIZE
+                    calibration_source = SOURCE_DEFAULT
+                    print(
+                        f"No registry or manual scale for this video; "
+                        f"using default {pixel_size:.6f} mm/pixel "
+                        f"(fix in Review plate calibrations, then re-process)"
+                    )
+
     except Exception as e:
-        print(f"Error in pixel size calculation: {str(e)}, using default value {pixel_size:.6f} mm/pixel")
+        pixel_size = DEFAULT_PIXEL_SIZE
+        calibration_source = SOURCE_DEFAULT
+        print(
+            f"Error in pixel size calculation: {str(e)}, "
+            f"using default value {pixel_size:.6f} mm/pixel"
+        )
+
+    group_info['pixel_size'] = pixel_size
+    group_info['calibration_source'] = calibration_source
+    dump_json(os.path.join(analysis_dir, 'group_info.json'), group_info)
+
+    seg_subdir = params.get('segmentation_subdir') or 'Ensemble'
 
     # Process frames
     for img_file in image_files:
-        seg_file = os.path.join(params['segmentation_dir'], "Ensemble", img_file)
+        seg_file = os.path.join(params['segmentation_dir'], seg_subdir, img_file)
         original_seg = cv2.imread(seg_file, cv2.IMREAD_GRAYSCALE)
         if original_seg is None:
             print(f'Warning: Could not read segmentation file: {seg_file}')
@@ -362,11 +478,6 @@ def process_video(params: Dict[str, Any]):
             if vis_image is None:
                 print(f"Warning: Could not load image for visualization: {img_file}")
                 continue
-
-        # Extract date and time
-        date = img_file.split('_')[0]
-        hour = img_file.split('_')[1]
-        date_hour = date + ' ' + hour
 
         # Process binary segmentation
         binary_seg = original_seg > 0
@@ -465,11 +576,10 @@ def process_video(params: Dict[str, Any]):
             # Apply mask to ROI
             crop = original_seg[y_min:y_max, x_min:x_max] * roi_mask
 
-            # Calculate measurements
-            dense_area_covered = np.sum(crop > 0) * pixel_size * pixel_size
+            # Calculate measurements in pixels (dataWork converts lengths to mm)
+            dense_area_covered = float(np.sum(crop > 0))
             perimeter = cv2.arcLength(best_contour, True) * pixel_size
 
-            # Calculate hypocotyl properties
             hypocotyl_length = 0
             hypocotyl = crop == 4
             if np.sum(hypocotyl) > 10:
@@ -477,9 +587,8 @@ def process_video(params: Dict[str, Any]):
                 hypocotyl = cv2.morphologyEx(hypocotyl.astype(np.uint8), cv2.MORPH_OPEN, kernel)
                 hypocotyl = cv2.morphologyEx(hypocotyl, cv2.MORPH_CLOSE, kernel)
                 hypocotyl_skeleton = skeletonize(hypocotyl)
-                hypocotyl_length = np.sum(hypocotyl_skeleton) * pixel_size
+                hypocotyl_length = float(np.sum(hypocotyl_skeleton))
             
-            # Calculate simplified root properties
             mainroot_length = 0
             mainroot = crop == 1
             if np.sum(mainroot) > 10:
@@ -487,7 +596,7 @@ def process_video(params: Dict[str, Any]):
                 mainroot = cv2.morphologyEx(mainroot.astype(np.uint8), cv2.MORPH_OPEN, kernel)
                 mainroot = cv2.morphologyEx(mainroot, cv2.MORPH_CLOSE, kernel)
                 mainroot_skeleton = skeletonize(mainroot)
-                mainroot_length = np.sum(mainroot_skeleton) * pixel_size
+                mainroot_length = float(np.sum(mainroot_skeleton))
             
             totalroot_length = 0
             totalroot = np.bitwise_or(crop == 1, crop == 2)
@@ -496,32 +605,35 @@ def process_video(params: Dict[str, Any]):
                 totalroot = cv2.morphologyEx(totalroot.astype(np.uint8), cv2.MORPH_OPEN, kernel)
                 totalroot = cv2.morphologyEx(totalroot, cv2.MORPH_CLOSE, kernel)
                 totalroot_skeleton = skeletonize(totalroot)
-                totalroot_length = np.sum(totalroot_skeleton) * pixel_size
+                totalroot_length = float(np.sum(totalroot_skeleton))
 
-            # get convex hull of total root
-            dense_root_area = np.sum(totalroot) * pixel_size * pixel_size
+            dense_root_area = float(np.sum(totalroot))
+            lateral_length = max(0.0, totalroot_length - mainroot_length)
 
-            # Get group and create visualization
-            group = get_group_for_position(x_center, y_center, groups)
+            experiment = get_group_for_position(x_center, y_center, groups)
+            plate_condition = params.get('PlateCondition', '') or ''
+            extra_variable = params.get('ExtraVariable', '') or ''
             if params['show_tracking']:
                 vis_image = draw_tracking(
                     vis_image,
                     [x, y, x_w, y_h],
-                    group,
+                    experiment,
                     int(ID),
                     crop,
                     (x_min, y_min)
                 )
             
-            # Store results
-            UID = f"{params['analysis_id']}_{group}_{int(ID)}"
-            rows.append([UID, group, t * params['time_delta'] / 60, 
-                        dense_area_covered, 
-                        perimeter, t + 1, ID, date_hour, 
-                        hypocotyl_length, mainroot_length, totalroot_length, 
-                        dense_root_area,
-                        x, y, w, h,  
-                        img_file])   
+            plant_id = f"{params['analysis_id']}_{experiment}_{int(ID)}"
+            rows.append([
+                plant_id, experiment, t * params['time_delta'] / 60,
+                dense_area_covered,
+                perimeter, t + 1, ID, img_file,
+                hypocotyl_length, mainroot_length, totalroot_length,
+                lateral_length, 0,
+                dense_root_area,
+                plate_condition, extra_variable, pixel_size, calibration_source,
+                x, y, w, h,
+            ])   
         
         # Save visualization
         if params['show_tracking']:
@@ -534,10 +646,12 @@ def process_video(params: Dict[str, Any]):
 
     # --- Create DataFrame ONCE at the end ---
     dataframe = pd.DataFrame(all_data_rows, columns=column_names)
+    dataframe['rpi'] = params.get('rpi', '')
+    dataframe['cam'] = params.get('cam', '')
 
     # Post-processing
     if not dataframe.empty:
-        dataframe = dataframe.sort_values(by=['SeedPos', 'Slice']).reset_index(drop=True)
+        dataframe = dataframe.sort_values(by=['SeedPos', 'Frame']).reset_index(drop=True)
         # Ensure SeedPos can be converted to int safely
         try:
              dataframe['SeedPos'] = dataframe['SeedPos'].astype(int) - np.min(dataframe['SeedPos'].astype(int))
@@ -545,7 +659,7 @@ def process_video(params: Dict[str, Any]):
              pass # Handle cases where SeedPos might be empty
 
     # Remove unknown group seeds after all processing
-    dataframe = dataframe[dataframe['Group'] != 'Unknown']
+    dataframe = dataframe[dataframe['Experiment'] != 'Unknown']
 
     # Save results
     results_path = os.path.join(analysis_dir, 'seeds.tsv')
@@ -554,13 +668,15 @@ def process_video(params: Dict[str, Any]):
     # Update metadata
     completion_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_metadata(analysis_dir, params, completion_time=completion_time)
+    record_acquisition_span(analysis_dir, image_files)
 
     print(f"Results saved in: {results_path}")
 
     return dataframe
 
 
-def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str = None):
+def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str = None,
+                         segmentation_subdir: str = 'Ensemble'):
     """Validate directory structure and files."""
     if not os.path.exists(video_dir):
         raise ValueError(f"Video directory does not exist: {video_dir}")
@@ -568,11 +684,12 @@ def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str
     if segmentation_dir is None:
         segmentation_dir = os.path.join(video_dir, "Segmentation")
 
-    seg_dir = os.path.join(segmentation_dir, "Ensemble")
-    if not os.path.exists(seg_dir):
+    subdir = segmentation_subdir or 'Ensemble'
+    seg_dir = os.path.join(segmentation_dir, subdir)
+    if not os.path.exists(seg_dir) and subdir == 'Ensemble':
         seg_dir = os.path.join(segmentation_dir, "Seg")
     if not os.path.exists(seg_dir):
-        raise ValueError(f"Segmentation directory not found: {segmentation_dir}")
+        raise ValueError(f"Segmentation directory not found: {seg_dir}")
 
     if not os.path.exists(project_dir):
         raise ValueError(f"Project directory does not exist: {project_dir}")
@@ -591,13 +708,25 @@ def validate_directories(video_dir: str, project_dir: str, segmentation_dir: str
 
     return True
 
+
+def attach_rpi_cam(params: Dict[str, Any]) -> Dict[str, Any]:
+    rpi, cam = resolve_rpi_cam(
+        rpi=params.get('rpi'),
+        cam=params.get('cam'),
+        video_dir=params.get('video_dir'),
+        analysis_id=params.get('analysis_id'),
+    )
+    params['rpi'] = rpi
+    params['cam'] = cam
+    return params
+
+
 def build_params_from_config(config_path: str) -> Dict[str, Any]:
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    config = apply_load_aliases(load_json(config_path))
 
     required = [
         'video_dir', 'segmentation_dir', 'project_dir', 'analysis_id',
-        'group_names', 'seed_counts', 'time_delta', 'has_qr', 'show_tracking'
+        'group_names', 'seed_counts', 'timeStep', 'show_tracking'
     ]
     missing = [key for key in required if key not in config]
     if missing:
@@ -608,25 +737,40 @@ def build_params_from_config(config_path: str) -> Dict[str, Any]:
         'segmentation_dir': config['segmentation_dir'],
         'project_dir': config['project_dir'],
         'analysis_id': config['analysis_id'],
-        'time_delta': config['time_delta'],
-        'has_qr': bool(config['has_qr']),
+        'time_delta': config['timeStep'],
+        'timeStep': config['timeStep'],
+        'has_qr': video_has_qr(config),
         'show_tracking': bool(config['show_tracking']),
         'group_names': config['group_names'],
         'seed_counts': config['seed_counts'],
+        'PlateCondition': config.get('PlateCondition', '') or '',
+        'ExtraVariable': config.get('ExtraVariable', '') or '',
+        'rpi': config.get('rpi', ''),
+        'cam': config.get('cam', ''),
+        'segmentation_subdir': config.get('segmentation_subdir') or 'Ensemble',
     }
+    if config.get('pixel_size') not in (None, ''):
+        params['pixel_size'] = float(config['pixel_size'])
 
-    if params['has_qr']:
+    if params.get('pixel_size') not in (None, ''):
+        pass
+    elif params['has_qr']:
         pass
     else:
-        if config.get('known_distance') is None or config.get('pixel_distance') is None:
-            raise ValueError("Manual calibration requires known_distance and pixel_distance in config")
-        params['known_distance'] = float(config['known_distance'])
-        params['pixel_distance'] = int(config['pixel_distance'])
+        # Prefer form/config fields when present; otherwise registry/QR/default
+        # resolution in process_group handles missing scale.
+        known = config.get('knownDistance')
+        pixels = config.get('pixelDistance')
+        if known not in (None, '') and pixels not in (None, ''):
+            params['known_distance'] = float(known)
+            params['pixel_distance'] = int(pixels)
+            params['knownDistance'] = params['known_distance']
+            params['pixelDistance'] = params['pixel_distance']
 
     if 'group_rois' in config and config['group_rois']:
         params['group_rois'] = config['group_rois']
 
-    return params
+    return attach_rpi_cam(params)
 
 
 def build_params_from_args(args) -> Dict[str, Any]:
@@ -646,6 +790,8 @@ def build_params_from_args(args) -> Dict[str, Any]:
         'show_tracking': args.show_tracking,
         'group_names': group_names,
         'seed_counts': seed_counts,
+        'PlateCondition': getattr(args, 'plate_condition', '') or '',
+        'ExtraVariable': getattr(args, 'extra_variable', '') or '',
     }
 
     if not args.has_qr:
@@ -655,7 +801,7 @@ def build_params_from_args(args) -> Dict[str, Any]:
     if args.group_rois:
         params['group_rois'] = args.group_rois
 
-    return params
+    return attach_rpi_cam(params)
 
 
 def main():
@@ -678,6 +824,8 @@ def main():
     parser.add_argument('--group-info', nargs='+',
                         help='Alternating group names and seed counts (e.g., "GroupA" "10" "GroupB" "15")')
     parser.add_argument('--group-rois', help='JSON file with precomputed group ROIs')
+    parser.add_argument('--plate-condition', default='', help='Plate growth condition for this video')
+    parser.add_argument('--extra-variable', default='', help='Extra variable for this video')
 
     args = parser.parse_args()
 
@@ -698,14 +846,19 @@ def main():
 
             params = build_params_from_args(args)
 
-        validate_directories(params['video_dir'], params['project_dir'], params['segmentation_dir'])
+        validate_directories(
+            params['video_dir'], params['project_dir'], params['segmentation_dir'],
+            params.get('segmentation_subdir') or 'Ensemble',
+        )
 
         print(f"Starting analysis: {params['analysis_id']}")
         print("Groups to analyze:")
         for name, count in zip(params['group_names'], params['seed_counts']):
             print(f"  - {name}: {count} seeds")
 
-        if params['has_qr']:
+        if params.get('pixel_size') not in (None, ''):
+            pass
+        elif params['has_qr']:
             print("Using QR code calibration")
         else:
             print(f"Using manual calibration: {params['known_distance']}mm = {params['pixel_distance']}px")

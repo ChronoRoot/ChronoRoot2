@@ -1,15 +1,35 @@
 """Comparison-mode plots paired with statistical report outputs."""
 
+import math
+import os
+
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
 
 from .stats_utils import (
     _mode_spec,
     comparison_modes_for_run,
     ensure_factor_columns,
+    iter_replica_runs,
+    perform_scalar_pairwise_stats,
 )
 from .utils.fileUtilities import normalize_factor_value, UNSPECIFIED_FACTOR
-from .utils.report_paths import comparison_plot_path
+from .utils.report_paths import (
+    REPLICAS_DIR,
+    analysis_dir,
+    clear_replicas_subdir,
+    comparison_plot_path,
+    metric_dir,
+    save_report_figure,
+)
+from .plot_time_axis import (
+    decorate_elapsed_time_axes,
+    draw_snapshot_day_axis_on,
+    place_elapsed_time_suptitle,
+    push_facet_titles_below_day_axes,
+    space_elapsed_time_facet_grid,
+)
 from .utils.report_style import (
     apply_factor_axis_labels,
     axis_label_for_column,
@@ -19,9 +39,74 @@ from .utils.report_style import (
 
 plt.switch_backend('agg')
 
+RELATIVE_TITLE_SUFFIX = 'relative to initial stage'
+COUNT_N_OFFSET = 0.08
 
-def _plot_title(metric_label, spec):
-    return f'{metric_label} — {spec["header"]}'
+
+def subplot_grid(n):
+    """Rows = floor(sqrt(n)), columns = ceil(n / rows)."""
+    n = max(int(n), 1)
+    nrows = max(1, int(math.floor(math.sqrt(n))))
+    ncols = int(math.ceil(n / nrows))
+    return nrows, ncols
+
+
+def relative_title(title, conf=None):
+    """Append the relative-measurement suffix for figure-level titles only.
+
+    Use on suptitles / the sole title of a single-panel figure. Do not apply to
+    per-panel metric titles in overviews or facet grids — those collide with
+    Day labels and neighboring panels.
+    """
+    if not (conf or {}).get('measureRelativeToInitial'):
+        return title
+    text = str(title)
+    if RELATIVE_TITLE_SUFFIX.lower() in text.lower():
+        return text
+    return f'{text} — {RELATIVE_TITLE_SUFFIX}'
+
+
+def _decorate_temporal_grid(g, data, conf, x_col, title=None):
+    if x_col not in ('ElapsedTime (h)', 'Time'):
+        if title:
+            g.fig.suptitle(title, y=1.02)
+        return
+    hour_col = x_col if x_col in getattr(data, 'columns', []) else 'ElapsedTime (h)'
+    # Pass the full axes grid (not .flat) so Day labels stay on the top row only.
+    decorate_elapsed_time_axes(g.axes, data, conf, hour_col=hour_col)
+    push_facet_titles_below_day_axes(g)
+    space_elapsed_time_facet_grid(g.fig, g.axes)
+    place_elapsed_time_suptitle(g.fig, title)
+
+
+def _decorate_snapshot_grid(plot_obj, x_col, title=None):
+    if x_col == 'ElapsedTime (h)':
+        draw_snapshot_day_axis_on(plot_obj)
+    push_facet_titles_below_day_axes(plot_obj)
+    fig = plot_obj.fig if hasattr(plot_obj, 'fig') else getattr(plot_obj, 'figure', None)
+    axes = getattr(plot_obj, 'axes', None)
+    if fig is not None and axes is not None and axes is not plot_obj:
+        space_elapsed_time_facet_grid(fig, axes)
+    if title and fig is not None:
+        place_elapsed_time_suptitle(fig, title)
+
+
+def _plot_title(metric_label, spec, conf=None):
+    return relative_title(f'{metric_label} — {spec["header"]}', conf)
+
+
+def _facet_levels(data, column, drop_unspecified=False):
+    values = list(data[column].unique()) if column in data.columns else []
+    if drop_unspecified:
+        values = [v for v in values if normalize_factor_value(v) != UNSPECIFIED_FACTOR]
+    return sorted(values, key=str)
+
+
+def _facet_wrap_kwargs(col_order):
+    kwargs = {'col_order': col_order}
+    if col_order:
+        kwargs['col_wrap'] = subplot_grid(len(col_order))[1]
+    return kwargs
 
 
 def _palette_kwargs(data, hue_col, conf):
@@ -38,12 +123,29 @@ def _set_hue_legend(ax, hue_col, conf):
         leg.set_title(legend_title_for_hue(hue_col, conf))
 
 
+def _set_figure_hue_legend(plot_obj, hue_col, conf):
+    """Retitle FacetGrid / figure-level legends (seaborn often skips axes legends)."""
+    if not hue_col:
+        return
+    title = legend_title_for_hue(hue_col, conf)
+    leg = getattr(plot_obj, '_legend', None)
+    if leg is not None:
+        leg.set_title(title)
+    fig = getattr(plot_obj, 'fig', None) or getattr(plot_obj, 'figure', None)
+    if fig is None:
+        return
+    for fig_leg in list(getattr(fig, 'legends', None) or []):
+        fig_leg.set_title(title)
+
+
 _FACTOR_COLUMNS = frozenset({'Experiment', 'PlateCondition', 'ExtraVariable', 'Type'})
 
 
 def finalize_comparison_axes(plot_obj, conf, *, x_col=None, hue_col=None, facet_col=None):
     """Apply configured factor labels to a matplotlib Axes or seaborn FacetGrid."""
-    if hasattr(plot_obj, 'axes'):
+    # A matplotlib Axes also has .axes (itself). A FacetGrid's .axes is the grid.
+    axes_grid = getattr(plot_obj, 'axes', None)
+    if axes_grid is not None and axes_grid is not plot_obj and hasattr(axes_grid, 'flat'):
         g = plot_obj
         if facet_col in _FACTOR_COLUMNS:
             g.set_titles(col_template='{col_name}')
@@ -53,6 +155,8 @@ def finalize_comparison_axes(plot_obj, conf, *, x_col=None, hue_col=None, facet_
                 ax.set_xlabel(x_label)
             if hue_col:
                 _set_hue_legend(ax, hue_col, conf)
+        if hue_col:
+            _set_figure_hue_legend(g, hue_col, conf)
     else:
         apply_factor_axis_labels(plot_obj, conf, x_col=x_col, hue_col=hue_col)
 
@@ -94,131 +198,376 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
         'kind': kind, 'height': 4, 'aspect': 1.2,
     }
     kwargs.update(_palette_kwargs(data, hue, conf))
+    if col in data.columns:
+        n = int(data[col].nunique(dropna=True))
+        if n:
+            kwargs['col_wrap'] = subplot_grid(n)[1]
     return kwargs
+
+
+def _trim_duplicate_hue_legend(ax, hue_col, conf, n_levels):
+    """Keep one legend entry per hue level after box+swarm (both add handles)."""
+    if ax is None or not n_levels:
+        return
+    handles, labels = ax.get_legend_handles_labels()
+    if len(handles) < n_levels:
+        return
+    ax.legend(
+        handles[:n_levels], labels[:n_levels],
+        title=legend_title_for_hue(hue_col, conf),
+    )
+
+
+def _box_swarm(ax, data, x_col, y_col, hue_col, conf):
+    """Boxplot (hue colors) with swarm on top (same colors, black edge)."""
+    pal = _palette_kwargs(data, hue_col, conf)
+    n_levels = int(pd.Series(data[hue_col]).nunique(dropna=True)) if hue_col in data.columns else 0
+    sns.boxplot(
+        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
+        dodge=True, **pal,
+    )
+    sns.swarmplot(
+        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
+        dodge=True, edgecolor='black', linewidth=0.6, size=3.5,
+        legend=False, zorder=5, **pal,
+    )
+    _trim_duplicate_hue_legend(ax, hue_col, conf, n_levels)
+
+
+def _overlay_swarm_on_catplot(g, data, x, y, hue, conf):
+    """Draw swarm points on each catplot facet; boxes already drawn by catplot."""
+    if g is None:
+        return
+    pal = _palette_kwargs(data, hue, conf)
+    try:
+        facet_iter = list(g.facet_data())
+    except Exception:
+        facet_iter = []
+    if facet_iter:
+        for (i, j, _k), subset in facet_iter:
+            ax = g.facet_axis(i, j)
+            if subset is None or getattr(subset, 'empty', True):
+                continue
+            sns.swarmplot(
+                data=subset, x=x, y=y, hue=hue, ax=ax,
+                dodge=True, edgecolor='black', linewidth=0.6, size=3.5,
+                legend=False, zorder=5, **pal,
+            )
+            # Drop per-axes legends; finalize_comparison_axes keeps one figure legend.
+            leg = ax.get_legend()
+            if leg is not None:
+                leg.remove()
+        return
+    axes = getattr(g, 'axes', None)
+    if axes is None:
+        return
+    for ax in list(getattr(axes, 'flat', [axes])):
+        if ax is None:
+            continue
+        sns.swarmplot(
+            data=data, x=x, y=y, hue=hue, ax=ax,
+            dodge=True, edgecolor='black', linewidth=0.6, size=3.5,
+            legend=False, zorder=5, **pal,
+        )
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.remove()
+
+
+def _catplot_box_swarm(data, x, y, hue, col, conf):
+    """Faceted boxplot + swarm overlay (replaces violin catplots)."""
+    g = sns.catplot(**_catplot_kwargs(data, x, y, hue, col, conf, kind='box'))
+    _overlay_swarm_on_catplot(g, data, x, y, hue, conf)
+    return g
+
+
+def aggregate_count_lines(data, x_col, hue_col, metric, facet_col=None):
+    """Sum plant N per time/hue, then add a tiny y-offset so overlapping lines separate."""
+    frame = data.copy()
+    frame['_n'] = frame[metric].notna().astype(int)
+    keys = []
+    for col in (x_col, hue_col, facet_col):
+        if col and col in frame.columns and col not in keys:
+            keys.append(col)
+    grouped = frame.groupby(keys, as_index=False)['_n'].sum()
+    levels = sorted(grouped[hue_col].astype(str).unique(), key=str)
+    mapping = {level: i * COUNT_N_OFFSET for i, level in enumerate(levels)}
+    grouped['_n'] = pd.to_numeric(grouped['_n'], errors='coerce') + grouped[hue_col].astype(str).map(mapping).fillna(0)
+    return grouped
+
+
+def _count_lineplot_kwargs(x_col, hue_col, facet_col=None, data=None, conf=None):
+    kwargs = _lineplot_kwargs(x_col, '_n', hue_col, facet_col=facet_col, data=data, conf=conf)
+    kwargs['errorbar'] = None
+    kwargs['estimator'] = 'mean'
+    return kwargs
+
+
+def _count_plot_path(output_path):
+    root, ext = os.path.splitext(output_path)
+    return f'{root}_count{ext or ".png"}'
+
+
+def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label):
+    """Companion N-over-time figure in the same folder as the mean plot."""
+    if metric not in data.columns:
+        return
+    axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
+    if not hue_col:
+        return
+    count_data = aggregate_count_lines(data, x_col, hue_col, metric, facet_col)
+    title = relative_title(f'{metric_label} — number of plants', conf)
+    count_path = _count_plot_path(output_path)
+    try:
+        if mode == 'by_genotype':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'Experiment', data=count_data, conf=conf),
+            )
+        elif mode == 'genotype_by_plate':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'Experiment', 'PlateCondition', data=count_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'PlateCondition', drop_unspecified=True)),
+            )
+        elif mode == 'genotype_by_extra':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'Experiment', 'ExtraVariable', data=count_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'ExtraVariable', drop_unspecified=True)),
+            )
+        elif mode == 'by_plate_condition':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'PlateCondition', data=count_data, conf=conf),
+            )
+        elif mode == 'by_extra_variable':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'ExtraVariable', data=count_data, conf=conf),
+            )
+        elif mode == 'plate_within_genotype':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'PlateCondition', 'Experiment', data=count_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'Experiment')),
+            )
+        elif mode == 'extra_within_genotype':
+            g = sns.relplot(
+                data=count_data,
+                **_count_lineplot_kwargs(x_col, 'ExtraVariable', 'Experiment', data=count_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(count_data, 'Experiment')),
+            )
+        else:
+            return
+        finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
+        _decorate_temporal_grid(g, count_data, conf, x_col, title=title)
+        g.set_ylabels('Number of plants')
+        save_report_figure(
+            g, count_path, conf, dpi=300, bbox_inches='tight', pad_inches=0.15,
+        )
+    except Exception:
+        pass
+    finally:
+        plt.close('all')
 
 
 def plot_comparison_mode(conf, data, metric, mode, output_path, *,
                          x_col='ElapsedTime (h)', metric_label=None, title=None,
-                         module=None, metric_slug_name=None, analysis_type='temporal'):
+                         module=None, metric_slug_name=None, analysis_type='temporal',
+                         xlabel=None, ylabel=None):
     """Save a line plot matching the grouping used for a comparison mode."""
     data = ensure_factor_columns(data)
+    plot_data = data.dropna(subset=[metric]) if metric in data.columns else data
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
-    title = title or _plot_title(metric_label, spec)
+    title = title or _plot_title(metric_label, spec, conf)
 
     plt.ioff()
     try:
         if mode == 'by_genotype':
-            g = sns.relplot(data=data, **_lineplot_kwargs(x_col, metric, 'Experiment', data=data, conf=conf))
+            g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', data=plot_data, conf=conf))
         elif mode == 'genotype_by_plate':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'PlateCondition', data=data, conf=conf),
-                col_order=sorted(
-                    [v for v in data['PlateCondition'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
-                    key=str,
-                ),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'PlateCondition', data=plot_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'PlateCondition', drop_unspecified=True)),
             )
         elif mode == 'genotype_by_extra':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'ExtraVariable', data=data, conf=conf),
-                col_order=sorted(
-                    [v for v in data['ExtraVariable'].unique() if normalize_factor_value(v) != UNSPECIFIED_FACTOR],
-                    key=str,
-                ),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'Experiment', 'ExtraVariable', data=plot_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'ExtraVariable', drop_unspecified=True)),
             )
         elif mode == 'by_plate_condition':
-            g = sns.relplot(data=data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', data=data, conf=conf))
+            g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', data=plot_data, conf=conf))
         elif mode == 'by_extra_variable':
-            g = sns.relplot(data=data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', data=data, conf=conf))
+            g = sns.relplot(data=plot_data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', data=plot_data, conf=conf))
         elif mode == 'plate_within_genotype':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', 'Experiment', data=data, conf=conf),
-                col_order=sorted(data['Experiment'].unique(), key=str),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'PlateCondition', 'Experiment', data=plot_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'Experiment')),
             )
         elif mode == 'extra_within_genotype':
             g = sns.relplot(
-                data=data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', 'Experiment', data=data, conf=conf),
-                col_order=sorted(data['Experiment'].unique(), key=str),
+                data=plot_data, **_lineplot_kwargs(x_col, metric, 'ExtraVariable', 'Experiment', data=plot_data, conf=conf),
+                **_facet_wrap_kwargs(_facet_levels(plot_data, 'Experiment')),
             )
         else:
             return False
 
         axes_x, hue_col, facet_col = _mode_axes(mode, x_col)
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
-        g.fig.suptitle(title, y=1.02)
-        g.savefig(output_path, dpi=300, bbox_inches='tight')
+        _decorate_temporal_grid(g, plot_data, conf, x_col, title=title)
+        if xlabel:
+            g.set_xlabels(xlabel)
+        if ylabel:
+            g.set_ylabels(ylabel)
+        save_report_figure(
+            g, output_path, conf, dpi=300, bbox_inches='tight', pad_inches=0.15,
+        )
         plt.close('all')
+        _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
     except Exception:
         plt.close('all')
         return False
 
 
+def _mark_means_on_axis(ax, data, x_col, metric):
+    """Draw each group's mean as a diamond and a number."""
+    if ax is None or data is None or getattr(data, 'empty', True):
+        return
+    if x_col not in data.columns or metric not in data.columns:
+        return
+    labels = [tick.get_text() for tick in ax.get_xticklabels()]
+    values = pd.to_numeric(data[metric], errors='coerce')
+    marked = False
+    for i, label in enumerate(labels):
+        group = values[data[x_col].astype(str) == str(label)].dropna()
+        if group.empty:
+            continue
+        mean = float(group.mean())
+        ax.scatter(
+            [i], [mean], marker='D', s=28, c='black', zorder=5,
+            linewidths=0, label='_nolegend_',
+        )
+        ax.annotate(
+            f'{mean:.2f}',
+            (i, mean),
+            textcoords='offset points',
+            xytext=(0, 7),
+            ha='center',
+            va='bottom',
+            fontsize=8,
+            zorder=6,
+        )
+        marked = True
+    if not marked:
+        return
+    ymin, ymax = ax.get_ylim()
+    span = ymax - ymin
+    if span > 0:
+        ax.set_ylim(ymin, ymax + 0.12 * span)
+
+
+def _mark_boxplot_means(plot_obj, data, x_col, metric):
+    axes_grid = getattr(plot_obj, 'axes', None)
+    if (
+        axes_grid is not None
+        and axes_grid is not plot_obj
+        and hasattr(axes_grid, 'flat')
+        and hasattr(plot_obj, 'facet_data')
+    ):
+        subsets = []
+        try:
+            for item in plot_obj.facet_data():
+                subsets.append(item[-1])
+        except Exception:
+            subsets = []
+        axes = list(axes_grid.flat)
+        if subsets and len(subsets) == len(axes):
+            for ax, subset in zip(axes, subsets):
+                _mark_means_on_axis(ax, subset, x_col, metric)
+            return
+    _mark_means_on_axis(plot_obj, data, x_col, metric)
+
+
 def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
                                 module=None, metric_slug_name=None, analysis_type='scalar',
-                                metric_label=None, x_col='Experiment', plot_kind='box'):
+                                metric_label=None, x_col='Experiment', plot_kind='box',
+                                show_mean=False):
     """Box/swarm plot for scalar metrics (FPCA PCs, etc.)."""
     data = ensure_factor_columns(data)
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
-    title = _plot_title(metric_label, spec)
+    title = _plot_title(metric_label, spec, conf)
     output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name or '')
     plt.ioff()
 
     try:
         if mode == 'by_genotype':
             fig, ax = plt.subplots(figsize=(8, 6))
-            sns.boxplot(data=data, x=x_col, y=metric, hue='Experiment', ax=ax,
-                        **_palette_kwargs(data, 'Experiment', conf))
+            _box_swarm(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
+            if show_mean:
+                _mark_boxplot_means(ax, data, x_col, metric)
         elif mode == 'genotype_by_plate':
-            g = sns.catplot(**_catplot_kwargs(data, 'Experiment', metric, 'Experiment', 'PlateCondition', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'Experiment', metric, 'Experiment', 'PlateCondition', conf)
             finalize_comparison_axes(g, conf, x_col='Experiment', hue_col='Experiment', facet_col='PlateCondition')
             g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            if show_mean:
+                _mark_boxplot_means(g, data, 'Experiment', metric)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'genotype_by_extra':
-            g = sns.catplot(**_catplot_kwargs(data, 'Experiment', metric, 'Experiment', 'ExtraVariable', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'Experiment', metric, 'Experiment', 'ExtraVariable', conf)
             finalize_comparison_axes(g, conf, x_col='Experiment', hue_col='Experiment', facet_col='ExtraVariable')
             g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            if show_mean:
+                _mark_boxplot_means(g, data, 'Experiment', metric)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'by_plate_condition':
             fig, ax = plt.subplots(figsize=(8, 6))
-            sns.boxplot(data=data, x='PlateCondition', y=metric, hue='PlateCondition', ax=ax,
-                        **_palette_kwargs(data, 'PlateCondition', conf))
+            _box_swarm(ax, data, 'PlateCondition', metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col='PlateCondition', hue_col='PlateCondition')
+            if show_mean:
+                _mark_boxplot_means(ax, data, 'PlateCondition', metric)
         elif mode == 'by_extra_variable':
             fig, ax = plt.subplots(figsize=(8, 6))
-            sns.boxplot(data=data, x='ExtraVariable', y=metric, hue='ExtraVariable', ax=ax,
-                        **_palette_kwargs(data, 'ExtraVariable', conf))
+            _box_swarm(ax, data, 'ExtraVariable', metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col='ExtraVariable', hue_col='ExtraVariable')
+            if show_mean:
+                _mark_boxplot_means(ax, data, 'ExtraVariable', metric)
         elif mode == 'plate_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, 'PlateCondition', metric, 'PlateCondition', 'Experiment', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'PlateCondition', metric, 'PlateCondition', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col='PlateCondition', hue_col='PlateCondition', facet_col='Experiment')
             g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            if show_mean:
+                _mark_boxplot_means(g, data, 'PlateCondition', metric)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         elif mode == 'extra_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, 'ExtraVariable', metric, 'ExtraVariable', 'Experiment', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'ExtraVariable', metric, 'ExtraVariable', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col='ExtraVariable', hue_col='ExtraVariable', facet_col='Experiment')
             g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            if show_mean:
+                _mark_boxplot_means(g, data, 'ExtraVariable', metric)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
             return True
         else:
             return False
 
         plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        save_report_figure(plt, output_path, conf, dpi=300, bbox_inches='tight')
         plt.close('all')
         return True
     except Exception:
@@ -226,72 +575,89 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
         return False
 
 
+def _apply_ylabel(plot_obj, ylabel):
+    if not ylabel:
+        return
+    if hasattr(plot_obj, 'set_ylabels'):
+        plot_obj.set_ylabels(ylabel)
+    else:
+        plot_obj.set_ylabel(ylabel)
+
+
 def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
                                    x_col='Day', module=None, metric_slug_name=None,
-                                   analysis_type='interval', metric_label=None):
-    """Violin/swarm plot for interval-based metrics (convex hull, angles)."""
+                                   analysis_type='interval', metric_label=None, ylabel=None):
+    """Box + swarm for one comparison mode, plus a companion count of plants."""
     data = ensure_factor_columns(data)
 
     spec = _mode_spec(mode, conf=conf)
     metric_label = metric_label or metric
-    title = _plot_title(metric_label, spec)
+    title = _plot_title(metric_label, spec, conf)
     output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name or '')
     plt.ioff()
 
     try:
         if mode == 'by_genotype':
-            fig, ax = plt.subplots(figsize=(8, 6))
-            exp_palette = _palette_kwargs(data, 'Experiment', conf)
-            sns.violinplot(data=data, x=x_col, y=metric, hue='Experiment', ax=ax, inner=None, **exp_palette)
-            sns.swarmplot(data=data, x=x_col, y=metric, hue='Experiment', ax=ax, dodge=True, size=3, **exp_palette)
+            fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+            _box_swarm(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
+            _apply_ylabel(ax, ylabel)
         elif mode == 'genotype_by_plate':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'PlateCondition', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'Experiment', 'PlateCondition', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='PlateCondition')
-            g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            _apply_ylabel(g, ylabel)
+            _decorate_snapshot_grid(g, x_col, title=title)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'genotype_by_extra':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'ExtraVariable', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'Experiment', 'ExtraVariable', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='ExtraVariable')
-            g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            _apply_ylabel(g, ylabel)
+            _decorate_snapshot_grid(g, x_col, title=title)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'by_plate_condition':
-            fig, ax = plt.subplots(figsize=(8, 6))
-            sns.violinplot(data=data, x=x_col, y=metric, hue='PlateCondition', ax=ax,
-                           **_palette_kwargs(data, 'PlateCondition', conf))
+            fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+            _box_swarm(ax, data, x_col, metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='PlateCondition')
+            _apply_ylabel(ax, ylabel)
         elif mode == 'by_extra_variable':
-            fig, ax = plt.subplots(figsize=(8, 6))
-            sns.violinplot(data=data, x=x_col, y=metric, hue='ExtraVariable', ax=ax,
-                           **_palette_kwargs(data, 'ExtraVariable', conf))
+            fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+            _box_swarm(ax, data, x_col, metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='ExtraVariable')
+            _apply_ylabel(ax, ylabel)
         elif mode == 'plate_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'PlateCondition', 'Experiment', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'PlateCondition', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='PlateCondition', facet_col='Experiment')
-            g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            _apply_ylabel(g, ylabel)
+            _decorate_snapshot_grid(g, x_col, title=title)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'extra_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'ExtraVariable', 'Experiment', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'ExtraVariable', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='ExtraVariable', facet_col='Experiment')
-            g.fig.suptitle(title, y=1.02)
-            g.savefig(output_path, dpi=300, bbox_inches='tight')
+            _apply_ylabel(g, ylabel)
+            _decorate_snapshot_grid(g, x_col, title=title)
+            save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
             plt.close('all')
+            _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         else:
             return False
 
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        _decorate_snapshot_grid(ax, x_col)
+        save_report_figure(plt, output_path, conf, dpi=300, bbox_inches='tight')
         plt.close('all')
+        _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
     except Exception:
         plt.close('all')
@@ -299,33 +665,67 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
 
 
 def emit_temporal_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
-                                   analysis_type='temporal', metric_label=None):
-    """Generate paired {metric}_{mode}.png for every enabled comparison mode."""
+                                   analysis_type='temporal', metric_label=None,
+                                   x_col='ElapsedTime (h)', xlabel=None, ylabel=None):
+    """Generate paired comparison figures for every enabled comparison mode."""
     for mode in comparison_modes_for_run(conf, data):
         output_path = comparison_plot_path(base_dir, mode, metric_slug=metric_slug_name)
         plot_comparison_mode(
             conf, data, metric, mode, output_path,
+            x_col=x_col,
             metric_label=metric_label or metric,
             module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type,
+            xlabel=xlabel, ylabel=ylabel,
         )
 
 
 def emit_interval_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
-                                   analysis_type='interval', x_col='Day', metric_label=None):
+                                   analysis_type='interval', x_col='Day', metric_label=None,
+                                   ylabel=None):
     for mode in comparison_modes_for_run(conf, data):
         plot_interval_comparison_mode(
             conf, data, metric, mode, base_dir,
             x_col=x_col, module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type, metric_label=metric_label or metric,
+            ylabel=ylabel,
         )
 
 
 def emit_scalar_comparison_plots(conf, data, metric, base_dir, *, module, metric_slug_name,
-                                 analysis_type='scalar', metric_label=None):
+                                 analysis_type='scalar', metric_label=None, show_mean=False):
     for mode in comparison_modes_for_run(conf, data):
         plot_scalar_comparison_mode(
             conf, data, metric, mode, base_dir,
             module=module, metric_slug_name=metric_slug_name,
             analysis_type=analysis_type, metric_label=metric_label or metric,
+            show_mean=show_mean,
+        )
+
+
+def emit_replica_scalar_comparisons(
+    conf, data, metric, *, module, metric_slug_name,
+    analysis_type='scalar', metric_label=None, parent_subpath=(),
+    plant_id_col='Plant_id', show_mean=False,
+):
+    """Scalar stats/plots per ExtraVariable, using non-extra comparison modes."""
+    parent_subpath = tuple(parent_subpath)
+    parent_dir = (
+        analysis_dir(conf, module, metric_slug_name, *parent_subpath)
+        if parent_subpath else metric_dir(conf, module, metric_slug_name)
+    )
+    clear_replicas_subdir(parent_dir)
+    for _extra, extra_slug, subset, replica_conf in iter_replica_runs(conf, data):
+        subpath = parent_subpath + (REPLICAS_DIR, extra_slug)
+        replica_dir = analysis_dir(conf, module, metric_slug_name, *subpath)
+        perform_scalar_pairwise_stats(
+            replica_conf, subset, metric, output_dir=None, plant_id_col=plant_id_col,
+            module=module, metric_slug_name=metric_slug_name,
+            subpath=subpath, analysis_type=analysis_type,
+        )
+        emit_scalar_comparison_plots(
+            replica_conf, subset, metric, replica_dir,
+            module=module, metric_slug_name=metric_slug_name,
+            analysis_type=analysis_type, metric_label=metric_label or metric,
+            show_mean=show_mean,
         )

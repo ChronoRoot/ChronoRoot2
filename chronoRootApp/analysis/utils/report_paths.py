@@ -2,8 +2,10 @@
 
 import os
 import re
+import shutil
 
 from .report_utils import ensure_directory
+from ..time_windows import report_folder_name
 
 MODULE_TEMPORAL = 'temporal_parameters'
 MODULE_CONVEX = 'convex_hull'
@@ -11,6 +13,8 @@ MODULE_ANGLES = 'angles'
 
 OVERVIEW_SLUG = 'overview'
 INDIVIDUAL_PLOTS_DIR = 'individual_plots'
+RELATIVE_MEASUREMENTS_DIR = 'relative measurements'
+REPLICAS_DIR = 'replicas'
 
 TEMPORAL_METRICS = [
     'MainRootLength (mm)',
@@ -34,12 +38,56 @@ CONVEX_METRICS = [
 FOURIER_PARENT_METRICS = {
     'MR': 'main_root_length',
     'TR': 'total_root_length',
+    'HY': 'hypocotyl_length',
 }
 
 ANGLE_METRICS = {
     'mean_emergence_angle': 'Mean emergence angle',
     'first_lr_tip_angle': 'First LR tip',
 }
+
+GERMINATION_TIME_SLUG = 'germination_time'
+
+FIGURE_FORMATS = ('.png', '.svg', '.pdf')
+
+
+def _flag(conf, key):
+    value = (conf or {}).get(key)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes')
+    return bool(value)
+
+
+def optional_figure_extensions(conf=None):
+    """Extra suffixes besides the PNG that is always written."""
+    conf = conf or {}
+    if 'exportSvg' in conf or 'exportPdf' in conf:
+        extras = []
+        if _flag(conf, 'exportSvg'):
+            extras.append('.svg')
+        if _flag(conf, 'exportPdf'):
+            extras.append('.pdf')
+        return extras
+    legacy = str(conf.get('figureFormat') or '').strip().lower()
+    if legacy and not legacy.startswith('.'):
+        legacy = '.' + legacy
+    if legacy in ('.svg', '.pdf'):
+        return [legacy]
+    return []
+
+
+def save_report_figure(target, path, conf=None, **kwargs):
+    """Write a PNG, plus .svg and .pdf when those options are on.
+
+    Existing files in the other formats are left in place.
+    """
+    root, ext = os.path.splitext(path)
+    if ext.lower() not in FIGURE_FORMATS and ext != '':
+        target.savefig(path, **kwargs)
+        return
+    for suffix in ['.png', *optional_figure_extensions(conf)]:
+        target.savefig(root + suffix, **kwargs)
+
 
 def metric_slug(display_name: str) -> str:
     """Convert a display metric name to a filesystem-safe folder slug."""
@@ -51,7 +99,7 @@ def metric_slug(display_name: str) -> str:
 
 
 def report_root(conf) -> str:
-    return os.path.join(conf['MainFolder'], 'Report')
+    return os.path.join(conf['MainFolder'], report_folder_name(conf))
 
 
 def data_file(conf, filename: str) -> str:
@@ -66,10 +114,25 @@ def module_dir(conf, module: str) -> str:
     return path
 
 
+def measure_relative_to_initial(conf) -> bool:
+    return bool((conf or {}).get('measureRelativeToInitial'))
+
+
 def metric_dir(conf, module: str, slug: str) -> str:
     path = os.path.join(module_dir(conf, module), slug)
+    if measure_relative_to_initial(conf) and module == MODULE_TEMPORAL:
+        path = os.path.join(path, RELATIVE_MEASUREMENTS_DIR)
     ensure_directory(path)
     return path
+
+
+def temporal_data_file(conf) -> str:
+    """Temporal_Data.csv; relative runs write a copy under data/relative measurements/."""
+    if measure_relative_to_initial(conf):
+        path = os.path.join(report_root(conf), 'data', RELATIVE_MEASUREMENTS_DIR)
+        ensure_directory(path)
+        return os.path.join(path, 'Temporal_Data.csv')
+    return data_file(conf, 'Temporal_Data.csv')
 
 
 def analysis_dir(conf, module: str, metric_slug_name: str, *subpath: str) -> str:
@@ -77,6 +140,13 @@ def analysis_dir(conf, module: str, metric_slug_name: str, *subpath: str) -> str
     path = os.path.join(metric_dir(conf, module, metric_slug_name), *subpath)
     ensure_directory(path)
     return path
+
+
+def clear_replicas_subdir(parent_dir: str) -> None:
+    """Remove a stale replicas/ folder under an existing metric or analysis dir."""
+    path = os.path.join(parent_dir, REPLICAS_DIR)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def comparison_stats_path(base_dir: str, mode: str, metric_slug: str = '') -> str:
@@ -118,6 +188,16 @@ def angle_overlays_dir(conf, experiment_slug: str) -> str:
     return path
 
 
+def first_lr_overlays_dir(conf, experiment_slug: str) -> str:
+    """First-lateral zoom panels, beside the tip-angle decay figure."""
+    path = os.path.join(
+        metric_dir(conf, MODULE_ANGLES, 'first_lr_tip_angle'),
+        f'overlays_{experiment_slug}',
+    )
+    ensure_directory(path)
+    return path
+
+
 def individual_plots_dir(conf, experiment_slug: str) -> str:
     path = os.path.join(report_root(conf), INDIVIDUAL_PLOTS_DIR, experiment_slug)
     ensure_directory(path)
@@ -137,8 +217,38 @@ def temporal_metric_slug(metric_column: str) -> str:
     return mapping.get(metric_column, metric_slug(metric_column))
 
 
+def _purge_mode_files_in_dir(directory, slug, disabled):
+    """Delete ``{slug}_{mode}`` plot/stats files in one directory."""
+    if not os.path.isdir(directory):
+        return
+    for mode in disabled:
+        stem = f'{slug}_{mode}'
+        names = [f'{stem}_stats.txt']
+        for ext in FIGURE_FORMATS:
+            names.append(f'{stem}{ext}')
+            names.append(f'{stem}_count{ext}')
+        for filename in names:
+            path = os.path.join(directory, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+
+
+def _purge_mode_tree(base, slug, disabled):
+    """Purge mode outputs in ``base`` and nested dirs (fpca, replicas, growth_speed)."""
+    if not os.path.isdir(base):
+        return
+    for dirpath, _dirnames, _filenames in os.walk(base):
+        _purge_mode_files_in_dir(dirpath, slug, disabled)
+
+
 def purge_disabled_comparison_outputs(conf, effective_modes):
-    """Remove comparison PNG/stats for modes not in the effective list."""
+    """Remove comparison figures and stats for modes not in the effective list.
+
+    Only touches directories that already exist so unused modules
+    (angles, convex hull, unselected temporal slugs) are not created.
+    Walks nested trees so fpca/pc*, replicas/*, and growth_speed/replicas
+    do not keep stale advanced-mode files after a mode is turned off.
+    """
     from ..stats_utils import ALL_COMPARISON_MODES
 
     effective = set(effective_modes or [])
@@ -146,24 +256,114 @@ def purge_disabled_comparison_outputs(conf, effective_modes):
     if not disabled:
         return
 
+    root = report_root(conf)
     metric_targets = [
-        (MODULE_TEMPORAL, [temporal_metric_slug(m) for m in TEMPORAL_METRICS]),
+        (MODULE_TEMPORAL, [temporal_metric_slug(m) for m in TEMPORAL_METRICS] + [GERMINATION_TIME_SLUG]),
         (MODULE_CONVEX, [metric_slug(m) for m in CONVEX_METRICS]),
         (MODULE_ANGLES, list(ANGLE_METRICS.keys())),
     ]
     for module, slugs in metric_targets:
+        module_path = os.path.join(root, module)
+        if not os.path.isdir(module_path):
+            continue
         for slug in slugs:
-            base = metric_dir(conf, module, slug)
-            for mode in disabled:
-                for path_fn in (comparison_plot_path, comparison_stats_path):
-                    path = path_fn(base, mode, metric_slug=slug)
-                    if os.path.isfile(path):
-                        os.remove(path)
+            base = os.path.join(module_path, slug)
+            _purge_mode_tree(base, slug, disabled)
+            if module == MODULE_TEMPORAL:
+                rel_base = os.path.join(base, RELATIVE_MEASUREMENTS_DIR)
+                _purge_mode_tree(rel_base, slug, disabled)
 
-    for parent_slug in FOURIER_PARENT_METRICS.values():
-        growth_dir = analysis_dir(conf, MODULE_TEMPORAL, parent_slug, 'growth_speed')
-        for mode in disabled:
-            for path_fn in (comparison_plot_path, comparison_stats_path):
-                path = path_fn(growth_dir, mode, metric_slug=parent_slug)
-                if os.path.isfile(path):
-                    os.remove(path)
+    # Fourier growth-speed files use the parent temporal slug as the stem; the
+    # walk above already covers growth_speed/ under those parents when present.
+
+
+def _is_atlas_image(filename):
+    lower = filename.lower()
+    return lower.endswith(('.png', '.jpg', '.jpeg'))
+
+
+def _atlas_genotype_prefix(filename):
+    """Return path-safe genotype prefix from an atlas filename, or None."""
+    if filename.startswith('combined_atlas'):
+        return None
+    stem = filename
+    for ext in ('.png', '.jpg', '.jpeg', '.svg', '.pdf'):
+        if stem.lower().endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    for marker in ('_day_', '_Last_Day', '_t_'):
+        if marker in stem:
+            return stem.split(marker, 1)[0]
+    return None
+
+
+def _purge_stale_atlases_in_folder(folder, current_slugs):
+    if not os.path.isdir(folder):
+        return
+    current = set(current_slugs or [])
+    for filename in os.listdir(folder):
+        path = os.path.join(folder, filename)
+        if not os.path.isfile(path) or not _is_atlas_image(filename):
+            continue
+        if filename.startswith('combined_atlas'):
+            # Combined figures are rebuilt from current atlases each run.
+            os.remove(path)
+            continue
+        prefix = _atlas_genotype_prefix(filename)
+        if prefix is not None and prefix not in current:
+            os.remove(path)
+
+
+def clear_convex_overview_atlases(conf):
+    """Remove qualitative atlas images so the next write is not mixed with orphans."""
+    folder = overview_dir(conf, MODULE_CONVEX)
+    if not os.path.isdir(folder):
+        return
+    for filename in os.listdir(folder):
+        path = os.path.join(folder, filename)
+        if os.path.isfile(path) and _is_atlas_image(filename):
+            os.remove(path)
+    for split_name in ('by_plate', 'by_extra'):
+        split_root = os.path.join(folder, split_name)
+        if os.path.isdir(split_root):
+            shutil.rmtree(split_root, ignore_errors=True)
+
+
+def purge_stale_genotype_outputs(conf, current_genotype_slugs):
+    """Drop individual_plots, overview atlases, and angle overlays for remapped genotypes."""
+    current = set(current_genotype_slugs or [])
+    root = report_root(conf)
+    ip_root = os.path.join(root, INDIVIDUAL_PLOTS_DIR)
+    if os.path.isdir(ip_root):
+        for name in os.listdir(ip_root):
+            path = os.path.join(ip_root, name)
+            if os.path.isdir(path) and name not in current:
+                shutil.rmtree(path, ignore_errors=True)
+
+    overview = os.path.join(root, MODULE_CONVEX, OVERVIEW_SLUG)
+    _purge_stale_atlases_in_folder(overview, current)
+    for split_name in ('by_plate', 'by_extra'):
+        split_root = os.path.join(overview, split_name)
+        if not os.path.isdir(split_root):
+            continue
+        for level in os.listdir(split_root):
+            _purge_stale_atlases_in_folder(os.path.join(split_root, level), current)
+
+    angles_root = os.path.join(root, MODULE_ANGLES)
+    if os.path.isdir(angles_root):
+        for name in os.listdir(angles_root):
+            if not name.startswith('overlays_'):
+                continue
+            slug = name[len('overlays_'):]
+            path = os.path.join(angles_root, name)
+            if os.path.isdir(path) and slug not in current:
+                shutil.rmtree(path, ignore_errors=True)
+        first_lr_root = os.path.join(angles_root, 'first_lr_tip_angle')
+        if os.path.isdir(first_lr_root):
+            for name in os.listdir(first_lr_root):
+                if not name.startswith('overlays_'):
+                    continue
+                slug = name[len('overlays_'):]
+                path = os.path.join(first_lr_root, name)
+                if os.path.isdir(path) and slug not in current:
+                    shutil.rmtree(path, ignore_errors=True)

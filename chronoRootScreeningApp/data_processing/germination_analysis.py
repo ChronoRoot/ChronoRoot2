@@ -8,7 +8,7 @@ from scipy.optimize import curve_fit
 class GerminationAnalyzer:
     """Analyzes seed germination data and generates plots."""
     
-    def __init__(self, data=None, output_dir='.', dt=15, store_for_each_video=False, add_time_before_photo=0, time_cut=0):
+    def __init__(self, data=None, output_dir='.', dt=15, store_for_each_video=False, add_time_before_photo=0, time_cut=0, extra_formats=()):
         self.data = self._prepare_data(data)
         self.base_dir = output_dir
         self.plot_dirs = self._setup_directories()
@@ -20,6 +20,14 @@ class GerminationAnalyzer:
         self.store_for_each_video = store_for_each_video
         self.add_time_before_photo = add_time_before_photo
         self.time_cut = time_cut
+        extras = []
+        for fmt in extra_formats or ():
+            text = str(fmt).strip().lower()
+            if text and not text.startswith('.'):
+                text = '.' + text
+            if text in ('.svg', '.pdf') and text not in extras:
+                extras.append(text)
+        self.extra_formats = tuple(extras)
         
         self.germination_data = None
         self.statistics = None
@@ -30,20 +38,20 @@ class GerminationAnalyzer:
             return None
         
         data = data.copy()
-        data['Group'] = data['Group'].astype(str)
-        data['Group'] = data['Group'].str.replace('/', '_')
-        data['UID'] = data['UID'].str.replace('/', '_')
-        data['UID'] = data['UID'].astype(str)
+        data['Experiment'] = data['Experiment'].astype(str)
+        data['Experiment'] = data['Experiment'].str.replace('/', '_')
+        data['Plant_id'] = data['Plant_id'].str.replace('/', '_')
+        data['Plant_id'] = data['Plant_id'].astype(str)
         
-        return data[data['Group'] != 'Unknown']
+        return data[data['Experiment'] != 'Unknown']
     
     def _setup_directories(self):
         """Create output directories."""
         dirs = {
-            'germination': os.path.join(self.base_dir, 'Germination', 'GerminationPlots'),
-            'germination_video': os.path.join(self.base_dir, 'Germination', 'GerminationPlotsPerVideo'),
-            'survival': os.path.join(self.base_dir, 'Germination', 'KaplanMeierPlots'),
-            'data': os.path.join(self.base_dir, 'Germination', 'ProcessedData')
+            'germination': os.path.join(self.base_dir, 'germination', 'GerminationPlots'),
+            'germination_video': os.path.join(self.base_dir, 'germination', 'GerminationPlotsPerVideo'),
+            'survival': os.path.join(self.base_dir, 'germination', 'KaplanMeierPlots'),
+            'data': os.path.join(self.base_dir, 'germination', 'ProcessedData')
         }
         for dir_path in dirs.values():
             os.makedirs(dir_path, exist_ok=True)
@@ -107,19 +115,19 @@ class GerminationAnalyzer:
     def _process_raw_data(self):
         """Process raw measurements to detect germination events."""
         data = self.data.copy()
-        processed = data.groupby(data['UID']).apply(self._detect_germination)
+        processed = data.groupby(data['Plant_id']).apply(self._detect_germination)
 
-        if 'UID' not in processed.columns:
-            if 'UID' in processed.index.names:
-                processed = processed.reset_index(level='UID')
+        if 'Plant_id' not in processed.columns:
+            if 'Plant_id' in processed.index.names:
+                processed = processed.reset_index(level='Plant_id')
             elif isinstance(processed.index, pd.MultiIndex):
                 processed = processed.reset_index(level=0)
             else:
                 processed = processed.reset_index() 
-            if 'UID' not in processed.columns:
+            if 'Plant_id' not in processed.columns:
                 for candidate in ['level_0', 'index']:
                     if candidate in processed.columns:
-                        processed = processed.rename(columns={candidate: 'UID'})
+                        processed = processed.rename(columns={candidate: 'Plant_id'})
                         break
 
         processed = processed.reset_index(drop=True)
@@ -128,9 +136,9 @@ class GerminationAnalyzer:
         data['ElapsedHours'] = data['ElapsedHours'] + self.add_time_before_photo
         
         # Get unique combinations of Group and Video
-        group_video_counts = (data[['Group', 'Video', 'SeedCount']]
+        group_video_counts = (data[['Experiment', 'Video', 'SeedCount']]
                             .drop_duplicates()
-                            .set_index(['Group', 'Video'])['SeedCount']
+                            .set_index(['Experiment', 'Video'])['SeedCount']
                             .to_dict())
         
         germinated_mask = data['Germinated'] == True
@@ -138,10 +146,12 @@ class GerminationAnalyzer:
 
         # Summarize germination events
         germ_data = (germ_subset
-                    .groupby(['Group', 'UID', 'Video'])
+                    .groupby(['Experiment', 'Plant_id', 'Video'])
                     .agg({
                         'ElapsedHours': 'min',
-                        'Area': 'mean'
+                        'Area': 'mean',
+                        **({col: 'first' for col in ['PlateCondition', 'ExtraVariable']
+                            if col in germ_subset.columns}),
                     })
                     .reset_index()
                     .rename(columns={
@@ -158,15 +168,15 @@ class GerminationAnalyzer:
         # For each Group-Video combination
         for (group, video), count in group_video_counts.items():
             # Get germinated seeds for this group and video
-            germinated = germ_data[(germ_data['Group'] == group) & 
+            germinated = germ_data[(germ_data['Experiment'] == group) & 
                                 (germ_data['Video'] == video)]
             
             # Get all UIDs for this group and video from original data
-            group_video_data = data[(data['Group'] == group) & (data['Video'] == video)]
-            group_video_uids = set(group_video_data['UID'].unique())
+            group_video_data = data[(data['Experiment'] == group) & (data['Video'] == video)]
+            group_video_uids = set(group_video_data['Plant_id'].unique())
             
             # Get current UIDs for this group and video in germination data
-            current_uids = set(germinated['UID'])
+            current_uids = set(germinated['Plant_id'])
             
             # Find missing UIDs for this group and video
             missing_uids = group_video_uids - current_uids
@@ -180,10 +190,10 @@ class GerminationAnalyzer:
                     # We have MORE detected seeds than the expected count
                     # Sort by earliest germination time and keep only the first 'count' seeds
                     sorted_germinated = germinated.sort_values('GerminationTime')
-                    keep_uids = set(sorted_germinated.head(count)['UID'].values)
+                    keep_uids = set(sorted_germinated.head(count)['Plant_id'].values)
                     
                     # Find UIDs to exclude
-                    exclude_uids = set(germinated['UID']) - keep_uids
+                    exclude_uids = set(germinated['Plant_id']) - keep_uids
                     uids_to_exclude.update(exclude_uids)
                     continue  # Skip to next group-video combination
                 
@@ -197,20 +207,27 @@ class GerminationAnalyzer:
                     for i in range(needed_count - len(missing_uids)):
                         missing_uids.append(f"Group_{group}_video_{video}_NonGerm_{i}")
 
-            # Add entries for missing UIDs
+            # Add entries for missing plants
             for uid in missing_uids:
-                non_germ_entries.append({
-                    'Group': group,
+                factor_row = {
+                    'Experiment': group,
                     'Video': video,
-                    'UID': uid,
+                    'Plant_id': uid,
+                }
+                if 'PlateCondition' in group_video_data.columns:
+                    factor_row['PlateCondition'] = group_video_data['PlateCondition'].iloc[0]
+                if 'ExtraVariable' in group_video_data.columns:
+                    factor_row['ExtraVariable'] = group_video_data['ExtraVariable'].iloc[0]
+                non_germ_entries.append({
+                    **factor_row,
                     'GerminationTime': np.nan,
                     'SeedSize': np.nan
                 })
 
                 non_germ_entries_for_data.append({
-                    'Group': group,
+                    'Experiment': group,
                     'Video': video,
-                    'UID': uid,
+                    'Plant_id': uid,
                     'ElapsedHours': 0,
                     'Perim.': np.nan,
                     'Area': np.nan,
@@ -224,10 +241,10 @@ class GerminationAnalyzer:
                 })
 
         # Filter out excess UIDs from germination data
-        germ_data = germ_data[~germ_data['UID'].isin(uids_to_exclude)]
+        germ_data = germ_data[~germ_data['Plant_id'].isin(uids_to_exclude)]
         
         # Filter out excess UIDs from main data
-        data = data[~data['UID'].isin(uids_to_exclude)]
+        data = data[~data['Plant_id'].isin(uids_to_exclude)]
 
         # Add all non-germinated entries at once
         if non_germ_entries:
@@ -256,14 +273,14 @@ class GerminationAnalyzer:
             raise ValueError("No germination data available. Run process_data first.")
         
         # Calculate group statistics
-        stats = self.germination_data.groupby('Group').agg({
+        stats = self.germination_data.groupby('Experiment').agg({
             'GerminationTime': ['count', 'mean', 'std'],
             'SeedSize': ['mean', 'std']
         }).reset_index()
         
         # Flatten column names
         stats.columns = [
-            'Group',
+            'Experiment',
             'Germinated_Seeds',
             'Mean_Germination_Time',
             'SD_Germination_Time',
@@ -273,13 +290,13 @@ class GerminationAnalyzer:
         
         # Calculate ungerminated seeds
         ungerminated = (self.germination_data[self.germination_data['GerminationTime'].isna()]
-                       .groupby('Group')
+                       .groupby('Experiment')
                        .size()
                        .reset_index()
                        .rename(columns={0: 'Ungerminated_Seeds'}))
         
         # Merge statistics
-        self.statistics = stats.merge(ungerminated, on='Group', how='left')
+        self.statistics = stats.merge(ungerminated, on='Experiment', how='left')
         self.statistics.to_csv(os.path.join(self.plot_dirs['data'], 'Germination_Statistics.csv'), 
                              sep=',', index=False)
         
@@ -288,7 +305,7 @@ class GerminationAnalyzer:
     def _create_plots(self):
         """Generate all visualization plots."""
         # Original group plots
-        for group_name, group_data in self.data.groupby('Group'):
+        for group_name, group_data in self.data.groupby('Experiment'):
             self._plot_germination_curve(group_name, group_data)
             
             # Add per-video plots for this group
@@ -312,7 +329,7 @@ class GerminationAnalyzer:
         
         # If there are no specified counts, fall back to counting UIDs
         if total_seeds == 0:
-            total_seeds = len(group_data['UID'].unique())
+            total_seeds = len(group_data['Plant_id'].unique())
             
         time_points = sorted(group_data['ElapsedHours'].unique())
         germination_counts = []
@@ -322,7 +339,7 @@ class GerminationAnalyzer:
             germinated = len(group_data[
                 (group_data['ElapsedHours'] <= t) & 
                 (group_data['Germinated'])
-            ]['UID'].unique())
+            ]['Plant_id'].unique())
             raw_counts.append(germinated)  # Store raw count
             germination_counts.append((germinated / total_seeds) * 100)
         
@@ -343,7 +360,7 @@ class GerminationAnalyzer:
             # Calculate metrics
             final_germ_percent = max(germination_counts)
             TMGR = self.find_TMGR(popt)
-            final_germinated = len(group_data[group_data['Germinated']]['UID'].unique())
+            final_germinated = len(group_data[group_data['Germinated']]['Plant_id'].unique())
             
             # Calculate T50s using fine grid
             x_fine = np.linspace(0, max(time_points), 10000)
@@ -433,14 +450,14 @@ class GerminationAnalyzer:
         data_surv['Germinated'] = ~data_surv['GerminationTime'].isna()
         data_surv['GerminationTime'] = data_surv['GerminationTime'].fillna(max_time)
         
-        unique_groups = sorted(data_surv['Group'].unique())
+        unique_groups = sorted(data_surv['Experiment'].unique())
         
         if not pairwise:
             # Plot all groups together
             plt.figure(figsize=(7, 4))
             
             for group in unique_groups:
-                group_data = data_surv[data_surv['Group'] == group]
+                group_data = data_surv[data_surv['Experiment'] == group]
                 kmf = KaplanMeierFitter()
                 kmf.fit(group_data['GerminationTime'], 
                        event_observed=group_data['Germinated'])
@@ -464,7 +481,7 @@ class GerminationAnalyzer:
                     plt.figure(figsize=(7, 4))
                     
                     for group in [group1, group2]:
-                        group_data = data_surv[data_surv['Group'] == group]
+                        group_data = data_surv[data_surv['Experiment'] == group]
                         kmf = KaplanMeierFitter()
                         kmf.fit(group_data['GerminationTime'], 
                                event_observed=group_data['Germinated'])
@@ -481,9 +498,13 @@ class GerminationAnalyzer:
                                            f'Kaplan Meier - {group1} vs {group2}')
                     self._save_plot(plot_name)
 
-    def _save_plot(self, name, formats=('.png', '.pdf')):
-        """Save plot in multiple formats."""
-        for fmt in formats:
+    def _save_plot(self, name, formats=None):
+        """Save a PNG, plus any optional extra formats. Other copies are kept."""
+        chosen = ['.png']
+        for fmt in (formats if formats is not None else self.extra_formats):
+            if fmt not in chosen:
+                chosen.append(fmt)
+        for fmt in chosen:
             plt.savefig(name + fmt, bbox_inches='tight', dpi=300)
         plt.close()
 
@@ -521,7 +542,7 @@ class GerminationAnalyzer:
         
         # If there's no specified count, fall back to counting UIDs
         if total_seeds == 0:
-            total_seeds = len(video_data['UID'].unique())
+            total_seeds = len(video_data['Plant_id'].unique())
 
         time_points = sorted(video_data['ElapsedHours'].unique())
         germination_counts = []
@@ -530,7 +551,7 @@ class GerminationAnalyzer:
             germinated = len(video_data[
                 (video_data['ElapsedHours'] <= t) & 
                 (video_data['Germinated'])
-            ]['UID'].unique())
+            ]['Plant_id'].unique())
             germination_counts.append((germinated / total_seeds) * 100)
         
         try:
@@ -550,7 +571,7 @@ class GerminationAnalyzer:
             # Calculate metrics
             final_germ_percent = max(germination_counts)
             TMGR = self.find_TMGR(popt)
-            final_germinated = len(video_data[video_data['Germinated']]['UID'].unique())
+            final_germinated = len(video_data[video_data['Germinated']]['Plant_id'].unique())
             
 
             # Create plot with two y-axes
@@ -614,14 +635,14 @@ class GerminationAnalyzer:
         records = []
         
         # Iterate through each genotype/variety
-        for group_name, group_data in self.data.groupby('Group'):
+        for group_name, group_data in self.data.groupby('Experiment'):
             # Iterate through each video within that group
             for video_name, video_data in group_data.groupby('Video'):
                 
                 # Fetch expected total seeds or default to unique observed UIDs
                 total_seeds = self.group_video_seed_counts.get((group_name, video_name), 0)
                 if total_seeds == 0:
-                    total_seeds = len(video_data['UID'].unique())
+                    total_seeds = len(video_data['Plant_id'].unique())
                     
                 # Get all unique timepoints for this specific video
                 time_points = sorted(video_data['ElapsedHours'].unique())
@@ -631,7 +652,7 @@ class GerminationAnalyzer:
                     germinated_count = len(video_data[
                         (video_data['ElapsedHours'] <= t) & 
                         (video_data['Germinated'])
-                    ]['UID'].unique())
+                    ]['Plant_id'].unique())
                     
                     percentage = (germinated_count / total_seeds * 100) if total_seeds > 0 else 0
                     

@@ -3,18 +3,18 @@ ChronoRoot: High-throughput phenotyping by deep learning reveals novel temporal 
 Copyright (C) 2020 Nicolás Gaggion
 """
 
-import shutil
 import pandas as pd
 import os
-import json
 import argparse
+from analysis.utils.metadata_schema import apply_load_aliases, load_json
 
 from analysis.utils import report_utils as utils
 from analysis import convex_hull
 from analysis.report import (
-    plot_individual_plant,
+    save_individual_plant_plot,
     plot_info_all,
-    performStatisticalAnalysis,
+    performGerminationAnalysis,
+    performStatisticalAnalysisForMetrics,
     generateTableTemporal,
 )
 from analysis.stats_utils import (
@@ -33,27 +33,37 @@ from analysis.utils.fileUtilities import (
     build_plant_id,
     normalize_factor_value,
 )
+from analysis.time_windows import (
+    apply_time_windows,
+    hourly_covers_analysis_period,
+    snapshot_hours,
+    subtract_initial_stage,
+)
+from analysis.utils.report_subset import (
+    apply_subset,
+    experiment_in_report,
+    mark_report_status,
+    plant_in_report,
+    running_status,
+    STATUS_COMPLETE,
+    write_comparison_note,
+)
 from analysis.utils.report_paths import (
     data_file,
     individual_plots_dir,
     overview_dir,
     MODULE_CONVEX,
+    clear_convex_overview_atlases,
     purge_disabled_comparison_outputs,
+    purge_stale_genotype_outputs,
+    report_root,
+    temporal_data_file,
 )
 
 
 def _experiment_display_name(exp_dir):
     exp_dir_name = os.path.basename(exp_dir)
-    real_exp_name = convertFromPathSafe(exp_dir_name)
-    first_meta = utils.load_paths(exp_dir, '*/*/*/metadata.json')
-    if first_meta:
-        try:
-            with open(first_meta[0], 'r') as f:
-                meta_data = json.load(f)
-                real_exp_name = meta_data.get('Experiment', real_exp_name)
-        except Exception:
-            pass
-    return exp_dir_name, real_exp_name
+    return exp_dir_name, convertFromPathSafe(exp_dir_name)
 
 
 def _normalize_temporal_dataframe(all_data):
@@ -68,18 +78,21 @@ def _normalize_temporal_dataframe(all_data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ChronoRoot: Report Generation')
     parser.add_argument('--config', type=str, help='Path to the configuration file (default: config.json)')
+    parser.add_argument('--subset', type=str, default='', help='Saved report subset name')
 
     args = parser.parse_args()
-    conf = json.load(open(args.config, 'r'))
+    conf = apply_subset(apply_load_aliases(load_json(args.config)), args.subset)
 
     analysis_folder = os.path.join(conf['MainFolder'], 'Analysis')
     experiments = utils.load_paths(analysis_folder, '*')
 
-    utils.ensure_directory(os.path.join(conf['MainFolder'], 'Report'))
+    utils.ensure_directory(report_root(conf))
+    mark_report_status(report_root(conf), running_status(os.getpid()))
+    write_comparison_note(conf)
 
     print("Report generation began. This may take a while.")
 
-    temporal_parameters = [
+    temporal_parameters = conf.get('temporalMetrics') or [
         'MainRootLength (mm)', 'LateralRootsLength (mm)', 'TotalLength (mm)',
         'NumberOfLateralRoots', 'DiscreteLateralDensity (LR/cm)', 'MainOverTotal (%)',
         'HypocotylLength (mm)',
@@ -88,6 +101,8 @@ if __name__ == "__main__":
     temporal_data_path = data_file(conf, 'Temporal_Data.csv')
     convex_data_path = data_file(conf, 'Convex_Hull_Data.csv')
 
+    relative = bool(conf.get('measureRelativeToInitial'))
+
     # --- Phase 1: temporal aggregate + individual plots ---
     print('Phase 1/3: aggregating temporal data...')
     plant_frames = []
@@ -95,9 +110,13 @@ if __name__ == "__main__":
 
     for exp_index, exp_dir in enumerate(experiments, start=1):
         exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
+        if not experiment_in_report(conf, real_exp_name):
+            continue
         print(f'Phase 1/3: experiment {exp_index}/{n_experiments}: {real_exp_name}')
 
-        iplots_exp_folder = individual_plots_dir(conf, exp_dir_name)
+        iplots_exp_folder = None
+        if not relative:
+            iplots_exp_folder = individual_plots_dir(conf, exp_dir_name)
 
         rpi_paths = utils.load_paths(exp_dir, '*')
         for rpi in rpi_paths:
@@ -113,6 +132,13 @@ if __name__ == "__main__":
                         continue
 
                     meta = load_result_metadata(res_folder)
+                    if not plant_in_report(
+                        conf,
+                        real_exp_name,
+                        meta.get("PlateCondition", ""),
+                        meta.get("ExtraVariable", ""),
+                    ):
+                        continue
                     plant_id = build_plant_id(rpi_name, cam_name, plant_name)
                     file_csv = os.path.join(res_folder, 'PostProcess_Hour.csv')
 
@@ -130,92 +156,154 @@ if __name__ == "__main__":
                     )
                     plant_frames.append(data)
 
+                    if relative:
+                        continue
+
                     plot_filename = f"{exp_dir_name}_{plant_id}.png"
                     iplot_cache = os.path.join(res_folder, plot_filename)
-                    report_dest = os.path.join(iplots_exp_folder, plot_filename)
+                    save_individual_plant_plot(
+                        iplots_exp_folder, data, plot_filename, conf, iplot_cache,
+                    )
 
-                    if not os.path.exists(iplot_cache):
-                        plot_individual_plant(iplots_exp_folder, data, plot_filename)
-                        if os.path.exists(report_dest):
-                            shutil.copy(report_dest, iplot_cache)
-                    else:
-                        shutil.copy(iplot_cache, report_dest)
-
+    if not plant_frames:
+        print('No plants matched this report subset.', flush=True)
     all_data = pd.concat(plant_frames, ignore_index=True) if plant_frames else pd.DataFrame()
+    if not all_data.empty:
+        if not hourly_covers_analysis_period(all_data, conf):
+            print(
+                'Warning: the current analysis period is not fully covered by existing hourly files. '
+                'Hours outside the stored Date range will be empty. '
+                'Run Postprocess if you need those extra hours.',
+                flush=True,
+            )
+        all_data = apply_time_windows(all_data, conf)
     all_data.to_csv(temporal_data_path, index=False)
     print(f'Phase 1/3: wrote {temporal_data_path}')
 
-    all_data = _normalize_temporal_dataframe(all_data)
+    plot_data = subtract_initial_stage(all_data, conf) if not all_data.empty else all_data
+    if not plot_data.empty:
+        plot_data = _normalize_temporal_dataframe(plot_data)
+    if relative and not plot_data.empty:
+        rel_path = temporal_data_file(conf)
+        plot_data.to_csv(rel_path, index=False)
+        print(f'Phase 1/3: wrote {rel_path}')
 
     config_modes = get_enabled_comparison_modes(conf)
-    effective_modes = get_enabled_comparison_modes(conf, all_data)
+    effective_modes = get_enabled_comparison_modes(conf, plot_data)
     conf['effectiveComparisonModes'] = effective_modes
     log_auto_disabled_modes(conf, config_modes, effective_modes)
 
+    current_genotype_slugs = []
+    for exp_dir in experiments:
+        exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
+        if experiment_in_report(conf, real_exp_name):
+            current_genotype_slugs.append(exp_dir_name)
+    purge_stale_genotype_outputs(conf, current_genotype_slugs)
+
     # --- Phase 2: convex hull ---
     convex_hull_df = pd.DataFrame()
-    if conf.get('doConvex'):
+    if conf.get('doConvex') and not relative:
+        included = [
+            exp_dir for exp_dir in experiments
+            if experiment_in_report(conf, _experiment_display_name(exp_dir)[1])
+        ]
         print('Phase 2/3: convex hull analysis...')
-        global_shape, global_center = convex_hull.calculate_atlas_geometry(experiments)
-        convex_days = [int(d) for d in conf['daysConvexHull'].split(',') if str(d).strip()]
+        global_shape, global_center = convex_hull.calculate_atlas_geometry(included, conf)
+        snapshot_h = snapshot_hours(conf, kind='convex')
         timestep = int(conf['timeStep'])
         convex_overview = overview_dir(conf, MODULE_CONVEX)
         convex_frames = []
-        n_experiments = len(experiments)
+        atlas_jobs = []
+        n_experiments = len(included)
 
-        for exp_index, exp_dir in enumerate(experiments, start=1):
+        for exp_index, exp_dir in enumerate(included, start=1):
             exp_dir_name, real_exp_name = _experiment_display_name(exp_dir)
             print(f'Phase 2/3: convex hull ({exp_index}/{n_experiments}): {real_exp_name}')
 
-            atlases, current_convex_df = convex_hull.generate_root_atlases(
+            atlas_bundle, current_convex_df = convex_hull.generate_root_atlases(
                 exp_dir,
-                days=convex_days,
+                snapshot_hours=snapshot_h,
                 timestep=timestep,
                 canvas_shape=global_shape,
                 center_coords=global_center,
                 rotate_root=True,
+                conf=conf,
             )
 
             if not current_convex_df.empty:
                 current_convex_df['Experiment'] = real_exp_name
                 convex_frames.append(current_convex_df)
 
-            if conf.get('saveImagesConvex') and atlases:
-                for i, day in enumerate(convex_days):
-                    at_hull, at_cont, at_root = atlases[i]
-                    convex_hull.visualize_single_atlas(
-                        at_hull, at_cont, at_root,
-                        convex_overview, exp_dir_name, day,
-                    )
-            elif atlases:
-                at_hull, at_cont, at_root = atlases[-1]
-                convex_hull.visualize_single_atlas(
-                    at_hull, at_cont, at_root,
-                    convex_overview, exp_dir_name,
-                )
+            if atlas_bundle and (atlas_bundle.get('all') or []):
+                atlas_jobs.append((atlas_bundle, exp_dir_name))
 
         convex_hull_df = pd.concat(convex_frames, ignore_index=True) if convex_frames else pd.DataFrame()
         if not convex_hull_df.empty:
             convex_hull_df.to_csv(convex_data_path, index=False)
             print(f'Phase 2/3: wrote {convex_data_path}')
 
+        plate_levels = (
+            convex_hull.usable_atlas_factor_levels(convex_hull_df['PlateCondition'])
+            if not convex_hull_df.empty and 'PlateCondition' in convex_hull_df.columns
+            else []
+        )
+        extra_levels = (
+            convex_hull.usable_atlas_factor_levels(convex_hull_df['ExtraVariable'])
+            if not convex_hull_df.empty and 'ExtraVariable' in convex_hull_df.columns
+            else []
+        )
+        mode_set = set(effective_modes or [])
+        split_plates = len(plate_levels) >= 2 and 'genotype_by_plate' in mode_set
+        split_extras = len(extra_levels) >= 2 and 'genotype_by_extra' in mode_set
+        write_all = 'by_genotype' in mode_set
+        clear_convex_overview_atlases(conf)
+        save_all_hours = bool(conf.get('saveImagesConvex'))
+        for atlas_bundle, exp_dir_name in atlas_jobs:
+            if save_all_hours:
+                bundle_to_write = atlas_bundle
+                hour_list = list(snapshot_h)
+            else:
+                series = atlas_bundle.get('all') or []
+                if not series:
+                    continue
+                bundle_to_write = {
+                    'all': [series[-1]],
+                    'by_plate': {
+                        key: [vals[-1]]
+                        for key, vals in (atlas_bundle.get('by_plate') or {}).items()
+                        if vals
+                    },
+                    'by_extra': {
+                        key: [vals[-1]]
+                        for key, vals in (atlas_bundle.get('by_extra') or {}).items()
+                        if vals
+                    },
+                }
+                hour_list = [snapshot_h[-1]] if snapshot_h else []
+            convex_hull.write_experiment_atlases(
+                bundle_to_write, convex_overview, exp_dir_name, hour_list,
+                split_plates=split_plates, split_extras=split_extras,
+                write_all=write_all,
+            )
+
     purge_disabled_comparison_outputs(conf, effective_modes)
 
     # --- Phase 3: figures and statistics ---
     print('Phase 3/3: generating report figures and statistics...')
 
-    for parameter in temporal_parameters:
-        print(f'Phase 3/3: temporal analysis — {parameter}')
-        performStatisticalAnalysis(conf, all_data, parameter)
+    print('Phase 3/3: germination time')
+    performGerminationAnalysis(conf, all_data)
 
-    plot_info_all(conf, all_data)
-    generateTableTemporal(conf, all_data)
+    performStatisticalAnalysisForMetrics(conf, plot_data, temporal_parameters)
+
+    plot_info_all(conf, plot_data)
+    generateTableTemporal(conf, plot_data)
 
     if conf.get('doFPCA'):
         print('Phase 3/3: FPCA analysis')
-        performFPCA(args.config)
+        performFPCA(conf)
 
-    if conf.get('doConvex') and not convex_hull_df.empty:
+    if not relative and conf.get('doConvex') and not convex_hull_df.empty:
         print('Phase 3/3: convex hull summary and statistics')
         convex_hull.plot_hull_metrics_summary(conf, convex_hull_df)
         convex_hull.visualize_combined_atlases(conf)
@@ -233,13 +321,15 @@ if __name__ == "__main__":
 
         conf['effectiveComparisonModes'] = saved_modes
 
-    if conf.get('doFourier'):
+    if not relative and conf.get('doFourier'):
         print('Phase 3/3: Fourier analysis')
         makeFourierPlots(conf)
 
-    if conf.get('doLateralAngles'):
+    if not relative and conf.get('doLateralAngles'):
         print('Phase 3/3: lateral angles analysis')
         makeLateralAnglesPlots(conf)
-        plotLateralAnglesOnTop(conf)
+        if not conf.get('skipIndividualAnglePlots'):
+            plotLateralAnglesOnTop(conf)
 
+    mark_report_status(report_root(conf), STATUS_COMPLETE)
     print("Report generation finished.")
