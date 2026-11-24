@@ -87,11 +87,15 @@ class ZoomableImage(QLabel):
         )
 
         pixmap = QPixmap.fromImage(q_image)
-        scaled_width = int(width * self.zoom_factor)
-        scaled_height = int(height * self.zoom_factor)
         scaled_pixmap = pixmap.scaled(
-            scaled_width, scaled_height, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            max(1, int(width * self.zoom_factor)),
+            max(1, int(height * self.zoom_factor)),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
         )
+        # Use the actual scaled size (KeepAspectRatio may shrink one side).
+        scaled_width = scaled_pixmap.width()
+        scaled_height = scaled_pixmap.height()
 
         final_pixmap = QPixmap(scaled_pixmap)
         painter = QPainter(final_pixmap)
@@ -102,8 +106,7 @@ class ZoomableImage(QLabel):
 
         point_radius = max(5, int(5 * self.zoom_factor))
         for px, py in self.points:
-            scaled_x = int(px * self.zoom_factor)
-            scaled_y = int(py * self.zoom_factor)
+            scaled_x, scaled_y = self._image_to_pixmap_xy(px, py, scaled_width, scaled_height)
             painter.drawEllipse(
                 scaled_x - point_radius, scaled_y - point_radius,
                 point_radius * 2, point_radius * 2,
@@ -113,8 +116,8 @@ class ZoomableImage(QLabel):
             p1 = self.points[0]
             p2 = self.points[1]
 
-            p1_scaled = (int(p1[0] * self.zoom_factor), int(p1[1] * self.zoom_factor))
-            p2_scaled = (int(p2[0] * self.zoom_factor), int(p2[1] * self.zoom_factor))
+            p1_scaled = self._image_to_pixmap_xy(p1[0], p1[1], scaled_width, scaled_height)
+            p2_scaled = self._image_to_pixmap_xy(p2[0], p2[1], scaled_width, scaled_height)
             painter.drawLine(p1_scaled[0], p1_scaled[1], p2_scaled[0], p2_scaled[1])
 
             mid_x = (p1_scaled[0] + p2_scaled[0]) // 2
@@ -124,28 +127,57 @@ class ZoomableImage(QLabel):
         painter.end()
         self.setPixmap(final_pixmap)
 
+    def _image_to_pixmap_xy(self, x, y, pixmap_width=None, pixmap_height=None):
+        """Map original image pixel → coordinates on the displayed pixmap."""
+        if self.current_frame is None:
+            return (0, 0)
+        frame_h, frame_w = self.current_frame.shape[:2]
+        if pixmap_width is None or pixmap_height is None:
+            pm = self.pixmap()
+            if pm is None:
+                return (0, 0)
+            pixmap_width, pixmap_height = pm.width(), pm.height()
+        if frame_w <= 0 or frame_h <= 0:
+            return (0, 0)
+        return (
+            int(round(float(x) * pixmap_width / frame_w)),
+            int(round(float(y) * pixmap_height / frame_h)),
+        )
+
+    def _pixmap_origin_in_label(self):
+        """Top-left of the centered pixmap inside this QLabel (widget coords)."""
+        pm = self.pixmap()
+        if pm is None:
+            return (0, 0)
+        return (
+            (self.width() - pm.width()) // 2,
+            (self.height() - pm.height()) // 2,
+        )
+
     def get_image_coordinates(self, pos):
-        if not self.pixmap():
+        """Map a mouse position on this label to original image pixel coords.
+
+        ``event.pos()`` is already in QLabel coordinates (scroll is included).
+        Do not add scrollbar values — that double-counts pan when zoomed in.
+        """
+        if self.current_frame is None or not self.pixmap():
             return None
 
-        scroll_area = self.parent().parent()
+        pixmap = self.pixmap()
+        x_offset, y_offset = self._pixmap_origin_in_label()
+        # Widget-local click → position on the scaled pixmap.
+        x = pos.x() - x_offset
+        y = pos.y() - y_offset
+        if not (0 <= x < pixmap.width() and 0 <= y < pixmap.height()):
+            return None
 
-        pixmap_width = self.pixmap().width()
-        pixmap_height = self.pixmap().height()
-        label_width = self.width()
-        label_height = self.height()
+        frame_h, frame_w = self.current_frame.shape[:2]
+        if pixmap.width() <= 0 or pixmap.height() <= 0:
+            return None
+        original_x = int(x * frame_w / pixmap.width())
+        original_y = int(y * frame_h / pixmap.height())
 
-        x_offset = (label_width - pixmap_width) // 2
-        y_offset = (label_height - pixmap_height) // 2
-
-        adjusted_x = pos.x() - x_offset + scroll_area.horizontalScrollBar().value()
-        adjusted_y = pos.y() - y_offset + scroll_area.verticalScrollBar().value()
-
-        original_x = int(adjusted_x / self.zoom_factor)
-        original_y = int(adjusted_y / self.zoom_factor)
-
-        if 0 <= original_x < self.current_frame.shape[1] and \
-           0 <= original_y < self.current_frame.shape[0]:
+        if 0 <= original_x < frame_w and 0 <= original_y < frame_h:
             return (original_x, original_y)
         return None
 
