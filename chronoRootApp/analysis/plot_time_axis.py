@@ -1,5 +1,7 @@
 """Matplotlib helpers for elapsed-time Day labels, midnight dashes, and snapshot axes."""
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -50,7 +52,7 @@ def _annotate_clock_caption(ax, conf):
 
 def _visible_plot_axes(axes):
     visible = []
-    for ax in list(axes):
+    for ax in np.ravel(list(axes) if not hasattr(axes, 'ndim') else axes):
         if ax is None:
             continue
         if hasattr(ax, 'get_visible') and not ax.get_visible():
@@ -59,6 +61,27 @@ def _visible_plot_axes(axes):
             continue
         visible.append(ax)
     return visible
+
+
+def _top_row_axes(axes):
+    """Axes that sit on the first row of a facet / subplot grid."""
+    try:
+        arr = np.array(axes, dtype=object)
+    except Exception:
+        arr = np.array(list(np.ravel(axes)), dtype=object)
+    if arr.ndim == 2:
+        return [
+            ax for ax in arr[0, :]
+            if ax is not None and (not hasattr(ax, 'get_visible') or ax.get_visible())
+        ]
+    flat = [ax for ax in np.ravel(arr) if ax is not None]
+    visible = _visible_plot_axes(flat)
+    n = len(visible)
+    if n <= 1:
+        return visible
+    # Seaborn col_wrap flattens to 1-D in row-major order.
+    ncols = int(math.ceil(n / max(1, int(math.floor(math.sqrt(n))))))
+    return visible[:ncols]
 
 
 def draw_day_axis(ax, data, hour_col='ElapsedTime (h)', tick_size=9):
@@ -80,6 +103,8 @@ def draw_day_axis(ax, data, hour_col='ElapsedTime (h)', tick_size=9):
         ax_days.set_xticks([])
     ax_days.tick_params(axis='x', which='major', length=8, width=2, color='black')
     ax_days.tick_params(axis='x', which='minor', length=4, width=1, color='black')
+    ax._chronoroot_has_day_axis = True
+    ax._chronoroot_day_axis = ax_days
     return ax_days
 
 
@@ -167,12 +192,18 @@ def decorate_elapsed_time_axes(
     axes, data, conf, *, day_axis=True,
     hour_col='ElapsedTime (h)', day_tick_size=9,
 ):
-    """Decorate a grid of elapsed-time axes; caption once at figure bottom-right."""
+    """Decorate a grid of elapsed-time axes; caption once at figure bottom-right.
+
+    Day twin-axes are only drawn on the top row. Putting them on every facet
+    piles Day labels into the row above on multi-row FacetGrids.
+    """
     visible = _visible_plot_axes(axes)
+    top_row = set(_top_row_axes(axes)) if day_axis else set()
     drawn = False
     for ax in visible:
+        use_day = day_axis and (ax in top_row)
         ticks = decorate_elapsed_time_axis(
-            ax, data, conf, day_axis=day_axis, annotate=False,
+            ax, data, conf, day_axis=use_day, annotate=False,
             hour_col=hour_col, day_tick_size=day_tick_size,
         )
         if ticks:
@@ -186,30 +217,90 @@ def draw_clock_ticks_on_axes(axes, data, conf):
     decorate_elapsed_time_axes(axes, data, conf)
 
 
-def push_facet_titles_below_day_axes(plot_obj):
-    """Move seaborn facet titles below Day twin-axis labels.
+# Small gap (points) between the top of Day labels and the facet title baseline.
+_FACET_TITLE_GAP_PT = 4
+# Small gap between the top of facet titles and the figure title.
+_SUPTITLE_GAP_PT = 6
 
-    Axes titles sit above twin Day ticks and can outrank ``fig.suptitle`` after
-    ``bbox_inches='tight'``. Clearing them and drawing just above the axes spine
-    keeps the stack: overall title → Day ticks → facet label → plot.
+
+def _renderer_for(fig):
+    """Force a draw so tick/title window extents are valid."""
+    try:
+        fig.canvas.draw()
+        return fig.canvas.get_renderer()
+    except Exception:
+        return None
+
+
+def _day_label_top_display_y(ax, renderer):
+    """Highest display-Y of Day twin tick labels on this axes (or None)."""
+    day_ax = getattr(ax, '_chronoroot_day_axis', None)
+    if day_ax is None or renderer is None:
+        return None
+    tops = []
+    for lab in day_ax.get_xticklabels():
+        if not lab.get_visible() or not (lab.get_text() or '').strip():
+            continue
+        try:
+            tops.append(lab.get_window_extent(renderer=renderer).y1)
+        except Exception:
+            continue
+    return max(tops) if tops else None
+
+
+def push_facet_titles_below_day_axes(plot_obj):
+    """Place facet titles just above measured Day twin labels.
+
+    Applies to all facet modes (genotype_by_plate, plate_within_genotype, …)
+    and overview grids. Day tick style is unchanged. Panels without a Day twin
+    keep seaborn titles.
     """
     if plot_obj is None:
         return
-    axes = []
-    grid = getattr(plot_obj, 'axes', None)
-    if grid is not None and grid is not plot_obj:
-        axes = list(np.ravel(grid))
+    if isinstance(plot_obj, np.ndarray):
+        axes = list(np.ravel(plot_obj))
     else:
-        axes = [plot_obj]
+        axes = []
+        grid = getattr(plot_obj, 'axes', None)
+        if grid is not None and grid is not plot_obj:
+            axes = list(np.ravel(grid))
+        else:
+            axes = [plot_obj]
+    fig = None
+    for ax in axes:
+        if ax is not None and hasattr(ax, 'figure'):
+            fig = ax.figure
+            break
+    renderer = _renderer_for(fig) if fig is not None else None
     for ax in axes:
         if ax is None or not hasattr(ax, 'get_title'):
             continue
         title = ax.get_title()
         if not title:
             continue
+        if not getattr(ax, '_chronoroot_has_day_axis', False):
+            continue
         ax.set_title('')
+        day_top = _day_label_top_display_y(ax, renderer)
+        if day_top is None or renderer is None:
+            # Fallback: modest pad above the spine (points).
+            ax.annotate(
+                title,
+                xy=(0.5, 1.0),
+                xycoords='axes fraction',
+                xytext=(0, 36),
+                textcoords='offset points',
+                ha='center',
+                va='bottom',
+                fontsize=11,
+                annotation_clip=False,
+            )
+            continue
+        # Convert Day-label top + gap into axes-fraction y for this panel.
+        gap_px = _FACET_TITLE_GAP_PT * (renderer.points_to_pixels(1.0) if hasattr(renderer, 'points_to_pixels') else renderer.dpi / 72.0)
+        _, y_axes = ax.transAxes.inverted().transform((0.0, day_top + gap_px))
         ax.text(
-            0.5, 1.02, title,
+            0.5, y_axes, title,
             transform=ax.transAxes,
             ha='center',
             va='bottom',
@@ -218,13 +309,95 @@ def push_facet_titles_below_day_axes(plot_obj):
         )
 
 
-def place_elapsed_time_suptitle(fig, title, *, top=0.78, y=0.98):
-    """Put the figure title above Day-axis ticks instead of on top of them."""
+def space_elapsed_time_facet_grid(fig, axes):
+    """Light layout only — no inflated figure height / giant top band.
+
+    Facet titles sit just above measured Day labels; bbox_inches='tight' on
+    save crops the rest. Multi-row grids only need a bit of hspace.
+    """
+    if fig is None:
+        return
+    try:
+        arr = np.array(axes, dtype=object)
+    except Exception:
+        return
+    visible = _visible_plot_axes(arr)
+    has_day = any(getattr(ax, '_chronoroot_has_day_axis', False) for ax in visible)
+    if getattr(arr, 'ndim', 1) == 2:
+        nrows = max(1, int(arr.shape[0]))
+    else:
+        n = len(visible)
+        nrows = 1 if n <= 1 else max(1, int(math.floor(math.sqrt(n))))
+        if visible and all(getattr(ax, '_chronoroot_has_day_axis', False) for ax in visible):
+            nrows = 1
+    try:
+        fig.set_layout_engine('none')
+    except Exception:
+        pass
+    if nrows > 1:
+        # Room between rows so lower-row titles don't hit upper-row x labels.
+        fig.subplots_adjust(hspace=0.32 if not has_day else 0.36)
+
+
+def place_elapsed_time_suptitle(fig, title, *, top=None, y=None):
+    """Put the figure title just above the highest facet/Day content.
+
+    Only measures content above the axes (Day twin labels, raised facet titles,
+    Axes titles). Bottom x tick labels must not drive placement — on interval
+    plots those are category Days at the foot of the axes and would pin the
+    figure title to the bottom of the SVG.
+    """
     if fig is None or not title:
         return
     try:
         fig.set_layout_engine('none')
     except Exception:
         pass
-    fig.subplots_adjust(top=top)
-    fig.suptitle(title, y=y)
+    if top is not None:
+        fig.subplots_adjust(top=top)
+    if y is not None:
+        fig.suptitle(title, y=y)
+        return
+    renderer = _renderer_for(fig)
+    if renderer is None:
+        fig.suptitle(title, y=1.02, va='bottom')
+        return
+    top_disp = None
+    for ax in fig.axes:
+        if ax is None:
+            continue
+        day_top = _day_label_top_display_y(ax, renderer)
+        if day_top is not None:
+            top_disp = day_top if top_disp is None else max(top_disp, day_top)
+        # Raised facet titles live in ax.texts (not bottom tick labels).
+        for artist in list(getattr(ax, 'texts', []) or []):
+            try:
+                text = artist.get_text() if hasattr(artist, 'get_text') else ''
+                if not (text or '').strip():
+                    continue
+                y1 = artist.get_window_extent(renderer=renderer).y1
+            except Exception:
+                continue
+            top_disp = y1 if top_disp is None else max(top_disp, y1)
+        # Default seaborn facet titles.
+        try:
+            title_artist = ax.title
+            if title_artist is not None and (ax.get_title() or '').strip():
+                y1 = title_artist.get_window_extent(renderer=renderer).y1
+                top_disp = y1 if top_disp is None else max(top_disp, y1)
+        except Exception:
+            pass
+    fig_h = fig.bbox.height
+    if top_disp is None or fig_h <= 0:
+        fig.suptitle(title, y=1.02, va='bottom')
+        return
+    gap_px = _SUPTITLE_GAP_PT * (
+        renderer.points_to_pixels(1.0)
+        if hasattr(renderer, 'points_to_pixels')
+        else renderer.dpi / 72.0
+    )
+    y_frac = (top_disp + gap_px) / fig_h
+    # Guard: never place below mid-figure (bottom tick contamination).
+    if y_frac < 0.85:
+        y_frac = 1.02
+    fig.suptitle(title, y=y_frac, va='bottom')

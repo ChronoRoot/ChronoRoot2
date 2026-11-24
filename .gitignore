@@ -6,3 +6,4 @@
 Docker/.gitignore
 tests*
 .cursor*
+/plot_gallery/

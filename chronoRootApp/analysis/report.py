@@ -73,7 +73,13 @@ from .report_plots import (
     relative_title,
     subplot_grid,
 )
-from .plot_time_axis import decorate_elapsed_time_axis, decorate_elapsed_time_axes
+from .plot_time_axis import (
+    decorate_elapsed_time_axis,
+    decorate_elapsed_time_axes,
+    place_elapsed_time_suptitle,
+    push_facet_titles_below_day_axes,
+    space_elapsed_time_facet_grid,
+)
 from .time_windows import elapsed_hour_windows
 from .utils.report_style import (
     genotype_palette_for_data,
@@ -648,64 +654,74 @@ def _write_temporal_overview_pair(conf, dataframe, out_dir, metrics, geno_label,
     ensure_directory(out_dir)
     geno_palette = genotype_palette_for_data(dataframe)
 
-    def _plot_metric(ax, y_col, title):
+    n = len(metrics)
+    nrows, ncols = subplot_grid(n)
+    # Relative suffix belongs on the figure title only, not every metric panel.
+    figure_title = relative_title(condition_title or 'Temporal overview', conf)
+
+    def _finish_overview_figure(fig, axes_grid):
+        # One shared legend outside (not repeated on every metric panel).
+        handles, labels = None, None
+        for ax in np.ravel(axes_grid):
+            if ax is None:
+                continue
+            leg = ax.get_legend()
+            if leg is not None:
+                if handles is None:
+                    handles, labels = ax.get_legend_handles_labels()
+                leg.remove()
+        if handles:
+            fig.legend(
+                handles, labels, title=geno_label,
+                loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=True,
+            )
+        decorate_elapsed_time_axes(axes_grid, dataframe, conf)
+        push_facet_titles_below_day_axes(axes_grid)
+        space_elapsed_time_facet_grid(fig, axes_grid)
+        place_elapsed_time_suptitle(fig, figure_title)
+
+    def _draw_overview(path, plot_fn, ylabel):
+        fig = plt.figure(figsize=(5.5 * ncols, 4.2 * nrows))
+        gs = fig.add_gridspec(nrows, ncols, hspace=0.32, wspace=0.28)
+        axes_grid = np.empty((nrows, ncols), dtype=object)
+        for i, (col, title) in enumerate(metrics):
+            r, c = divmod(i, ncols)
+            ax = fig.add_subplot(gs[r, c])
+            axes_grid[r, c] = ax
+            plot_fn(ax, col)
+            ax.set_title(title, fontsize=14)
+            ax.set_xlabel('Elapsed Time (h)', fontsize=12)
+            ax.set_ylabel(ylabel(col), fontsize=12)
+        _finish_overview_figure(fig, axes_grid)
+        save_report_figure(
+            fig, path, conf, dpi=300, bbox_inches='tight', pad_inches=0.15,
+        )
+        plt.close('all')
+
+    def _metric_lines(ax, y_col):
         plot_df = dataframe.dropna(subset=[y_col]) if y_col in dataframe.columns else dataframe
         sns.lineplot(
             x='ElapsedTime (h)', y=y_col, data=plot_df, hue='Experiment',
             errorbar='se', ax=ax, palette=geno_palette,
         )
-        ax.set_title(title, fontsize=16)
-        ax.legend(loc='best', title=geno_label)
 
-    n = len(metrics)
-    nrows, ncols = subplot_grid(n)
-    fig3 = plt.figure(figsize=(4 * ncols, 4 * nrows), constrained_layout=True)
-    gs = fig3.add_gridspec(nrows, ncols)
-    axes = [fig3.add_subplot(gs[i // ncols, i % ncols]) for i in range(n)]
-
-    for ax, (col, title) in zip(axes, metrics):
-        _plot_metric(ax, col, relative_title(title, conf))
-        ax.set_xlabel('Elapsed Time (h)', fontsize=12)
-        ax.set_ylabel(_overview_ylabel(col), fontsize=12)
-    decorate_elapsed_time_axes(axes, dataframe, conf)
-    if condition_title:
-        fig3.suptitle(condition_title, fontsize=18)
-
-    save_report_figure(
-        plt,
-        os.path.join(out_dir, 'all_metrics_subplots.png'),
-        conf, dpi=300, bbox_inches='tight',
-    )
-
-    plt.cla()
-    plt.clf()
-    plt.close('all')
-
-    fig_n = plt.figure(figsize=(4 * ncols, 4 * nrows), constrained_layout=True)
-    gs_n = fig_n.add_gridspec(nrows, ncols)
-    axes_n = [fig_n.add_subplot(gs_n[i // ncols, i % ncols]) for i in range(n)]
-    for ax, (col, title) in zip(axes_n, metrics):
-        n_df = aggregate_count_lines(dataframe, 'ElapsedTime (h)', 'Experiment', col)
+    def _count_lines(ax, y_col):
+        n_df = aggregate_count_lines(dataframe, 'ElapsedTime (h)', 'Experiment', y_col)
         sns.lineplot(
             x='ElapsedTime (h)', y='_n', data=n_df, hue='Experiment',
             errorbar=None, ax=ax, palette=geno_palette,
         )
-        ax.set_title(relative_title(title, conf), fontsize=16)
-        ax.set_xlabel('Elapsed Time (h)', fontsize=12)
-        ax.set_ylabel('Number of plants', fontsize=12)
-        ax.legend(loc='best', title=geno_label)
-    decorate_elapsed_time_axes(axes_n, dataframe, conf)
-    if condition_title:
-        fig_n.suptitle(condition_title, fontsize=18)
-    save_report_figure(
-        plt,
-        os.path.join(out_dir, 'all_metrics_n.png'),
-        conf, dpi=300, bbox_inches='tight',
-    )
 
-    plt.cla()
-    plt.clf()
-    plt.close('all')
+    _draw_overview(
+        os.path.join(out_dir, 'all_metrics_subplots.png'),
+        _metric_lines,
+        _overview_ylabel,
+    )
+    _draw_overview(
+        os.path.join(out_dir, 'all_metrics_n.png'),
+        _count_lines,
+        lambda _col: 'Number of plants',
+    )
 
 
 def plot_info_all(conf, dataframe):

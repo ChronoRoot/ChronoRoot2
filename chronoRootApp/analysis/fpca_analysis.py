@@ -79,7 +79,8 @@ def _write_fpca_overview(
         x='ElapsedTime (h)', y=magnitude, hue='Experiment',
         data=temporal_df, errorbar='se', palette=genotype_palette,
     )
-    plt.title(relative_title(magnitude, conf), fontsize=16)
+    # Panel titles stay short; "relative to initial stage" belongs on the figure title only.
+    plt.title(magnitude, fontsize=16)
     leg = plt.gca().get_legend()
     if leg is not None:
         leg.set_title(genotype_legend)
@@ -94,7 +95,7 @@ def _write_fpca_overview(
         s=100,
         ax=ax,
     )
-    ax.set_title(relative_title('PC1 vs PC2', conf))
+    ax.set_title('PC1 vs PC2')
     ax.set_xlabel('PC1' + (' (IRN)' if inverse_rank_normalize else ''))
     ax.set_ylabel('PC2' + (' (IRN)' if inverse_rank_normalize else ''))
     ax.legend(title=genotype_legend, bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -110,10 +111,7 @@ def _write_fpca_overview(
             palette=genotype_palette,
         )
         ax.set_title(
-            relative_title(
-                f'PC{fpc1}. Variance Explained: {fpca.explained_variance_ratio_[fpc1 - 1]:.2f}',
-                conf,
-            ),
+            f'PC{fpc1}. Variance Explained: {fpca.explained_variance_ratio_[fpc1 - 1]:.2f}',
             fontsize=16,
         )
 
@@ -131,15 +129,15 @@ def _write_fpca_overview(
             curve = [x[0] for x in curve.data_matrix[0]]
             ax.plot(curve, color=palette[i], label=f'Q {quantiles[i]:.2f}')
 
-        ax.set_title(relative_title(f'Interpretation of PC{fpc1}', conf), fontsize=16)
+        ax.set_title(f'Interpretation of PC{fpc1}', fontsize=16)
         ax.set_ylabel(magnitude)
         ax.set_xlabel('Time (h)')
         handles = [plt.Line2D([0, 1], [0, 1], color=palette[i], lw=2) for i in range(N + 1)][::-1]
         labels = [f'{z_quantiles[i, fpc1 - 1]:.2f}' for i in range(N + 1)][::-1]
         ax.legend(handles, labels, title=f'PC{fpc1} Value', bbox_to_anchor=(1.05, 1), loc='upper left')
 
-    if condition_title:
-        plt.suptitle(condition_title, fontsize=16)
+    figure_title = condition_title or f'{magnitude} — FPCA overview'
+    plt.suptitle(relative_title(figure_title, conf), fontsize=16)
     plt.tight_layout()
     save_report_figure(
         plt,

@@ -28,6 +28,7 @@ from .plot_time_axis import (
     draw_snapshot_day_axis_on,
     place_elapsed_time_suptitle,
     push_facet_titles_below_day_axes,
+    space_elapsed_time_facet_grid,
 )
 from .utils.report_style import (
     apply_factor_axis_labels,
@@ -51,6 +52,12 @@ def subplot_grid(n):
 
 
 def relative_title(title, conf=None):
+    """Append the relative-measurement suffix for figure-level titles only.
+
+    Use on suptitles / the sole title of a single-panel figure. Do not apply to
+    per-panel metric titles in overviews or facet grids — those collide with
+    Day labels and neighboring panels.
+    """
     if not (conf or {}).get('measureRelativeToInitial'):
         return title
     text = str(title)
@@ -65,8 +72,10 @@ def _decorate_temporal_grid(g, data, conf, x_col, title=None):
             g.fig.suptitle(title, y=1.02)
         return
     hour_col = x_col if x_col in getattr(data, 'columns', []) else 'ElapsedTime (h)'
-    decorate_elapsed_time_axes(g.axes.flat, data, conf, hour_col=hour_col)
+    # Pass the full axes grid (not .flat) so Day labels stay on the top row only.
+    decorate_elapsed_time_axes(g.axes, data, conf, hour_col=hour_col)
     push_facet_titles_below_day_axes(g)
+    space_elapsed_time_facet_grid(g.fig, g.axes)
     place_elapsed_time_suptitle(g.fig, title)
 
 
@@ -75,6 +84,9 @@ def _decorate_snapshot_grid(plot_obj, x_col, title=None):
         draw_snapshot_day_axis_on(plot_obj)
     push_facet_titles_below_day_axes(plot_obj)
     fig = plot_obj.fig if hasattr(plot_obj, 'fig') else getattr(plot_obj, 'figure', None)
+    axes = getattr(plot_obj, 'axes', None)
+    if fig is not None and axes is not None and axes is not plot_obj:
+        space_elapsed_time_facet_grid(fig, axes)
     if title and fig is not None:
         place_elapsed_time_suptitle(fig, title)
 
@@ -185,8 +197,6 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
         'data': data, 'x': x, 'y': y, 'hue': hue, 'col': col,
         'kind': kind, 'height': 4, 'aspect': 1.2,
     }
-    if kind == 'violin':
-        kwargs['inner'] = None
     kwargs.update(_palette_kwargs(data, hue, conf))
     if col in data.columns:
         n = int(data[col].nunique(dropna=True))
@@ -195,12 +205,80 @@ def _catplot_kwargs(data, x, y, hue, col, conf, kind='box'):
     return kwargs
 
 
-def _violin(ax, data, x_col, y_col, hue_col, conf):
-    """Distribution only. Plant counts are a separate figure, not points on the violin."""
-    sns.violinplot(
-        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
-        inner=None, **_palette_kwargs(data, hue_col, conf),
+def _trim_duplicate_hue_legend(ax, hue_col, conf, n_levels):
+    """Keep one legend entry per hue level after box+swarm (both add handles)."""
+    if ax is None or not n_levels:
+        return
+    handles, labels = ax.get_legend_handles_labels()
+    if len(handles) < n_levels:
+        return
+    ax.legend(
+        handles[:n_levels], labels[:n_levels],
+        title=legend_title_for_hue(hue_col, conf),
     )
+
+
+def _box_swarm(ax, data, x_col, y_col, hue_col, conf):
+    """Boxplot (hue colors) with swarm on top (same colors, black edge)."""
+    pal = _palette_kwargs(data, hue_col, conf)
+    n_levels = int(pd.Series(data[hue_col]).nunique(dropna=True)) if hue_col in data.columns else 0
+    sns.boxplot(
+        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
+        dodge=True, **pal,
+    )
+    sns.swarmplot(
+        data=data, x=x_col, y=y_col, hue=hue_col, ax=ax,
+        dodge=True, edgecolor='black', linewidth=0.6, size=3.5,
+        legend=False, zorder=5, **pal,
+    )
+    _trim_duplicate_hue_legend(ax, hue_col, conf, n_levels)
+
+
+def _overlay_swarm_on_catplot(g, data, x, y, hue, conf):
+    """Draw swarm points on each catplot facet; boxes already drawn by catplot."""
+    if g is None:
+        return
+    pal = _palette_kwargs(data, hue, conf)
+    try:
+        facet_iter = list(g.facet_data())
+    except Exception:
+        facet_iter = []
+    if facet_iter:
+        for (i, j, _k), subset in facet_iter:
+            ax = g.facet_axis(i, j)
+            if subset is None or getattr(subset, 'empty', True):
+                continue
+            sns.swarmplot(
+                data=subset, x=x, y=y, hue=hue, ax=ax,
+                dodge=True, edgecolor='black', linewidth=0.6, size=3.5,
+                legend=False, zorder=5, **pal,
+            )
+            # Drop per-axes legends; finalize_comparison_axes keeps one figure legend.
+            leg = ax.get_legend()
+            if leg is not None:
+                leg.remove()
+        return
+    axes = getattr(g, 'axes', None)
+    if axes is None:
+        return
+    for ax in list(getattr(axes, 'flat', [axes])):
+        if ax is None:
+            continue
+        sns.swarmplot(
+            data=data, x=x, y=y, hue=hue, ax=ax,
+            dodge=True, edgecolor='black', linewidth=0.6, size=3.5,
+            legend=False, zorder=5, **pal,
+        )
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.remove()
+
+
+def _catplot_box_swarm(data, x, y, hue, col, conf):
+    """Faceted boxplot + swarm overlay (replaces violin catplots)."""
+    g = sns.catplot(**_catplot_kwargs(data, x, y, hue, col, conf, kind='box'))
+    _overlay_swarm_on_catplot(g, data, x, y, hue, conf)
+    return g
 
 
 def aggregate_count_lines(data, x_col, hue_col, metric, facet_col=None):
@@ -285,7 +363,9 @@ def _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metr
         finalize_comparison_axes(g, conf, x_col=axes_x, hue_col=hue_col, facet_col=facet_col)
         _decorate_temporal_grid(g, count_data, conf, x_col, title=title)
         g.set_ylabels('Number of plants')
-        save_report_figure(g, count_path, conf, dpi=300, bbox_inches='tight')
+        save_report_figure(
+            g, count_path, conf, dpi=300, bbox_inches='tight', pad_inches=0.15,
+        )
     except Exception:
         pass
     finally:
@@ -342,7 +422,9 @@ def plot_comparison_mode(conf, data, metric, mode, output_path, *,
             g.set_xlabels(xlabel)
         if ylabel:
             g.set_ylabels(ylabel)
-        save_report_figure(g, output_path, conf, dpi=300, bbox_inches='tight')
+        save_report_figure(
+            g, output_path, conf, dpi=300, bbox_inches='tight', pad_inches=0.15,
+        )
         plt.close('all')
         _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
         return True
@@ -426,14 +508,13 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
     try:
         if mode == 'by_genotype':
             fig, ax = plt.subplots(figsize=(8, 6))
-            sns.boxplot(data=data, x=x_col, y=metric, hue='Experiment', ax=ax,
-                        **_palette_kwargs(data, 'Experiment', conf))
+            _box_swarm(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
             if show_mean:
                 _mark_boxplot_means(ax, data, x_col, metric)
         elif mode == 'genotype_by_plate':
-            g = sns.catplot(**_catplot_kwargs(data, 'Experiment', metric, 'Experiment', 'PlateCondition', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'Experiment', metric, 'Experiment', 'PlateCondition', conf)
             finalize_comparison_axes(g, conf, x_col='Experiment', hue_col='Experiment', facet_col='PlateCondition')
             g.fig.suptitle(title, y=1.02)
             if show_mean:
@@ -442,7 +523,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             plt.close('all')
             return True
         elif mode == 'genotype_by_extra':
-            g = sns.catplot(**_catplot_kwargs(data, 'Experiment', metric, 'Experiment', 'ExtraVariable', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'Experiment', metric, 'Experiment', 'ExtraVariable', conf)
             finalize_comparison_axes(g, conf, x_col='Experiment', hue_col='Experiment', facet_col='ExtraVariable')
             g.fig.suptitle(title, y=1.02)
             if show_mean:
@@ -452,22 +533,20 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             return True
         elif mode == 'by_plate_condition':
             fig, ax = plt.subplots(figsize=(8, 6))
-            sns.boxplot(data=data, x='PlateCondition', y=metric, hue='PlateCondition', ax=ax,
-                        **_palette_kwargs(data, 'PlateCondition', conf))
+            _box_swarm(ax, data, 'PlateCondition', metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col='PlateCondition', hue_col='PlateCondition')
             if show_mean:
                 _mark_boxplot_means(ax, data, 'PlateCondition', metric)
         elif mode == 'by_extra_variable':
             fig, ax = plt.subplots(figsize=(8, 6))
-            sns.boxplot(data=data, x='ExtraVariable', y=metric, hue='ExtraVariable', ax=ax,
-                        **_palette_kwargs(data, 'ExtraVariable', conf))
+            _box_swarm(ax, data, 'ExtraVariable', metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col='ExtraVariable', hue_col='ExtraVariable')
             if show_mean:
                 _mark_boxplot_means(ax, data, 'ExtraVariable', metric)
         elif mode == 'plate_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, 'PlateCondition', metric, 'PlateCondition', 'Experiment', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'PlateCondition', metric, 'PlateCondition', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col='PlateCondition', hue_col='PlateCondition', facet_col='Experiment')
             g.fig.suptitle(title, y=1.02)
             if show_mean:
@@ -476,7 +555,7 @@ def plot_scalar_comparison_mode(conf, data, metric, mode, base_dir, *,
             plt.close('all')
             return True
         elif mode == 'extra_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, 'ExtraVariable', metric, 'ExtraVariable', 'Experiment', conf, plot_kind))
+            g = _catplot_box_swarm(data, 'ExtraVariable', metric, 'ExtraVariable', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col='ExtraVariable', hue_col='ExtraVariable', facet_col='Experiment')
             g.fig.suptitle(title, y=1.02)
             if show_mean:
@@ -508,7 +587,7 @@ def _apply_ylabel(plot_obj, ylabel):
 def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
                                    x_col='Day', module=None, metric_slug_name=None,
                                    analysis_type='interval', metric_label=None, ylabel=None):
-    """Violin for one comparison mode, plus a companion count of plants."""
+    """Box + swarm for one comparison mode, plus a companion count of plants."""
     data = ensure_factor_columns(data)
 
     spec = _mode_spec(mode, conf=conf)
@@ -520,12 +599,12 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
     try:
         if mode == 'by_genotype':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-            _violin(ax, data, x_col, metric, 'Experiment', conf)
+            _box_swarm(ax, data, x_col, metric, 'Experiment', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='Experiment')
             _apply_ylabel(ax, ylabel)
         elif mode == 'genotype_by_plate':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'PlateCondition', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'Experiment', 'PlateCondition', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='PlateCondition')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
@@ -534,7 +613,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'genotype_by_extra':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'Experiment', 'ExtraVariable', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'Experiment', 'ExtraVariable', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='Experiment', facet_col='ExtraVariable')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
@@ -544,18 +623,18 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             return True
         elif mode == 'by_plate_condition':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-            _violin(ax, data, x_col, metric, 'PlateCondition', conf)
+            _box_swarm(ax, data, x_col, metric, 'PlateCondition', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='PlateCondition')
             _apply_ylabel(ax, ylabel)
         elif mode == 'by_extra_variable':
             fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-            _violin(ax, data, x_col, metric, 'ExtraVariable', conf)
+            _box_swarm(ax, data, x_col, metric, 'ExtraVariable', conf)
             ax.set_title(title)
             finalize_comparison_axes(ax, conf, x_col=x_col, hue_col='ExtraVariable')
             _apply_ylabel(ax, ylabel)
         elif mode == 'plate_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'PlateCondition', 'Experiment', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'PlateCondition', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='PlateCondition', facet_col='Experiment')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
@@ -564,7 +643,7 @@ def plot_interval_comparison_mode(conf, data, metric, mode, base_dir, *,
             _save_temporal_count_plot(conf, data, metric, mode, output_path, x_col, metric_label)
             return True
         elif mode == 'extra_within_genotype':
-            g = sns.catplot(**_catplot_kwargs(data, x_col, metric, 'ExtraVariable', 'Experiment', conf, 'violin'))
+            g = _catplot_box_swarm(data, x_col, metric, 'ExtraVariable', 'Experiment', conf)
             finalize_comparison_axes(g, conf, x_col=x_col, hue_col='ExtraVariable', facet_col='Experiment')
             _apply_ylabel(g, ylabel)
             _decorate_snapshot_grid(g, x_col, title=title)
